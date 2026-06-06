@@ -82,6 +82,7 @@ async function migrate() {
       topic VARCHAR(255) NOT NULL,
       tone VARCHAR(80) NOT NULL,
       platform ENUM('facebook', 'x', 'youtube', 'tiktok') NOT NULL,
+      social_account_id CHAR(36) NULL,
       content JSON NOT NULL,
       status ENUM('draft', 'queued', 'scheduled', 'published', 'failed') NOT NULL DEFAULT 'draft',
       scheduled_at DATETIME NULL,
@@ -93,12 +94,14 @@ async function migrate() {
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       INDEX idx_posts_user_id (user_id),
+      INDEX idx_posts_social_account_id (social_account_id),
       INDEX idx_posts_status (status),
       INDEX idx_posts_scheduled_at (scheduled_at),
       CONSTRAINT fk_posts_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     )
   `);
   await addColumnIfMissing('posts', 'media', 'JSON NULL');
+  await addColumnIfMissing('posts', 'social_account_id', 'CHAR(36) NULL');
 
   await query(`
     CREATE TABLE IF NOT EXISTS social_accounts (

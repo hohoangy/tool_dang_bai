@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import { env } from '../../config/env.js';
 import { ApiError } from '../../utils/api-error.js';
+import { loadImage } from '../../utils/media-file.js';
 
 const scopes = ['tweet.read', 'tweet.write', 'users.read', 'offline.access'];
 
@@ -82,23 +83,28 @@ export const xService = {
       return { externalPostId: `x_demo_${Date.now()}`, raw: { demo: true } };
     }
     const text = buildTweetText(post);
+    const images = getPostImages(post);
     try {
+      const mediaIds = [];
+      for (const image of images) {
+        mediaIds.push(await uploadImage(account.accessToken, image));
+      }
+      const payload = {};
+      if (text) payload.text = text;
+      if (mediaIds.length) payload.media = { media_ids: mediaIds };
       const { data } = await axios.post(
         'https://api.x.com/2/tweets',
-        { text },
+        payload,
         { headers: { Authorization: `Bearer ${account.accessToken}` } }
       );
       return { externalPostId: data.data.id, raw: data };
     } catch (error) {
       if (isCreditsDepleted(error)) {
-        return {
-          externalPostId: `x_credit_demo_${Date.now()}`,
-          raw: {
-            demo: true,
-            reason: 'credits_depleted',
-            originalError: error.response?.data || error.message
-          }
-        };
+        throw new ApiError(
+          402,
+          'X API credits are depleted. The post was not published to X.',
+          error.response?.data || error.message
+        );
       }
       throw toXApiError(error, 'X publish failed.');
     }
@@ -110,6 +116,60 @@ function buildTweetText(post) {
   const base = [post.content.hook, post.content.caption, tags].filter(Boolean).join('\n\n');
   if (base.length <= 280) return base;
   return `${base.slice(0, 277).trimEnd()}...`;
+}
+
+function getPostImages(post) {
+  if (Array.isArray(post.media?.images) && post.media.images.length) {
+    return post.media.images.slice(0, 4);
+  }
+  return post.media?.imageUrl ? [{ url: post.media.imageUrl, altText: post.media.altText }] : [];
+}
+
+async function uploadImage(accessToken, image) {
+  const { buffer, mimeType } = await loadImage(image);
+  if (!mimeType?.startsWith('image/')) throw new ApiError(400, 'Selected media is not a supported image.');
+  if (buffer.length > 5 * 1024 * 1024) throw new ApiError(400, 'X images must be 5 MB or smaller.');
+
+  try {
+    const { data } = await axios.post(
+      'https://api.x.com/2/media/upload',
+      {
+        media: buffer.toString('base64'),
+        media_category: 'tweet_image',
+        media_type: mimeType,
+        shared: false
+      },
+      {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        maxBodyLength: 8 * 1024 * 1024
+      }
+    );
+    const mediaId = data?.data?.id;
+    if (!mediaId) throw new ApiError(502, 'X did not return a media ID.');
+    if (image.altText?.trim()) {
+      await axios.post(
+        'https://api.x.com/2/media/metadata',
+        {
+          id: mediaId,
+          metadata: {
+            alt_text: { text: image.altText.trim().slice(0, 1000) }
+          }
+        },
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+    }
+    return mediaId;
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    if (isCreditsDepleted(error)) {
+      throw new ApiError(
+        402,
+        'X API credits are depleted. The image and post were not published to X.',
+        error.response?.data || error.message
+      );
+    }
+    throw toXApiError(error, 'X image upload failed.');
+  }
 }
 
 function toXApiError(error, fallbackMessage) {

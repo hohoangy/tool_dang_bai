@@ -28,7 +28,11 @@ export async function publishPostToPlatform(userId, post) {
   const provider = providers[post.platform];
   if (!provider) throw new ApiError(400, 'Unsupported platform.');
 
-  let account = await SocialAccount.findOne({ userId, platform: post.platform, status: { $in: ['connected', 'designed'] } });
+  const accountFilter = post.socialAccountId
+    ? { _id: post.socialAccountId, userId, platform: post.platform, status: { $in: ['connected', 'designed'] } }
+    : { userId, platform: post.platform, status: { $in: ['connected', 'designed'] } };
+  let account = await SocialAccount.findOne(accountFilter);
+  if (!account) throw new ApiError(400, `No connected ${post.platform} account is available for this post.`);
   account = await refreshIfNeeded(provider, account);
   const result = await provider.publish(account, post);
 

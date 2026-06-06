@@ -1,4 +1,5 @@
 import { createModel, parseJson, toMysqlDate } from './mysql-model.js';
+import { decryptSecret, encryptSecret } from '../utils/secret.js';
 
 export const SocialAccount = createModel({
   table: 'social_accounts',
@@ -20,8 +21,8 @@ export const SocialAccount = createModel({
       platform: data.platform,
       account_name: data.accountName,
       external_account_id: data.externalAccountId || null,
-      access_token: data.accessToken || null,
-      refresh_token: data.refreshToken || null,
+      access_token: data.accessToken ? encryptSecret(data.accessToken) : null,
+      refresh_token: data.refreshToken ? encryptSecret(data.refreshToken) : null,
       token_expires_at: toMysqlDate(data.tokenExpiresAt),
       scopes: JSON.stringify(data.scopes || []),
       status: data.status || 'connected',
@@ -38,8 +39,8 @@ export const SocialAccount = createModel({
       platform: row.platform,
       accountName: row.account_name,
       externalAccountId: row.external_account_id,
-      accessToken: row.access_token,
-      refreshToken: row.refresh_token,
+      accessToken: decryptSecret(row.access_token),
+      refreshToken: decryptSecret(row.refresh_token),
       tokenExpiresAt: row.token_expires_at,
       scopes: parseJson(row.scopes, []),
       status: row.status,

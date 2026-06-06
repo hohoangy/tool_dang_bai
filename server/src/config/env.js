@@ -10,12 +10,14 @@ export const env = {
   databaseUrl: process.env.DATABASE_URL || 'mysql://root:@localhost:3306/ai_social_automation',
   jwtSecret: process.env.JWT_SECRET || 'dev-secret-change-me',
   jwtExpiresIn: process.env.JWT_EXPIRES_IN || '7d',
+  tokenEncryptionSecret: process.env.TOKEN_ENCRYPTION_SECRET || process.env.MOBILE_AUTOMATION_SECRET || process.env.JWT_SECRET || 'dev-secret-change-me',
   aiProvider: process.env.AI_PROVIDER || 'demo',
   openAiApiKey: process.env.OPENAI_API_KEY || '',
   meta: {
     appId: process.env.META_APP_ID || '',
     appSecret: process.env.META_APP_SECRET || '',
-    redirectUri: process.env.META_REDIRECT_URI || ''
+    redirectUri: process.env.META_REDIRECT_URI || '',
+    graphVersion: process.env.META_GRAPH_VERSION || 'v21.0'
   },
   x: {
     clientId: process.env.X_CLIENT_ID || '',

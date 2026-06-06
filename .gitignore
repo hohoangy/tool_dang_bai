@@ -14,6 +14,7 @@ coverage/
 *.err.log
 
 downloads/
+server/uploads/
 .history/
 
 .DS_Store

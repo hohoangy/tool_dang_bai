@@ -61,27 +61,43 @@ socialRoutes.get('/connect-facebook/callback', asyncHandler(async (req, res) => 
     res.redirect('/');
     return;
   }
+  if (req.query.error || !req.query.code || !req.query.state) {
+    res.redirect(`${env.clientUrl}/platforms?facebook=oauth-error`);
+    return;
+  }
 
-  const token = await facebookService.exchangeCode(req.query.code);
-  const pages = await facebookService.getPages(token.access_token);
-  const page = pages[0];
-  if (!page?.access_token) {
+  const oauthState = facebookService.verifyState(req.query.state);
+  const shortLivedToken = await facebookService.exchangeCode(req.query.code);
+  const longLivedToken = await facebookService.exchangeLongLivedUserToken(shortLivedToken.access_token);
+  const pages = await facebookService.getPages(longLivedToken.access_token);
+  const connectablePages = pages.filter((page) => page?.id && page?.name && page?.access_token);
+
+  if (!connectablePages.length) {
     res.redirect(`${env.clientUrl}/platforms?facebook=missing-page`);
     return;
   }
 
-  await SocialAccount.create({
-    userId: req.query.state,
+  await SocialAccount.deleteMany({ userId: oauthState.userId, platform: 'facebook' });
+  await SocialAccount.insertMany(connectablePages.map((page) => ({
+    userId: oauthState.userId,
     platform: 'facebook',
     accountName: page.name,
     externalAccountId: page.id,
     accessToken: page.access_token,
-    tokenExpiresAt: token.expires_in ? new Date(Date.now() + token.expires_in * 1000) : undefined,
+    refreshToken: longLivedToken.access_token,
+    tokenExpiresAt: undefined,
     scopes: ['pages_manage_posts', 'pages_read_engagement', 'pages_show_list'],
-    metadata: { tasks: page.tasks || [] },
+    metadata: {
+      tasks: page.tasks || [],
+      tokenType: 'page',
+      connectedBy: 'facebook_login',
+      graphVersion: env.meta.graphVersion,
+      userTokenExpiresAt: longLivedToken.expires_in ? new Date(Date.now() + longLivedToken.expires_in * 1000).toISOString() : null
+    },
     status: 'connected'
-  });
-  res.redirect(`${env.clientUrl}/platforms?facebook=connected`);
+  })));
+
+  res.redirect(`${env.clientUrl}/platforms?facebook=connected&pages=${connectablePages.length}`);
 }));
 
 socialRoutes.get('/connect-x/callback', asyncHandler(async (req, res) => {

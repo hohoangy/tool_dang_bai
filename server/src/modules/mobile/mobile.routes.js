@@ -77,6 +77,12 @@ const facebookPostSchema = z.object({
   text: z.string().min(1).max(5000),
   appPackage: z.string().optional().or(z.literal('')),
   autoSubmit: z.boolean().default(false),
+  images: z.array(z.object({
+    url: z.string().url(),
+    name: z.string().optional(),
+    mimeType: z.string().startsWith('image/').optional(),
+    size: z.number().int().positive().max(5 * 1024 * 1024).optional()
+  })).max(4).default([]),
   composerTap: z.object({ x: z.number(), y: z.number() }).optional(),
   submitTap: z.object({ x: z.number(), y: z.number() }).optional()
 });

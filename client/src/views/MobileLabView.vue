@@ -18,11 +18,13 @@ const screenshot = ref(null);
 const facebookPostResult = ref(null);
 const screenshotLoading = ref(false);
 const facebookPosting = ref(false);
+const facebookImageUploading = ref(false);
 const remoteTextInput = ref('');
 const facebookToolMode = ref('');
 const facebookImageInput = ref(null);
 const facebookVideoInput = ref(null);
 let jobTimer = null;
+const maxFacebookPhotos = 4;
 
 const defaultPackages = {
   facebook: 'com.facebook.katana',
@@ -33,7 +35,7 @@ const defaultPackages = {
 };
 
 const form = reactive({
-  platform: 'x',
+  platform: 'facebook',
   displayName: '',
   accountHandle: '',
   instanceName: 'LDPlayer-1',
@@ -41,7 +43,7 @@ const form = reactive({
   deviceId: '',
   notes: '',
   metadata: {
-    appPackage: defaultPackages.x,
+    appPackage: defaultPackages.facebook,
     username: '',
     password: '',
     loginSteps: {
@@ -131,7 +133,11 @@ function syncPackage() {
 }
 
 async function createAccount() {
-  const { data } = await http.post('/mobile/accounts', form);
+  const displayName = form.displayName?.trim() || form.accountHandle?.trim() || form.instanceName?.trim() || 'LDPlayer fallback';
+  const { data } = await http.post('/mobile/accounts', {
+    ...form,
+    displayName
+  });
   accounts.value.unshift(data.account);
   selectedIds.value = [data.account._id, ...selectedIds.value];
   resetForm();
@@ -249,7 +255,14 @@ async function sendRemoteKey(key) {
 }
 
 async function publishFacebookPost(options = {}) {
-  if (!selectedFacebookAccount.value || !facebookAutomationText.value.trim()) return;
+  if (!selectedFacebookAccount.value) {
+    ui.notify('Chưa chọn được tài khoản Facebook/LDPlayer. Hãy tải lại trang hoặc thêm thiết bị fallback trước.', 'error');
+    return;
+  }
+  if (!facebookAutomationText.value.trim()) {
+    ui.notify('Thiếu nội dung bài đăng.', 'error');
+    return;
+  }
   const autoSubmit = options.forceAutoSubmit || facebookPost.autoSubmit;
   facebookPosting.value = true;
   try {
@@ -257,6 +270,15 @@ async function publishFacebookPost(options = {}) {
       text: facebookAutomationText.value,
       appPackage: selectedFacebookAccount.value.metadata?.appPackage || defaultPackages.facebook,
       autoSubmit,
+      images: facebookPost.attachments
+        .filter((attachment) => attachment.type === 'photo' && attachment.uploadedUrl)
+        .slice(0, maxFacebookPhotos)
+        .map((attachment) => ({
+          url: attachment.uploadedUrl,
+          name: attachment.name,
+          mimeType: attachment.mimeType,
+          size: attachment.size
+        })),
       composerTap: facebookPost.composerTap,
       submitTap: facebookPost.submitTap
     });
@@ -282,16 +304,67 @@ function triggerFacebookAttachment(type) {
   if (type === 'video') facebookVideoInput.value?.click();
 }
 
-function addFacebookAttachments(event, type) {
+async function addFacebookAttachments(event, type) {
   const files = Array.from(event.target.files || []);
-  const nextItems = files.map((file) => ({
-    id: `${Date.now()}-${file.name}-${Math.random().toString(16).slice(2)}`,
-    name: file.name,
-    type,
-    url: URL.createObjectURL(file)
-  }));
-  facebookPost.attachments.push(...nextItems);
   event.target.value = '';
+  if (type !== 'photo') {
+    const nextItems = files.map((file) => ({
+      id: `${Date.now()}-${file.name}-${Math.random().toString(16).slice(2)}`,
+      name: file.name,
+      type,
+      url: URL.createObjectURL(file)
+    }));
+    facebookPost.attachments.push(...nextItems);
+    return;
+  }
+
+  const existingPhotoCount = facebookPost.attachments.filter((item) => item.type === 'photo').length;
+  const remaining = maxFacebookPhotos - existingPhotoCount;
+  if (remaining <= 0) {
+    ui.notify(`Facebook qua LDPlayer hỗ trợ tối đa ${maxFacebookPhotos} ảnh mỗi bài.`, 'error');
+    return;
+  }
+  const selectedFiles = files.slice(0, remaining);
+  if (!selectedFiles.length) return;
+  if (files.length > remaining) {
+    ui.notify(`Chỉ nhận thêm ${remaining} ảnh để giữ giới hạn ${maxFacebookPhotos} ảnh.`, 'error');
+  }
+  if (selectedFiles.some((file) => file.size > 5 * 1024 * 1024)) {
+    ui.notify('Ảnh phải nhỏ hơn hoặc bằng 5 MB.', 'error');
+    return;
+  }
+
+  facebookImageUploading.value = true;
+  try {
+    for (const file of selectedFiles) {
+      const previewUrl = URL.createObjectURL(file);
+      try {
+        const { data } = await http.post('/media/images', file, {
+          headers: {
+            'Content-Type': file.type,
+            'X-File-Name': encodeURIComponent(file.name)
+          }
+        });
+        facebookPost.attachments.push({
+          id: `${Date.now()}-${file.name}-${Math.random().toString(16).slice(2)}`,
+          name: file.name,
+          type,
+          url: previewUrl,
+          uploadedUrl: data.image.url,
+          mimeType: data.image.mimeType,
+          size: data.image.size
+        });
+      } catch (error) {
+        URL.revokeObjectURL(previewUrl);
+        throw error;
+      }
+    }
+    ui.notify(`Đã tải ${selectedFiles.length} ảnh lên, sẵn sàng chép vào LDPlayer.`);
+  } catch (error) {
+    ui.notify(error.message, 'error');
+  } finally {
+    facebookImageUploading.value = false;
+  }
 }
 
 function removeFacebookAttachment(item) {
@@ -320,7 +393,7 @@ function toggleAccount(account) {
 
 function resetForm() {
   Object.assign(form, {
-    platform: 'x',
+    platform: 'facebook',
     displayName: '',
     accountHandle: '',
     instanceName: 'LDPlayer-1',
@@ -328,7 +401,7 @@ function resetForm() {
     deviceId: '',
     notes: '',
     metadata: {
-      appPackage: defaultPackages.x,
+      appPackage: defaultPackages.facebook,
       username: '',
       password: '',
       loginSteps: {
@@ -381,9 +454,31 @@ onUnmounted(() => {
 
 <template>
   <div class="space-y-5">
+    <BaseCard>
+      <div class="flex flex-wrap items-center justify-between gap-4">
+        <div class="max-w-3xl">
+          <p class="text-sm font-extrabold uppercase tracking-wide text-emerald-500">Luồng chính khuyến nghị</p>
+          <h2 class="mt-1 text-2xl font-extrabold">Đăng Facebook bằng Meta API, dùng LDPlayer làm fallback</h2>
+          <p class="mt-2 text-sm leading-6 text-zinc-500">
+            Kết nối Facebook Page ở mục Nền tảng, sau đó chọn đúng Page khi tạo bài viết. Mobile ảo chỉ nên dùng để remote, xử lý checkpoint, 2FA hoặc thao tác thủ công khi API không hỗ trợ.
+          </p>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <RouterLink class="btn-primary" to="/platforms">
+            <Wifi class="h-4 w-4" />
+            Kết nối Facebook Page
+          </RouterLink>
+          <RouterLink class="btn-soft" to="/create">
+            <Send class="h-4 w-4" />
+            Tạo bài qua API
+          </RouterLink>
+        </div>
+      </div>
+    </BaseCard>
+
     <div class="grid gap-3 sm:grid-cols-3">
       <BaseCard>
-        <p class="text-sm font-semibold text-zinc-500">Nick sẵn sàng</p>
+        <p class="text-sm font-semibold text-zinc-500">Thiết bị sẵn sàng</p>
         <p class="mt-2 text-3xl font-extrabold">{{ readyCount }}</p>
       </BaseCard>
       <BaseCard>
@@ -400,8 +495,8 @@ onUnmounted(() => {
       <BaseCard>
         <div class="mb-5 flex items-start justify-between gap-4">
           <div>
-            <h2 class="text-xl font-extrabold">Thêm nick LDPlayer</h2>
-            <p class="mt-1 text-sm text-zinc-500">Mỗi nick gắn với một instance, ADB target và cấu hình đăng nhập.</p>
+            <h2 class="text-xl font-extrabold">Thêm thiết bị LDPlayer</h2>
+            <p class="mt-1 text-sm text-zinc-500">Dùng cho remote, checkpoint, 2FA và thao tác thủ công ngoài API.</p>
           </div>
           <Smartphone class="h-6 w-6 text-zinc-500" />
         </div>
@@ -415,7 +510,7 @@ onUnmounted(() => {
               <option value="tiktok">TikTok</option>
               <option value="other">Khác</option>
             </select>
-            <input v-model.trim="form.displayName" class="field" required placeholder="Tên nick" />
+            <input v-model.trim="form.displayName" class="field" placeholder="Tên thiết bị/nick (tùy chọn)" />
           </div>
           <input v-model.trim="form.accountHandle" class="field" placeholder="@username hoặc UID" />
           <input v-model.trim="form.metadata.appPackage" class="field" required placeholder="Android package name" />
@@ -425,8 +520,8 @@ onUnmounted(() => {
           </div>
           <input v-model.trim="form.deviceId" class="field" placeholder="Device ID nếu khác ADB host" />
           <div class="grid gap-3 sm:grid-cols-2">
-            <input v-model.trim="form.metadata.username" class="field" required placeholder="Tài khoản đăng nhập" />
-            <input v-model="form.metadata.password" class="field" required type="password" placeholder="Mật khẩu" />
+            <input v-model.trim="form.metadata.username" class="field" placeholder="Tài khoản đăng nhập (tùy chọn)" />
+            <input v-model="form.metadata.password" class="field" type="password" placeholder="Mật khẩu (tùy chọn)" />
           </div>
           <div class="grid gap-3 sm:grid-cols-3">
             <label class="space-y-1 text-xs font-bold uppercase text-zinc-500">
@@ -452,9 +547,9 @@ onUnmounted(() => {
             </label>
           </div>
           <textarea v-model.trim="form.notes" class="field min-h-20 resize-none" placeholder="Ghi chú checkpoint/proxy/2FA nếu có"></textarea>
-          <button class="btn-primary w-full" :disabled="loading || !form.displayName || !form.instanceName || !form.metadata.username || !form.metadata.password">
+          <button class="btn-primary w-full" :disabled="loading || !form.instanceName || !form.metadata.appPackage">
             <ClipboardList class="h-4 w-4" />
-            Thêm vào hàng điều khiển
+            Thêm vào mobile fallback
           </button>
         </form>
       </BaseCard>
@@ -463,8 +558,8 @@ onUnmounted(() => {
         <BaseCard>
           <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
             <div>
-              <h2 class="text-xl font-extrabold">Remote LDPlayer</h2>
-              <p class="mt-1 text-sm text-zinc-500">Mở giả lập, xem màn hình, click để tap và nhập liệu trực tiếp qua ADB.</p>
+              <h2 class="text-xl font-extrabold">Remote LDPlayer fallback</h2>
+              <p class="mt-1 text-sm text-zinc-500">Mở giả lập, xem màn hình, click để tap và xử lý thủ công khi API cần hỗ trợ.</p>
             </div>
             <select v-model="selectedRemoteId" class="field max-w-xs" @change="screenshot = null">
               <option v-for="account in accounts" :key="account._id" :value="account._id">
@@ -545,8 +640,8 @@ onUnmounted(() => {
         <BaseCard>
           <div class="mb-4 flex flex-wrap items-start justify-between gap-3">
             <div>
-              <h2 class="text-xl font-extrabold">Đăng Facebook qua LDPlayer</h2>
-              <p class="mt-1 text-sm text-zinc-500">Mở composer trong app Facebook đã đăng nhập, kiểm tra màn hình rồi mới tự bấm đăng khi bật Auto post.</p>
+              <h2 class="text-xl font-extrabold">Fallback Facebook qua LDPlayer</h2>
+              <p class="mt-1 text-sm text-zinc-500">Chỉ dùng khi cần kiểm tra thủ công, checkpoint hoặc test composer. Đăng Page hàng ngày nên chạy qua Meta API.</p>
             </div>
             <select v-model="selectedFacebookId" class="field max-w-xs">
               <option v-for="account in accounts" :key="account._id" :value="account._id">
@@ -563,7 +658,7 @@ onUnmounted(() => {
                   <p class="font-extrabold">Bài viết mới</p>
                   <button
                     class="inline-flex items-center gap-2 rounded-full bg-[#1877f2] px-4 py-1.5 text-sm font-extrabold text-white disabled:opacity-50"
-                    :disabled="facebookPosting || !facebookAutomationText.trim()"
+                    :disabled="facebookPosting || facebookImageUploading || !selectedFacebookAccount || !facebookAutomationText.trim()"
                     @click="publishFacebookPost({ forceAutoSubmit: true })"
                   >
                     <Loader2 v-if="facebookPosting" class="h-4 w-4 animate-spin" />
@@ -643,7 +738,15 @@ onUnmounted(() => {
                       <span class="text-xs font-bold text-zinc-500">Facebook composer</span>
                     </div>
                     <div class="grid grid-cols-3 gap-2 sm:grid-cols-6">
-                      <button class="grid h-11 place-items-center rounded-lg bg-zinc-100 text-emerald-500 dark:bg-zinc-900" title="Ảnh/video" @click="triggerFacebookAttachment('photo')"><Image class="h-5 w-5" /></button>
+                      <button
+                        class="grid h-11 place-items-center rounded-lg bg-zinc-100 text-emerald-500 disabled:cursor-not-allowed disabled:opacity-40 dark:bg-zinc-900"
+                        :title="facebookPost.attachments.filter((item) => item.type === 'photo').length >= maxFacebookPhotos ? `Đã đủ ${maxFacebookPhotos} ảnh` : 'Tải tối đa 4 ảnh vào LDPlayer'"
+                        :disabled="facebookImageUploading || facebookPost.attachments.filter((item) => item.type === 'photo').length >= maxFacebookPhotos"
+                        @click="triggerFacebookAttachment('photo')"
+                      >
+                        <Loader2 v-if="facebookImageUploading" class="h-5 w-5 animate-spin" />
+                        <Image v-else class="h-5 w-5" />
+                      </button>
                       <button class="grid h-11 place-items-center rounded-lg bg-zinc-100 text-sky-500 dark:bg-zinc-900" title="Gắn thẻ" @click="setFacebookToolMode('tag')"><UserRoundPlus class="h-5 w-5" /></button>
                       <button class="grid h-11 place-items-center rounded-lg bg-zinc-100 text-amber-500 dark:bg-zinc-900" title="Cảm xúc" @click="setFacebookToolMode('feeling')"><Laugh class="h-5 w-5" /></button>
                       <button class="grid h-11 place-items-center rounded-lg bg-zinc-100 text-red-500 dark:bg-zinc-900" title="Vị trí" @click="setFacebookToolMode('location')"><MapPin class="h-5 w-5" /></button>
@@ -718,7 +821,7 @@ onUnmounted(() => {
               </div>
 
               <div class="flex flex-wrap gap-2">
-                <button class="btn-primary" :disabled="facebookPosting || !selectedFacebookAccount || !facebookAutomationText.trim()" @click="publishFacebookPost()">
+                <button class="btn-primary" :disabled="facebookPosting || facebookImageUploading || !selectedFacebookAccount || !facebookAutomationText.trim()" @click="publishFacebookPost()">
                   <Loader2 v-if="facebookPosting" class="h-4 w-4 animate-spin" />
                   <Send v-else class="h-4 w-4" />
                   {{ facebookPost.autoSubmit ? 'Đăng Facebook' : 'Mở composer' }}
@@ -730,7 +833,7 @@ onUnmounted(() => {
               </div>
 
               <p class="text-sm text-zinc-500">
-                Khi test lần đầu, để tắt Auto post, bấm Mở composer, xem screenshot rồi chỉnh tọa độ X/Y của nút Đăng. Text tiếng Việt có dấu sẽ được gửi qua clipboard/paste Unicode khi thiết bị hỗ trợ.
+                Ảnh được tải lên server rồi chép vào thư mục Pictures của LDPlayer trước khi mở Facebook. Luồng fallback hỗ trợ tối đa 4 ảnh mỗi bài. Khi test lần đầu, hãy tắt Auto post để kiểm tra ảnh và nội dung trong composer.
               </p>
             </div>
 

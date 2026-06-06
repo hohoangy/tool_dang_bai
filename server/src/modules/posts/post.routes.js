@@ -73,10 +73,18 @@ postRoutes.patch('/posts/:id', requireAuth, asyncHandler(async (req, res) => {
       outline: z.array(z.string()).optional()
     }).optional(),
     status: z.enum(['draft', 'queued', 'scheduled', 'published', 'failed']).optional(),
+    socialAccountId: z.string().optional().or(z.literal('')),
     scheduledAt: z.string().datetime().optional(),
     media: z.object({
       imageUrl: z.string().url().optional().or(z.literal('')),
-      altText: z.string().optional()
+      altText: z.string().optional(),
+      images: z.array(z.object({
+        url: z.string().url(),
+        mimeType: z.string().startsWith('image/').optional(),
+        name: z.string().optional(),
+        size: z.number().int().positive().max(5 * 1024 * 1024).optional(),
+        altText: z.string().max(1000).optional()
+      })).max(4).optional()
     }).optional()
   });
   const input = schema.parse(req.body);
@@ -132,11 +140,19 @@ postRoutes.post('/publish-post', requireAuth, asyncHandler(async (req, res) => {
   const post = await postRepository.findByIdForUser(postId, req.user._id);
   if (!post) throw new ApiError(404, 'Post not found.');
 
-  const result = await publishPostToPlatform(req.user._id, post);
-  post.status = 'published';
-  post.publishedAt = new Date();
-  post.externalPostId = result.externalPostId;
-  await post.save();
+  try {
+    const result = await publishPostToPlatform(req.user._id, post);
+    post.status = 'published';
+    post.publishedAt = new Date();
+    post.externalPostId = result.externalPostId;
+    post.errorMessage = null;
+    await post.save();
 
-  res.json({ post, result });
+    res.json({ post, result });
+  } catch (error) {
+    post.status = 'failed';
+    post.errorMessage = error.message;
+    await post.save();
+    throw error;
+  }
 }));

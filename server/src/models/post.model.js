@@ -11,6 +11,7 @@ export const Post = createModel({
     publishedAt: 'published_at',
     externalPostId: 'external_post_id',
     errorMessage: 'error_message',
+    socialAccountId: 'social_account_id',
     createdAt: 'created_at',
     updatedAt: 'updated_at'
   },
@@ -22,6 +23,7 @@ export const Post = createModel({
       topic: data.topic,
       tone: data.tone,
       platform: data.platform,
+      social_account_id: data.socialAccountId || null,
       content: JSON.stringify(data.content || {}),
       status: data.status || 'draft',
       scheduled_at: toMysqlDate(data.scheduledAt),
@@ -43,6 +45,7 @@ export const Post = createModel({
       topic: row.topic,
       tone: row.tone,
       platform: row.platform,
+      socialAccountId: row.social_account_id,
       content: parseJson(row.content, {}),
       status: row.status,
       scheduledAt: row.scheduled_at,

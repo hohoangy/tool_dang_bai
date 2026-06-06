@@ -1,9 +1,10 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { requireAuth } from '../../middleware/auth.middleware.js';
-import { asyncHandler } from '../../utils/api-error.js';
+import { ApiError, asyncHandler } from '../../utils/api-error.js';
 import { Post } from '../../models/post.model.js';
 import { Schedule } from '../../models/schedule.model.js';
+import { SocialAccount } from '../../models/social-account.model.js';
 import { env } from '../../config/env.js';
 
 export const scheduleRoutes = Router();
@@ -13,6 +14,7 @@ const scheduleSchema = z.object({
   topic: z.string().min(2),
   tone: z.string(),
   platform: z.enum(['facebook', 'x', 'youtube', 'tiktok']),
+  socialAccountId: z.string().optional().or(z.literal('')),
   scheduledAt: z.string().datetime(),
   content: z.object({
     hook: z.string(),
@@ -23,7 +25,14 @@ const scheduleSchema = z.object({
   }),
   media: z.object({
     imageUrl: z.string().url().optional().or(z.literal('')),
-    altText: z.string().optional()
+    altText: z.string().optional(),
+    images: z.array(z.object({
+      url: z.string().url(),
+      mimeType: z.string().startsWith('image/').optional(),
+      name: z.string().optional(),
+      size: z.number().int().positive().max(5 * 1024 * 1024).optional(),
+      altText: z.string().max(1000).optional()
+    })).max(4).optional()
   }).optional()
 });
 
@@ -49,8 +58,19 @@ scheduleRoutes.post('/schedule-post', requireAuth, asyncHandler(async (req, res)
     return;
   }
 
+  if (input.socialAccountId) {
+    const account = await SocialAccount.findOne({
+      _id: input.socialAccountId,
+      userId: req.user._id,
+      platform: input.platform,
+      status: 'connected'
+    });
+    if (!account) throw new ApiError(400, 'Selected social account is not connected for this platform.');
+  }
+
   const post = await Post.create({
     ...input,
+    socialAccountId: input.socialAccountId || undefined,
     media: normalizeMedia(input.media),
     userId: req.user._id,
     scheduledAt: new Date(input.scheduledAt),
@@ -67,10 +87,19 @@ scheduleRoutes.post('/schedule-post', requireAuth, asyncHandler(async (req, res)
 }));
 
 function normalizeMedia(media) {
-  if (!media?.imageUrl) return {};
+  const images = (media?.images || []).slice(0, 4).map((image) => ({
+    url: image.url.trim(),
+    mimeType: image.mimeType || '',
+    name: image.name || '',
+    size: image.size,
+    altText: image.altText?.trim() || ''
+  }));
+  const imageUrl = media?.imageUrl?.trim() || images[0]?.url || '';
+  if (!imageUrl && !images.length) return {};
   return {
-    imageUrl: media.imageUrl.trim(),
-    altText: media.altText?.trim() || ''
+    imageUrl,
+    altText: media?.altText?.trim() || images[0]?.altText || '',
+    images
   };
 }
 
