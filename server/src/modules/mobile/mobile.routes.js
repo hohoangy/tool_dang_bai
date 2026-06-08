@@ -73,6 +73,26 @@ const swipeSchema = z.object({
 const textSchema = z.object({ text: z.string().min(1).max(500) });
 const keySchema = z.object({ key: z.enum(['back', 'home', 'enter', 'recent', 'power']) });
 const openAppSchema = z.object({ appPackage: z.string().optional().or(z.literal('')) });
+const defaultMobileAccount = {
+  platform: 'facebook',
+  displayName: 'LDPlayer Facebook',
+  accountHandle: '',
+  instanceName: 'LDPlayer-1',
+  adbHost: '127.0.0.1:5555',
+  deviceId: '',
+  status: 'ready',
+  notes: 'Cấu hình mặc định để test đăng Facebook qua LDPlayer.',
+  metadata: {
+    appPackage: 'com.facebook.katana',
+    username: '',
+    password: '',
+    loginSteps: {
+      usernameTap: { x: 540, y: 760 },
+      passwordTap: { x: 540, y: 900 },
+      submitTap: { x: 540, y: 1060 }
+    }
+  }
+};
 const facebookPostSchema = z.object({
   text: z.string().min(1).max(5000),
   appPackage: z.string().optional().or(z.literal('')),
@@ -88,8 +108,29 @@ const facebookPostSchema = z.object({
 });
 
 mobileRoutes.get('/accounts', requireAuth, asyncHandler(async (req, res) => {
-  const accounts = await MobileAccount.find({ userId: req.user._id }).sort({ updatedAt: -1 });
-  const logs = await MobileAccountLog.find({ userId: req.user._id }).sort({ createdAt: -1 }).limit(80);
+  let accounts = await MobileAccount.find({ userId: req.user._id }).sort({ updatedAt: -1 });
+  if (!accounts.length) {
+    const metadata = normalizeMetadata(defaultMobileAccount.metadata);
+    const account = await MobileAccount.create({
+      ...defaultMobileAccount,
+      metadata,
+      userId: req.user._id,
+      accountHandle: null,
+      deviceId: null
+    });
+    await writeLog(req.user._id, account._id, 'info', 'create_default_account', 'Đã tạo cấu hình LDPlayer mặc định.', {
+      platform: account.platform,
+      instanceName: account.instanceName,
+      adbHost: account.adbHost
+    });
+    accounts = [account];
+  }
+  let logs = [];
+  try {
+    logs = await MobileAccountLog.find({ userId: req.user._id }).sort({ createdAt: -1 }).limit(40);
+  } catch (error) {
+    console.warn('mobile account logs skipped:', error.message);
+  }
   res.json({ accounts: accounts.map(sanitizeAccount), logs });
 }));
 

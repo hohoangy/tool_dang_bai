@@ -1,11 +1,13 @@
 <script setup>
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue';
-import { ClipboardList, Home, Image, Keyboard, Laugh, Loader2, MapPin, MousePointer2, Play, RefreshCcw, Send, Smartphone, Tag, Terminal, Trash2, Undo2, UserRoundPlus, Video, Wifi, XCircle } from 'lucide-vue-next';
+import { Home, Image, Keyboard, Laugh, Loader2, MapPin, MousePointer2, Play, RefreshCcw, Send, Smartphone, Tag, Terminal, Undo2, UserRoundPlus, Video, Wifi, XCircle } from 'lucide-vue-next';
 import { http } from '../api/http';
 import BaseCard from '../components/BaseCard.vue';
+import { useAuthStore } from '../stores/auth';
 import { useUiStore } from '../stores/ui';
 
 const ui = useUiStore();
+const auth = useAuthStore();
 const accounts = ref([]);
 const logs = ref([]);
 const loading = ref(false);
@@ -32,6 +34,27 @@ const defaultPackages = {
   youtube: 'com.google.android.youtube',
   tiktok: 'com.zhiliaoapp.musically',
   other: ''
+};
+
+const defaultMobileAccount = {
+  platform: 'facebook',
+  displayName: 'LDPlayer Facebook',
+  accountHandle: '',
+  instanceName: 'LDPlayer-1',
+  adbHost: '127.0.0.1:5555',
+  deviceId: '',
+  status: 'ready',
+  notes: 'Cấu hình mặc định để test đăng Facebook qua LDPlayer.',
+  metadata: {
+    appPackage: defaultPackages.facebook,
+    username: '',
+    password: '',
+    loginSteps: {
+      usernameTap: { x: 540, y: 760 },
+      passwordTap: { x: 540, y: 900 },
+      submitTap: { x: 540, y: 1060 }
+    }
+  }
 };
 
 const form = reactive({
@@ -115,17 +138,37 @@ async function load() {
   loading.value = true;
   try {
     const { data } = await http.get('/mobile/accounts');
-    accounts.value = data.accounts;
-    logs.value = data.logs;
-    if (!selectedRemoteId.value && data.accounts[0]) selectedRemoteId.value = data.accounts[0]._id;
-    if (!selectedFacebookId.value) {
-      const facebookAccount = data.accounts.find((account) => account.platform === 'facebook') || data.accounts[0];
-      if (facebookAccount) selectedFacebookId.value = facebookAccount._id;
+    applyMobileAccounts(data);
+  } catch (error) {
+    if (isAuthError(error)) {
+      await auth.login('creator@example.com', 'password123');
+      const { data } = await http.get('/mobile/accounts');
+      applyMobileAccounts(data);
+      ui.notify('Đã làm mới phiên đăng nhập local.');
+      return;
     }
-    selectedIds.value = selectedIds.value.filter((id) => data.accounts.some((account) => account._id === id));
+    ui.notify(error.message, 'error');
   } finally {
     loading.value = false;
   }
+}
+
+function applyMobileAccounts(data) {
+  const nextAccounts = data.accounts || [];
+  accounts.value = nextAccounts;
+  logs.value = data.logs || [];
+  if (nextAccounts[0] && !nextAccounts.some((account) => account._id === selectedRemoteId.value)) {
+    selectedRemoteId.value = nextAccounts[0]._id;
+  }
+  const facebookAccount = nextAccounts.find((account) => account.platform === 'facebook') || nextAccounts[0];
+  if (facebookAccount && !nextAccounts.some((account) => account._id === selectedFacebookId.value)) {
+    selectedFacebookId.value = facebookAccount._id;
+  }
+  selectedIds.value = selectedIds.value.filter((id) => nextAccounts.some((account) => account._id === id));
+}
+
+function isAuthError(error) {
+  return /authentication required|invalid session/i.test(error?.message || '');
 }
 
 function syncPackage() {
@@ -457,104 +500,16 @@ onUnmounted(() => {
     <BaseCard>
       <div class="flex flex-wrap items-center justify-between gap-4">
         <div class="max-w-3xl">
-          <p class="text-sm font-extrabold uppercase tracking-wide text-emerald-500">Luồng chính khuyến nghị</p>
-          <h2 class="mt-1 text-2xl font-extrabold">Đăng Facebook bằng Meta API, dùng LDPlayer làm fallback</h2>
+          <p class="text-sm font-extrabold uppercase tracking-wide text-emerald-500">Tool chính</p>
+          <h2 class="mt-1 text-2xl font-extrabold">Test đăng Facebook thật qua LDPlayer</h2>
           <p class="mt-2 text-sm leading-6 text-zinc-500">
-            Kết nối Facebook Page ở mục Nền tảng, sau đó chọn đúng Page khi tạo bài viết. Mobile ảo chỉ nên dùng để remote, xử lý checkpoint, 2FA hoặc thao tác thủ công khi API không hỗ trợ.
+            Dùng Facebook app đã đăng nhập trong LDPlayer để mở composer, nhập nội dung, gắn ảnh và kiểm tra bài đăng thật mà không cần mua token API.
           </p>
-        </div>
-        <div class="flex flex-wrap gap-2">
-          <RouterLink class="btn-primary" to="/platforms">
-            <Wifi class="h-4 w-4" />
-            Kết nối Facebook Page
-          </RouterLink>
-          <RouterLink class="btn-soft" to="/create">
-            <Send class="h-4 w-4" />
-            Tạo bài qua API
-          </RouterLink>
         </div>
       </div>
     </BaseCard>
 
-    <div class="grid gap-3 sm:grid-cols-3">
-      <BaseCard>
-        <p class="text-sm font-semibold text-zinc-500">Thiết bị sẵn sàng</p>
-        <p class="mt-2 text-3xl font-extrabold">{{ readyCount }}</p>
-      </BaseCard>
-      <BaseCard>
-        <p class="text-sm font-semibold text-zinc-500">Đang chạy</p>
-        <p class="mt-2 text-3xl font-extrabold">{{ runningCount }}</p>
-      </BaseCard>
-      <BaseCard>
-        <p class="text-sm font-semibold text-zinc-500">Cần xử lý</p>
-        <p class="mt-2 text-3xl font-extrabold">{{ issueCount }}</p>
-      </BaseCard>
-    </div>
-
-    <div class="grid gap-5 xl:grid-cols-[420px_minmax(0,1fr)]">
-      <BaseCard>
-        <div class="mb-5 flex items-start justify-between gap-4">
-          <div>
-            <h2 class="text-xl font-extrabold">Thêm thiết bị LDPlayer</h2>
-            <p class="mt-1 text-sm text-zinc-500">Dùng cho remote, checkpoint, 2FA và thao tác thủ công ngoài API.</p>
-          </div>
-          <Smartphone class="h-6 w-6 text-zinc-500" />
-        </div>
-
-        <form class="space-y-3" @submit.prevent="createAccount">
-          <div class="grid gap-3 sm:grid-cols-2">
-            <select v-model="form.platform" class="field" @change="syncPackage">
-              <option value="x">X.com</option>
-              <option value="facebook">Facebook</option>
-              <option value="youtube">YouTube</option>
-              <option value="tiktok">TikTok</option>
-              <option value="other">Khác</option>
-            </select>
-            <input v-model.trim="form.displayName" class="field" placeholder="Tên thiết bị/nick (tùy chọn)" />
-          </div>
-          <input v-model.trim="form.accountHandle" class="field" placeholder="@username hoặc UID" />
-          <input v-model.trim="form.metadata.appPackage" class="field" required placeholder="Android package name" />
-          <div class="grid gap-3 sm:grid-cols-2">
-            <input v-model.trim="form.instanceName" class="field" required placeholder="LDPlayer instance" />
-            <input v-model.trim="form.adbHost" class="field" placeholder="127.0.0.1:5555" />
-          </div>
-          <input v-model.trim="form.deviceId" class="field" placeholder="Device ID nếu khác ADB host" />
-          <div class="grid gap-3 sm:grid-cols-2">
-            <input v-model.trim="form.metadata.username" class="field" placeholder="Tài khoản đăng nhập (tùy chọn)" />
-            <input v-model="form.metadata.password" class="field" type="password" placeholder="Mật khẩu (tùy chọn)" />
-          </div>
-          <div class="grid gap-3 sm:grid-cols-3">
-            <label class="space-y-1 text-xs font-bold uppercase text-zinc-500">
-              User tap
-              <div class="grid grid-cols-2 gap-2">
-                <input v-model.number="form.metadata.loginSteps.usernameTap.x" class="field px-2 py-2 text-sm" type="number" />
-                <input v-model.number="form.metadata.loginSteps.usernameTap.y" class="field px-2 py-2 text-sm" type="number" />
-              </div>
-            </label>
-            <label class="space-y-1 text-xs font-bold uppercase text-zinc-500">
-              Pass tap
-              <div class="grid grid-cols-2 gap-2">
-                <input v-model.number="form.metadata.loginSteps.passwordTap.x" class="field px-2 py-2 text-sm" type="number" />
-                <input v-model.number="form.metadata.loginSteps.passwordTap.y" class="field px-2 py-2 text-sm" type="number" />
-              </div>
-            </label>
-            <label class="space-y-1 text-xs font-bold uppercase text-zinc-500">
-              Login tap
-              <div class="grid grid-cols-2 gap-2">
-                <input v-model.number="form.metadata.loginSteps.submitTap.x" class="field px-2 py-2 text-sm" type="number" />
-                <input v-model.number="form.metadata.loginSteps.submitTap.y" class="field px-2 py-2 text-sm" type="number" />
-              </div>
-            </label>
-          </div>
-          <textarea v-model.trim="form.notes" class="field min-h-20 resize-none" placeholder="Ghi chú checkpoint/proxy/2FA nếu có"></textarea>
-          <button class="btn-primary w-full" :disabled="loading || !form.instanceName || !form.metadata.appPackage">
-            <ClipboardList class="h-4 w-4" />
-            Thêm vào mobile fallback
-          </button>
-        </form>
-      </BaseCard>
-
-      <div class="space-y-5">
+    <div class="space-y-5">
         <BaseCard>
           <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
             <div>
@@ -847,90 +802,6 @@ onUnmounted(() => {
         </BaseCard>
 
         <BaseCard>
-          <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <h2 class="text-xl font-extrabold">Batch tự động</h2>
-              <p class="mt-1 text-sm text-zinc-500">{{ selectedAccounts.length }} nick đang được chọn.</p>
-            </div>
-            <div class="flex flex-wrap gap-2">
-              <button class="btn-soft" :disabled="loading || running" @click="load">
-                <RefreshCcw class="h-4 w-4" />
-                Làm mới
-              </button>
-              <button v-if="jobIsActive" class="btn-soft" @click="cancelJob">
-                <XCircle class="h-4 w-4" />
-                Hủy batch
-              </button>
-              <button class="btn-primary" :disabled="!canRunBatch" @click="runBatch">
-                <Loader2 v-if="running" class="h-4 w-4 animate-spin" />
-                <Play v-else class="h-4 w-4" />
-                Chạy batch
-              </button>
-            </div>
-          </div>
-
-          <div v-if="activeJob" class="mb-4 rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
-            <div class="mb-2 flex items-center justify-between gap-3">
-              <p class="text-sm font-bold">Job {{ activeJob.status }}</p>
-              <p class="text-sm text-zinc-500">{{ activeJob.completed }} xong · {{ activeJob.failed }} lỗi · {{ activeJob.total }} tổng</p>
-            </div>
-            <div class="h-2 overflow-hidden rounded-full bg-zinc-100 dark:bg-zinc-800">
-              <div class="h-full bg-zinc-950 transition-all dark:bg-white" :style="{ width: `${jobProgress}%` }"></div>
-            </div>
-          </div>
-
-          <div class="overflow-hidden rounded-lg border border-zinc-200 dark:border-zinc-800">
-            <table class="w-full min-w-[760px] text-left text-sm">
-              <thead class="bg-zinc-50 text-xs uppercase text-zinc-500 dark:bg-zinc-900">
-                <tr>
-                  <th class="w-12 px-4 py-3"></th>
-                  <th class="px-4 py-3">Nick</th>
-                  <th class="px-4 py-3">Instance</th>
-                  <th class="px-4 py-3">ADB</th>
-                  <th class="px-4 py-3">Trạng thái</th>
-                  <th class="px-4 py-3 text-right">Thao tác</th>
-                </tr>
-              </thead>
-              <tbody class="divide-y divide-zinc-200 dark:divide-zinc-800">
-                <tr v-for="account in accounts" :key="account._id" class="bg-white dark:bg-zinc-950">
-                  <td class="px-4 py-3">
-                    <input type="checkbox" class="h-4 w-4" :checked="selectedIds.includes(account._id)" @change="toggleAccount(account)" />
-                  </td>
-                  <td class="px-4 py-3">
-                    <p class="font-bold">{{ account.displayName }}</p>
-                    <p class="text-xs text-zinc-500">{{ account.metadata?.username || account.accountHandle || '-' }} · {{ account.platform }}</p>
-                  </td>
-                  <td class="px-4 py-3">{{ account.instanceName }}</td>
-                  <td class="px-4 py-3">{{ account.deviceId || account.adbHost || '-' }}</td>
-                  <td class="px-4 py-3">
-                    <span class="rounded-full border border-zinc-200 px-3 py-1 text-xs font-bold dark:border-zinc-700">
-                      {{ statusLabels[account.status] || account.status }}
-                    </span>
-                    <p class="mt-1 text-xs text-zinc-500">Login: {{ formatDate(account.lastLoginAt) }}</p>
-                  </td>
-                  <td class="px-4 py-3">
-                    <div class="flex justify-end gap-2">
-                      <button class="btn-soft h-9 px-3" :disabled="running" @click="probe(account)">
-                        <Wifi class="h-4 w-4" />
-                        ADB
-                      </button>
-                      <button class="btn-primary h-9 px-3" :disabled="running" @click="runOne(account)">
-                        <Play class="h-4 w-4" />
-                        Login
-                      </button>
-                      <button class="btn-soft h-9 px-3" :disabled="running" @click="deleteAccount(account)">
-                        <Trash2 class="h-4 w-4" />
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-            <p v-if="!accounts.length" class="p-6 text-sm text-zinc-500">Chưa có nick nào trong hàng điều khiển.</p>
-          </div>
-        </BaseCard>
-
-        <BaseCard>
           <div class="mb-4 flex items-center gap-2">
             <Terminal class="h-5 w-5 text-zinc-500" />
             <h3 class="text-lg font-extrabold">Log tự động</h3>
@@ -953,5 +824,4 @@ onUnmounted(() => {
         </BaseCard>
       </div>
     </div>
-  </div>
 </template>

@@ -1,7 +1,7 @@
 <script setup>
 import { computed, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
-import { BarChart3, CalendarClock, CheckCircle2, Inbox, LayoutDashboard, LogOut, Menu, MonitorSmartphone, Moon, PenLine, Settings, Share2, Sparkles, Sun, X } from 'lucide-vue-next';
+import { LogOut, Menu, MonitorSmartphone, Moon, Sun, X } from 'lucide-vue-next';
 import { useAuthStore } from '../stores/auth';
 import { useUiStore } from '../stores/ui';
 import Toast from '../components/Toast.vue';
@@ -14,45 +14,16 @@ const mobileOpen = ref(false);
 
 const navGroups = [
   {
-    label: 'Vận hành đăng bài',
+    label: 'Tool chính',
     items: [
-      { to: '/', label: 'Tổng quan', icon: LayoutDashboard },
-      { to: '/create', label: 'Tạo bài đa kênh', icon: PenLine },
-      { to: '/scheduled', label: 'Lịch đăng', icon: CalendarClock },
-      { to: '/published', label: 'Bài đã đăng', icon: CheckCircle2 }
-    ]
-  },
-  {
-    label: 'Kênh xuất bản',
-    items: [
-      { to: '/platforms', label: 'X, Facebook, YouTube, TikTok', icon: Share2 },
-      { to: '/ai-generator', label: 'Nội dung AI', icon: Sparkles }
-    ]
-  },
-  {
-    label: 'Tương tác & số liệu',
-    items: [
-      { to: '/comments', label: 'Bình luận / Inbox', icon: Inbox },
-      { to: '/analytics', label: 'Thống kê', icon: BarChart3 }
-    ]
-  },
-  {
-    label: 'Công cụ',
-    items: [
-      { to: '/mobile-lab', label: 'Mobile fallback', icon: MonitorSmartphone },
-      { to: '/settings', label: 'Cài đặt', icon: Settings }
+      { to: '/mobile-lab', label: 'Remote LDPlayer', icon: MonitorSmartphone }
     ]
   }
 ];
 
 const allNavItems = computed(() => navGroups.flatMap((group) => group.items));
-const title = computed(() => allNavItems.value.find((item) => item.to === route.path)?.label || 'Tổng quan');
-const subtitle = computed(() => {
-  if (route.path === '/create') return 'Soạn một lần, chọn kênh, đăng ngay hoặc đưa vào lịch tự động.';
-  if (route.path === '/platforms') return 'Kết nối tài khoản xuất bản chính thức cho từng nền tảng.';
-  if (route.path === '/comments') return 'Nền tảng cho bước tiếp theo: gom bình luận, inbox và phản hồi.';
-  return 'Quản lý nội dung, lịch đăng, kênh xuất bản và số liệu trong một quy trình.';
-});
+const title = computed(() => allNavItems.value.find((item) => item.to === route.path)?.label || 'Remote LDPlayer');
+const subtitle = computed(() => 'Test đăng Facebook thật bằng Facebook app trong LDPlayer, không cần mua token API.');
 
 function logout() {
   auth.logout();
@@ -65,8 +36,8 @@ function logout() {
     <aside :class="['fixed inset-y-0 left-0 z-40 flex w-72 flex-col border-r border-zinc-200 bg-white p-4 transition dark:border-zinc-800 dark:bg-zinc-950 lg:translate-x-0', mobileOpen ? 'translate-x-0' : '-translate-x-full']">
       <div class="flex items-center justify-between">
         <div>
-          <p class="text-xl font-extrabold">SocialPilot AI</p>
-          <p class="text-sm text-zinc-500">Tự động hóa sáng tạo</p>
+          <p class="text-xl font-extrabold">LDPlayer Post Tool</p>
+          <p class="text-sm text-zinc-500">Test đăng Facebook thật</p>
         </div>
         <button class="btn-soft h-9 w-9 p-0 lg:hidden" @click="mobileOpen = false"><X class="h-4 w-4" /></button>
       </div>
@@ -103,10 +74,6 @@ function logout() {
               <p class="text-sm text-zinc-500">{{ subtitle }}</p>
             </div>
           </div>
-          <RouterLink to="/create" class="btn-primary hidden sm:inline-flex">
-            <PenLine class="h-4 w-4" />
-            Bài viết mới
-          </RouterLink>
         </div>
       </header>
       <div class="p-4 sm:p-8">
