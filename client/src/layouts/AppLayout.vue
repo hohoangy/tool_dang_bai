@@ -16,14 +16,14 @@ const navGroups = [
   {
     label: 'Tool chính',
     items: [
-      { to: '/mobile-lab', label: 'Remote LDPlayer', icon: MonitorSmartphone }
+      { to: '/mobile-lab', label: 'Automation Studio', icon: MonitorSmartphone }
     ]
   }
 ];
 
 const allNavItems = computed(() => navGroups.flatMap((group) => group.items));
-const title = computed(() => allNavItems.value.find((item) => item.to === route.path)?.label || 'Remote LDPlayer');
-const subtitle = computed(() => 'Test đăng Facebook thật bằng Facebook app trong LDPlayer, không cần mua token API.');
+const title = computed(() => allNavItems.value.find((item) => item.to === route.path)?.label || 'Automation Studio');
+const subtitle = computed(() => 'Đăng bài trực tiếp qua app thật trong LDPlayer: Facebook, X, TikTok, Instagram...');
 
 function logout() {
   auth.logout();
@@ -36,8 +36,8 @@ function logout() {
     <aside :class="['fixed inset-y-0 left-0 z-40 flex w-72 flex-col border-r border-zinc-200 bg-white p-4 transition dark:border-zinc-800 dark:bg-zinc-950 lg:translate-x-0', mobileOpen ? 'translate-x-0' : '-translate-x-full']">
       <div class="flex items-center justify-between">
         <div>
-          <p class="text-xl font-extrabold">LDPlayer Post Tool</p>
-          <p class="text-sm text-zinc-500">Test đăng Facebook thật</p>
+          <p class="text-xl font-extrabold">Social Auto Studio</p>
+          <p class="text-sm text-zinc-500">LDPlayer automation</p>
         </div>
         <button class="btn-soft h-9 w-9 p-0 lg:hidden" @click="mobileOpen = false"><X class="h-4 w-4" /></button>
       </div>

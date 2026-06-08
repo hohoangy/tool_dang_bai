@@ -1,6 +1,6 @@
 <script setup>
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue';
-import { Home, Image, Keyboard, Laugh, Loader2, MapPin, MousePointer2, Play, RefreshCcw, Send, Smartphone, Tag, Terminal, Undo2, UserRoundPlus, Video, Wifi, XCircle } from 'lucide-vue-next';
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue';
+import { Home, Image, Keyboard, Loader2, MousePointer2, Play, RefreshCcw, Send, Smartphone, Terminal, Undo2, Wifi, XCircle } from 'lucide-vue-next';
 import { http } from '../api/http';
 import BaseCard from '../components/BaseCard.vue';
 import { useAuthStore } from '../stores/auth';
@@ -8,33 +8,55 @@ import { useUiStore } from '../stores/ui';
 
 const ui = useUiStore();
 const auth = useAuthStore();
+
 const accounts = ref([]);
 const logs = ref([]);
 const loading = ref(false);
 const running = ref(false);
-const selectedIds = ref([]);
-const activeJob = ref(null);
-const selectedRemoteId = ref('');
-const selectedFacebookId = ref('');
-const screenshot = ref(null);
-const facebookPostResult = ref(null);
 const screenshotLoading = ref(false);
-const facebookPosting = ref(false);
-const facebookImageUploading = ref(false);
+const posting = ref(false);
+const mediaUploading = ref(false);
+const selectedAccountId = ref('');
+const selectedPlatformId = ref('facebook');
+const screenshot = ref(null);
+const postResult = ref(null);
 const remoteTextInput = ref('');
-const facebookToolMode = ref('');
-const facebookImageInput = ref(null);
-const facebookVideoInput = ref(null);
-let jobTimer = null;
-const maxFacebookPhotos = 4;
+const mediaInput = ref(null);
+const composerTextarea = ref(null);
+const showEmojiPicker = ref(false);
 
-const defaultPackages = {
-  facebook: 'com.facebook.katana',
-  x: 'com.twitter.android',
-  youtube: 'com.google.android.youtube',
-  tiktok: 'com.zhiliaoapp.musically',
-  other: ''
-};
+const maxPhotos = 4;
+
+const platforms = [
+  {
+    id: 'facebook',
+    label: 'Facebook',
+    packageName: 'com.facebook.katana',
+    status: 'ready',
+    description: 'Mo composer, nhap text, gan anh va dang truc tiep bang Facebook app trong LDPlayer.'
+  },
+  {
+    id: 'x',
+    label: 'X',
+    packageName: 'com.twitter.android',
+    status: 'planned',
+    description: 'Se dung cung LDPlayer engine, them workflow compose/post rieng cho X.'
+  },
+  {
+    id: 'tiktok',
+    label: 'TikTok',
+    packageName: 'com.zhiliaoapp.musically',
+    status: 'planned',
+    description: 'Se can workflow chon video, caption, next va post.'
+  },
+  {
+    id: 'instagram',
+    label: 'Instagram',
+    packageName: 'com.instagram.android',
+    status: 'planned',
+    description: 'Se can workflow chon media, caption va share.'
+  }
+];
 
 const defaultMobileAccount = {
   platform: 'facebook',
@@ -44,9 +66,9 @@ const defaultMobileAccount = {
   adbHost: '127.0.0.1:5555',
   deviceId: '',
   status: 'ready',
-  notes: 'Cấu hình mặc định để test đăng Facebook qua LDPlayer.',
+  notes: 'Default LDPlayer profile for direct Facebook posting tests.',
   metadata: {
-    appPackage: defaultPackages.facebook,
+    appPackage: 'com.facebook.katana',
     username: '',
     password: '',
     loginSteps: {
@@ -57,82 +79,39 @@ const defaultMobileAccount = {
   }
 };
 
-const form = reactive({
-  platform: 'facebook',
-  displayName: '',
-  accountHandle: '',
-  instanceName: 'LDPlayer-1',
-  adbHost: '127.0.0.1:5555',
-  deviceId: '',
-  notes: '',
-  metadata: {
-    appPackage: defaultPackages.facebook,
-    username: '',
-    password: '',
-    loginSteps: {
-      usernameTap: { x: 540, y: 760 },
-      passwordTap: { x: 540, y: 900 },
-      submitTap: { x: 540, y: 1060 }
-    }
+const post = reactive({
+  text: 'Bài test đăng từ LDPlayer qua SocialPilot AI 😄',
+  media: []
+});
+
+const emojiGroups = [
+  {
+    label: 'Da dung gan day',
+    items: ['🤣', '😍', '😊', '😌', '😇', '😀', '😂', '☘️']
+  },
+  {
+    label: 'Mat cuoi va hinh nguoi',
+    items: ['😀', '😃', '😁', '😄', '😆', '🥺', '😅', '😂', '🤣', '🥲', '☺️', '😊', '😇', '🙂', '🙃', '😉', '😔', '😍', '🥰', '😘', '😗', '😙', '😚', '😋']
+  },
+  {
+    label: 'Cam xuc pho bien',
+    items: ['👍', '👏', '🙏', '💪', '🔥', '✨', '❤️', '💙', '💚', '💛', '🎉', '✅', '📌', '📷', '🚀', '⭐']
   }
-});
-
-const selectedAccounts = computed(() => accounts.value.filter((account) => selectedIds.value.includes(account._id)));
-const selectedRemoteAccount = computed(() => accounts.value.find((account) => account._id === selectedRemoteId.value) || accounts.value[0]);
-const selectedFacebookAccount = computed(() => accounts.value.find((account) => account._id === selectedFacebookId.value) || accounts.value.find((account) => account.platform === 'facebook') || accounts.value[0]);
-const screenshotSrc = computed(() => screenshot.value?.imageBase64 ? `data:image/png;base64,${screenshot.value.imageBase64}` : '');
-const facebookScreenshotSrc = computed(() => facebookPostResult.value?.screenshot?.imageBase64 ? `data:image/png;base64,${facebookPostResult.value.screenshot.imageBase64}` : '');
-const latestLogs = computed(() => logs.value.slice(0, 120));
-const readyCount = computed(() => accounts.value.filter((account) => ['ready', 'login_required', 'connected'].includes(account.status)).length);
-const runningCount = computed(() => accounts.value.filter((account) => account.status === 'logging_in').length);
-const issueCount = computed(() => accounts.value.filter((account) => ['checkpoint', 'error'].includes(account.status)).length);
-const canRunBatch = computed(() => selectedIds.value.length > 0 && !running.value);
-const jobProgress = computed(() => {
-  if (!activeJob.value?.total) return 0;
-  return Math.round(((activeJob.value.completed + activeJob.value.failed) / activeJob.value.total) * 100);
-});
-const jobIsActive = computed(() => ['queued', 'running', 'canceling'].includes(activeJob.value?.status));
-
-const statusLabels = {
-  ready: 'Sẵn sàng',
-  login_required: 'Cần đăng nhập',
-  logging_in: 'Đang chạy',
-  connected: 'Đã đăng nhập',
-  checkpoint: 'Checkpoint',
-  error: 'Lỗi',
-  paused: 'Tạm dừng'
-};
-
-const facebookPost = reactive({
-  text: 'Bài test đăng từ LDPlayer qua SocialPilot AI.',
-  audience: 'Bạn bè',
-  album: 'Album',
-  feeling: '',
-  location: '',
-  tags: '',
-  topic: '',
-  attachments: [],
-  autoSubmit: false,
-  composerTap: { x: 390, y: 145 },
-  submitTap: { x: 818, y: 1552 }
-});
-
-const feelingOptions = [
-  { label: 'vui vẻ', icon: '😊', tone: 'text-amber-500', bg: 'bg-amber-50 dark:bg-amber-950/30' },
-  { label: 'biết ơn', icon: '💙', tone: 'text-sky-500', bg: 'bg-sky-50 dark:bg-sky-950/30' },
-  { label: 'hào hứng', icon: '🤩', tone: 'text-orange-500', bg: 'bg-orange-50 dark:bg-orange-950/30' },
-  { label: 'thư giãn', icon: '😌', tone: 'text-emerald-500', bg: 'bg-emerald-50 dark:bg-emerald-950/30' }
 ];
 
-const selectedFeeling = computed(() => feelingOptions.find((item) => item.label === facebookPost.feeling));
-const facebookPostMeta = computed(() => [
-  selectedFeeling.value ? { key: 'feeling', icon: selectedFeeling.value.icon, text: `đang cảm thấy ${selectedFeeling.value.label}`, tone: selectedFeeling.value.tone, bg: selectedFeeling.value.bg } : null,
-  facebookPost.location ? { key: 'location', icon: '📍', text: `tại ${facebookPost.location}`, tone: 'text-red-500', bg: 'bg-red-50 dark:bg-red-950/30' } : null,
-  facebookPost.tags ? { key: 'tags', icon: '👥', text: `cùng với ${facebookPost.tags}`, tone: 'text-sky-500', bg: 'bg-sky-50 dark:bg-sky-950/30' } : null,
-  facebookPost.topic ? { key: 'topic', icon: '#', text: facebookPost.topic, tone: 'text-blue-500', bg: 'bg-blue-50 dark:bg-blue-950/30' } : null
-].filter(Boolean));
-const facebookMetaTitle = computed(() => facebookPostMeta.value.map((item) => item.text).join(' · '));
-const facebookAutomationText = computed(() => facebookPost.text.trim());
+const selectedPlatform = computed(() => platforms.find((item) => item.id === selectedPlatformId.value) || platforms[0]);
+const selectedAccount = computed(() => {
+  const exact = accounts.value.find((account) => account._id === selectedAccountId.value);
+  if (exact) return exact;
+  return accounts.value.find((account) => account.platform === selectedPlatformId.value) || accounts.value[0] || null;
+});
+const selectedAccountLabel = computed(() => selectedAccount.value ? `${selectedAccount.value.displayName} - ${selectedAccount.value.instanceName}` : 'Chua co LDPlayer profile');
+const accountInitial = computed(() => selectedAccount.value?.displayName?.slice(0, 1)?.toUpperCase() || 'F');
+const screenshotSrc = computed(() => screenshot.value?.imageBase64 ? `data:image/png;base64,${screenshot.value.imageBase64}` : '');
+const composerScreenshotSrc = computed(() => postResult.value?.screenshot?.imageBase64 ? `data:image/png;base64,${postResult.value.screenshot.imageBase64}` : '');
+const latestLogs = computed(() => logs.value.slice(0, 80));
+const canUseRemote = computed(() => Boolean(selectedAccount.value));
+const canRunWorkflow = computed(() => selectedPlatform.value.status === 'ready' && canUseRemote.value && post.text.trim() && !posting.value && !mediaUploading.value);
 
 async function load() {
   loading.value = true;
@@ -144,7 +123,7 @@ async function load() {
       await auth.login('creator@example.com', 'password123');
       const { data } = await http.get('/mobile/accounts');
       applyMobileAccounts(data);
-      ui.notify('Đã làm mới phiên đăng nhập local.');
+      ui.notify('Da lam moi phien dang nhap local.');
       return;
     }
     ui.notify(error.message, 'error');
@@ -157,227 +136,168 @@ function applyMobileAccounts(data) {
   const nextAccounts = data.accounts || [];
   accounts.value = nextAccounts;
   logs.value = data.logs || [];
-  if (nextAccounts[0] && !nextAccounts.some((account) => account._id === selectedRemoteId.value)) {
-    selectedRemoteId.value = nextAccounts[0]._id;
+  if (nextAccounts[0] && !nextAccounts.some((account) => account._id === selectedAccountId.value)) {
+    const preferred = findPreferredAccount(nextAccounts);
+    selectedAccountId.value = preferred._id;
   }
-  const facebookAccount = nextAccounts.find((account) => account.platform === 'facebook') || nextAccounts[0];
-  if (facebookAccount && !nextAccounts.some((account) => account._id === selectedFacebookId.value)) {
-    selectedFacebookId.value = facebookAccount._id;
-  }
-  selectedIds.value = selectedIds.value.filter((id) => nextAccounts.some((account) => account._id === id));
+}
+
+function findPreferredAccount(items) {
+  return items.find((account) => account.platform === selectedPlatformId.value && account.instanceName === 'LDPlayer')
+    || items.find((account) => account.instanceName === 'LDPlayer')
+    || items.find((account) => account.platform === selectedPlatformId.value)
+    || items[0];
 }
 
 function isAuthError(error) {
   return /authentication required|invalid session/i.test(error?.message || '');
 }
 
-function syncPackage() {
-  form.metadata.appPackage = defaultPackages[form.platform] || '';
-}
-
-async function createAccount() {
-  const displayName = form.displayName?.trim() || form.accountHandle?.trim() || form.instanceName?.trim() || 'LDPlayer fallback';
-  const { data } = await http.post('/mobile/accounts', {
-    ...form,
-    displayName
-  });
-  accounts.value.unshift(data.account);
-  selectedIds.value = [data.account._id, ...selectedIds.value];
-  resetForm();
-  ui.notify('Đã thêm nick vào hàng điều khiển.');
-  await load();
-}
-
-async function probe(account) {
-  running.value = true;
-  try {
-    await http.post(`/mobile/accounts/${account._id}/probe`);
-    ui.notify(`Đã kiểm tra thiết bị cho ${account.displayName}.`);
-    await load();
-  } finally {
-    running.value = false;
-  }
-}
-
-async function runOne(account) {
-  running.value = true;
-  try {
-    await http.post(`/mobile/accounts/${account._id}/run-login`, {});
-    ui.notify(`Đã chạy đăng nhập cho ${account.displayName}.`);
-    await load();
-  } finally {
-    running.value = false;
-  }
-}
-
-async function runBatch() {
-  if (!canRunBatch.value) return;
-  running.value = true;
-  try {
-    const { data } = await http.post('/mobile/batch/run-login', { accountIds: selectedIds.value });
-    activeJob.value = data.job;
-    startJobPolling(data.job.id);
-    ui.notify('Batch đã được đưa vào hàng chạy nền.');
-    await load();
-  } finally {
-    if (!jobIsActive.value) running.value = false;
-  }
-}
-
-async function cancelJob() {
-  if (!activeJob.value) return;
-  const { data } = await http.post(`/mobile/jobs/${activeJob.value.id}/cancel`);
-  activeJob.value = data.job;
-  ui.notify('Đã gửi yêu cầu hủy batch.');
-}
-
-async function deleteAccount(account) {
-  await http.delete(`/mobile/accounts/${account._id}`);
-  selectedIds.value = selectedIds.value.filter((id) => id !== account._id);
-  ui.notify(`Đã xóa ${account.displayName}.`);
-  await load();
+async function ensureDefaultProfile() {
+  if (accounts.value.length) return;
+  const { data } = await http.post('/mobile/accounts', defaultMobileAccount);
+  accounts.value = [data.account];
+  selectedAccountId.value = data.account._id;
+  ui.notify('Da tao LDPlayer profile mac dinh.');
 }
 
 async function remoteLaunch() {
-  if (!selectedRemoteAccount.value) return;
+  if (!selectedAccount.value) return;
   running.value = true;
   try {
-    await http.post(`/mobile/accounts/${selectedRemoteAccount.value._id}/remote/launch`);
-    ui.notify('Đã mở và nối LDPlayer.');
+    await http.post(`/mobile/accounts/${selectedAccount.value._id}/remote/launch`);
+    ui.notify('Da mo va noi LDPlayer.');
     await refreshScreenshot();
+  } catch (error) {
+    ui.notify(error.message, 'error');
   } finally {
     running.value = false;
   }
 }
 
 async function remoteOpenApp() {
-  if (!selectedRemoteAccount.value) return;
+  if (!selectedAccount.value) return;
   running.value = true;
   try {
-    await http.post(`/mobile/accounts/${selectedRemoteAccount.value._id}/remote/open-app`, {
-      appPackage: selectedRemoteAccount.value.metadata?.appPackage || ''
+    await http.post(`/mobile/accounts/${selectedAccount.value._id}/remote/open-app`, {
+      appPackage: selectedAccount.value.metadata?.appPackage || selectedPlatform.value.packageName
     });
-    ui.notify('Đã mở app trong LDPlayer.');
+    ui.notify(`Da mo ${selectedPlatform.value.label} trong LDPlayer.`);
     await refreshScreenshot();
+  } catch (error) {
+    ui.notify(error.message, 'error');
+  } finally {
+    running.value = false;
+  }
+}
+
+async function probeDevice() {
+  if (!selectedAccount.value) return;
+  running.value = true;
+  try {
+    await http.post(`/mobile/accounts/${selectedAccount.value._id}/probe`);
+    ui.notify('ADB san sang.');
+    await load();
+  } catch (error) {
+    ui.notify(error.message, 'error');
   } finally {
     running.value = false;
   }
 }
 
 async function refreshScreenshot() {
-  if (!selectedRemoteAccount.value) return;
+  if (!selectedAccount.value) return;
   screenshotLoading.value = true;
   try {
-    const { data } = await http.get(`/mobile/accounts/${selectedRemoteAccount.value._id}/remote/screenshot`);
+    const { data } = await http.get(`/mobile/accounts/${selectedAccount.value._id}/remote/screenshot`);
     screenshot.value = data.screenshot;
+  } catch (error) {
+    ui.notify(error.message, 'error');
   } finally {
     screenshotLoading.value = false;
   }
 }
 
 async function clickScreenshot(event) {
-  if (!selectedRemoteAccount.value || !screenshot.value?.width || !screenshot.value?.height) return;
+  if (!selectedAccount.value || !screenshot.value?.width || !screenshot.value?.height) return;
   const rect = event.currentTarget.getBoundingClientRect();
   const x = ((event.clientX - rect.left) / rect.width) * screenshot.value.width;
   const y = ((event.clientY - rect.top) / rect.height) * screenshot.value.height;
-  await http.post(`/mobile/accounts/${selectedRemoteAccount.value._id}/remote/tap`, { x, y });
+  await http.post(`/mobile/accounts/${selectedAccount.value._id}/remote/tap`, { x, y });
   window.setTimeout(refreshScreenshot, 500);
 }
 
 async function sendRemoteText() {
-  if (!selectedRemoteAccount.value || !remoteTextInput.value.trim()) return;
-  await http.post(`/mobile/accounts/${selectedRemoteAccount.value._id}/remote/text`, { text: remoteTextInput.value });
+  if (!selectedAccount.value || !remoteTextInput.value.trim()) return;
+  await http.post(`/mobile/accounts/${selectedAccount.value._id}/remote/text`, { text: remoteTextInput.value });
   remoteTextInput.value = '';
   window.setTimeout(refreshScreenshot, 400);
 }
 
 async function sendRemoteKey(key) {
-  if (!selectedRemoteAccount.value) return;
-  await http.post(`/mobile/accounts/${selectedRemoteAccount.value._id}/remote/key`, { key });
+  if (!selectedAccount.value) return;
+  await http.post(`/mobile/accounts/${selectedAccount.value._id}/remote/key`, { key });
   window.setTimeout(refreshScreenshot, 400);
 }
 
-async function publishFacebookPost(options = {}) {
-  if (!selectedFacebookAccount.value) {
-    ui.notify('Chưa chọn được tài khoản Facebook/LDPlayer. Hãy tải lại trang hoặc thêm thiết bị fallback trước.', 'error');
+async function runPostWorkflow() {
+  if (!selectedAccount.value) {
+    ui.notify('Chua co LDPlayer profile.', 'error');
     return;
   }
-  if (!facebookAutomationText.value.trim()) {
-    ui.notify('Thiếu nội dung bài đăng.', 'error');
+  if (selectedPlatform.value.status !== 'ready') {
+    ui.notify(`Workflow ${selectedPlatform.value.label} se duoc them sau. Hien tai Facebook da san sang.`, 'error');
     return;
   }
-  const autoSubmit = options.forceAutoSubmit || facebookPost.autoSubmit;
-  facebookPosting.value = true;
+  if (!post.text.trim()) {
+    ui.notify('Thieu noi dung bai dang.', 'error');
+    return;
+  }
+
+  posting.value = true;
   try {
-    const { data } = await http.post(`/mobile/accounts/${selectedFacebookAccount.value._id}/facebook/post`, {
-      text: facebookAutomationText.value,
-      appPackage: selectedFacebookAccount.value.metadata?.appPackage || defaultPackages.facebook,
-      autoSubmit,
-      images: facebookPost.attachments
-        .filter((attachment) => attachment.type === 'photo' && attachment.uploadedUrl)
-        .slice(0, maxFacebookPhotos)
-        .map((attachment) => ({
-          url: attachment.uploadedUrl,
-          name: attachment.name,
-          mimeType: attachment.mimeType,
-          size: attachment.size
-        })),
-      composerTap: facebookPost.composerTap,
-      submitTap: facebookPost.submitTap
+    const { data } = await http.post(`/mobile/accounts/${selectedAccount.value._id}/facebook/post`, {
+      text: post.text.trim(),
+      appPackage: selectedAccount.value.metadata?.appPackage || selectedPlatform.value.packageName,
+      autoSubmit: true,
+      images: post.media
+        .filter((item) => item.type === 'photo' && item.uploadedUrl)
+        .slice(0, maxPhotos)
+        .map((item) => ({
+          url: item.uploadedUrl,
+          name: item.name,
+          mimeType: item.mimeType,
+          size: item.size
+        }))
     });
-    facebookPostResult.value = data.result;
+    postResult.value = data.result;
     screenshot.value = data.result.screenshot || screenshot.value;
-    selectedRemoteId.value = selectedFacebookAccount.value._id;
-    ui.notify(data.result.composerPending ? 'Đã tap mở composer nhưng chưa thấy màn soạn ổn định. Kiểm tra screenshot rồi bấm lại.' : autoSubmit ? 'Đã chạy lệnh tự đăng Facebook.' : 'Đã mở composer Facebook để kiểm tra.');
+    if (data.result.submitVerified === false) {
+      ui.notify('Đã bấm Đăng nhưng chưa xác nhận Facebook đã nhận bài. Hãy xem screenshot/log.', 'error');
+    } else {
+      ui.notify('Đã gửi lệnh đăng bài lên Facebook.');
+    }
     await load();
   } catch (error) {
     ui.notify(error.message, 'error');
   } finally {
-    facebookPosting.value = false;
+    posting.value = false;
   }
 }
 
-function setFacebookToolMode(mode) {
-  facebookToolMode.value = facebookToolMode.value === mode ? '' : mode;
-}
-
-function triggerFacebookAttachment(type) {
-  facebookToolMode.value = type;
-  if (type === 'photo') facebookImageInput.value?.click();
-  if (type === 'video') facebookVideoInput.value?.click();
-}
-
-async function addFacebookAttachments(event, type) {
+async function addMedia(event) {
   const files = Array.from(event.target.files || []);
   event.target.value = '';
-  if (type !== 'photo') {
-    const nextItems = files.map((file) => ({
-      id: `${Date.now()}-${file.name}-${Math.random().toString(16).slice(2)}`,
-      name: file.name,
-      type,
-      url: URL.createObjectURL(file)
-    }));
-    facebookPost.attachments.push(...nextItems);
-    return;
-  }
-
-  const existingPhotoCount = facebookPost.attachments.filter((item) => item.type === 'photo').length;
-  const remaining = maxFacebookPhotos - existingPhotoCount;
-  if (remaining <= 0) {
-    ui.notify(`Facebook qua LDPlayer hỗ trợ tối đa ${maxFacebookPhotos} ảnh mỗi bài.`, 'error');
-    return;
-  }
+  const remaining = maxPhotos - post.media.filter((item) => item.type === 'photo').length;
   const selectedFiles = files.slice(0, remaining);
   if (!selectedFiles.length) return;
-  if (files.length > remaining) {
-    ui.notify(`Chỉ nhận thêm ${remaining} ảnh để giữ giới hạn ${maxFacebookPhotos} ảnh.`, 'error');
-  }
+  if (files.length > remaining) ui.notify(`Chi nhan them ${remaining} anh de giu gioi han ${maxPhotos} anh.`, 'error');
   if (selectedFiles.some((file) => file.size > 5 * 1024 * 1024)) {
-    ui.notify('Ảnh phải nhỏ hơn hoặc bằng 5 MB.', 'error');
+    ui.notify('Anh phai nho hon hoac bang 5 MB.', 'error');
     return;
   }
 
-  facebookImageUploading.value = true;
+  mediaUploading.value = true;
   try {
     for (const file of selectedFiles) {
       const previewUrl = URL.createObjectURL(file);
@@ -388,10 +308,10 @@ async function addFacebookAttachments(event, type) {
             'X-File-Name': encodeURIComponent(file.name)
           }
         });
-        facebookPost.attachments.push({
+        post.media.push({
           id: `${Date.now()}-${file.name}-${Math.random().toString(16).slice(2)}`,
           name: file.name,
-          type,
+          type: 'photo',
           url: previewUrl,
           uploadedUrl: data.image.url,
           mimeType: data.image.mimeType,
@@ -402,84 +322,45 @@ async function addFacebookAttachments(event, type) {
         throw error;
       }
     }
-    ui.notify(`Đã tải ${selectedFiles.length} ảnh lên, sẵn sàng chép vào LDPlayer.`);
+    ui.notify(`Da tai ${selectedFiles.length} anh len server.`);
   } catch (error) {
     ui.notify(error.message, 'error');
   } finally {
-    facebookImageUploading.value = false;
+    mediaUploading.value = false;
   }
 }
 
-function removeFacebookAttachment(item) {
+function removeMedia(item) {
   URL.revokeObjectURL(item.url);
-  facebookPost.attachments = facebookPost.attachments.filter((attachment) => attachment.id !== item.id);
+  post.media = post.media.filter((media) => media.id !== item.id);
 }
 
-function resetFacebookComposer() {
-  facebookPost.text = '';
-  facebookPost.feeling = '';
-  facebookPost.location = '';
-  facebookPost.tags = '';
-  facebookPost.topic = '';
-  facebookToolMode.value = '';
-  facebookPost.attachments.forEach((item) => URL.revokeObjectURL(item.url));
-  facebookPost.attachments = [];
-}
-
-function toggleAccount(account) {
-  if (selectedIds.value.includes(account._id)) {
-    selectedIds.value = selectedIds.value.filter((id) => id !== account._id);
-  } else {
-    selectedIds.value = [...selectedIds.value, account._id];
+async function insertEmoji(emoji) {
+  const input = composerTextarea.value;
+  if (!input) {
+    post.text += emoji;
+    return;
   }
+
+  const start = input.selectionStart ?? post.text.length;
+  const end = input.selectionEnd ?? post.text.length;
+  post.text = `${post.text.slice(0, start)}${emoji}${post.text.slice(end)}`;
+  await nextTick();
+  input.focus();
+  const nextCursor = start + emoji.length;
+  input.setSelectionRange(nextCursor, nextCursor);
 }
 
-function resetForm() {
-  Object.assign(form, {
-    platform: 'facebook',
-    displayName: '',
-    accountHandle: '',
-    instanceName: 'LDPlayer-1',
-    adbHost: '127.0.0.1:5555',
-    deviceId: '',
-    notes: '',
-    metadata: {
-      appPackage: defaultPackages.facebook,
-      username: '',
-      password: '',
-      loginSteps: {
-        usernameTap: { x: 540, y: 760 },
-        passwordTap: { x: 540, y: 900 },
-        submitTap: { x: 540, y: 1060 }
-      }
-    }
-  });
-}
-
-function startJobPolling(jobId) {
-  if (jobTimer) window.clearInterval(jobTimer);
-  running.value = true;
-  jobTimer = window.setInterval(async () => {
-    try {
-      const { data } = await http.get(`/mobile/jobs/${jobId}`);
-      activeJob.value = data.job;
-      await load();
-      if (!['queued', 'running', 'canceling'].includes(data.job.status)) {
-        window.clearInterval(jobTimer);
-        jobTimer = null;
-        running.value = false;
-        ui.notify(data.job.failed ? `Batch kết thúc, ${data.job.failed} nick lỗi.` : 'Batch đăng nhập hoàn tất.');
-      }
-    } catch (error) {
-      window.clearInterval(jobTimer);
-      jobTimer = null;
-      running.value = false;
-    }
-  }, 1800);
+function resetComposer() {
+  post.text = '';
+  post.media.forEach((item) => URL.revokeObjectURL(item.url));
+  post.media = [];
+  postResult.value = null;
+  showEmojiPicker.value = false;
 }
 
 function formatDate(value) {
-  if (!value) return 'Chưa có';
+  if (!value) return 'Chua co';
   return new Intl.DateTimeFormat('vi-VN', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(value));
 }
 
@@ -488,340 +369,312 @@ function formatLog(log) {
   return target?.displayName || log.accountId;
 }
 
-onMounted(load);
+onMounted(async () => {
+  await load();
+  await ensureDefaultProfile();
+});
+
 onUnmounted(() => {
-  if (jobTimer) window.clearInterval(jobTimer);
-  facebookPost.attachments.forEach((item) => URL.revokeObjectURL(item.url));
+  post.media.forEach((item) => URL.revokeObjectURL(item.url));
 });
 </script>
 
 <template>
   <div class="space-y-5">
     <BaseCard>
-      <div class="flex flex-wrap items-center justify-between gap-4">
+      <div class="flex flex-wrap items-start justify-between gap-4">
         <div class="max-w-3xl">
-          <p class="text-sm font-extrabold uppercase tracking-wide text-emerald-500">Tool chính</p>
-          <h2 class="mt-1 text-2xl font-extrabold">Test đăng Facebook thật qua LDPlayer</h2>
+          <p class="text-sm font-extrabold uppercase tracking-wide text-emerald-500">Mobile fallback</p>
+          <h2 class="mt-1 text-2xl font-extrabold">LDPlayer Composer Test</h2>
           <p class="mt-2 text-sm leading-6 text-zinc-500">
-            Dùng Facebook app đã đăng nhập trong LDPlayer để mở composer, nhập nội dung, gắn ảnh và kiểm tra bài đăng thật mà không cần mua token API.
+            Kiểm tra bài đăng thủ công qua LDPlayer khi API không khả dụng hoặc cần xử lý checkpoint.
           </p>
+        </div>
+        <button class="btn-soft" :disabled="loading" @click="load">
+          <RefreshCcw class="h-4 w-4" />
+          Lam moi profile
+        </button>
+      </div>
+    </BaseCard>
+
+    <div class="grid gap-4 xl:grid-cols-[minmax(280px,360px)_1fr]">
+      <BaseCard>
+        <div class="mb-4 flex items-center gap-2">
+          <Smartphone class="h-5 w-5 text-zinc-500" />
+          <h2 class="text-xl font-extrabold">Profile dang dung</h2>
+        </div>
+
+        <label class="space-y-2 text-sm font-bold text-zinc-500">
+          Nen tang
+          <select v-model="selectedPlatformId" class="field">
+            <option v-for="platform in platforms" :key="platform.id" :value="platform.id">
+              {{ platform.label }}
+            </option>
+          </select>
+        </label>
+
+        <label class="mt-3 block space-y-2 text-sm font-bold text-zinc-500">
+          LDPlayer profile
+          <select v-model="selectedAccountId" class="field">
+            <option v-for="account in accounts" :key="account._id" :value="account._id">
+              {{ account.displayName }} - {{ account.instanceName }}
+            </option>
+          </select>
+        </label>
+
+        <div class="mt-4 rounded-lg border border-zinc-200 p-4 text-sm dark:border-zinc-800">
+          <p class="font-extrabold text-white">{{ selectedAccountLabel }}</p>
+          <p class="mt-2 text-zinc-500">Package: {{ selectedAccount?.metadata?.appPackage || selectedPlatform.packageName }}</p>
+          <p class="text-zinc-500">ADB: {{ selectedAccount?.deviceId || selectedAccount?.adbHost || '127.0.0.1:5555' }}</p>
+          <p class="text-zinc-500">Trang thai: {{ selectedAccount?.status || 'ready' }}</p>
+        </div>
+
+        <div class="mt-4 rounded-lg bg-zinc-100 p-4 text-sm leading-6 text-zinc-600 dark:bg-zinc-900 dark:text-zinc-300">
+          <p class="font-extrabold text-zinc-900 dark:text-white">Huong phat trien</p>
+          <p>1. Facebook workflow dang san sang.</p>
+          <p>2. X/TikTok/Instagram se them workflow rieng, dung chung LDPlayer engine.</p>
+          <p>3. Khi can scale, moi profile se la mot LDPlayer/token automation rieng.</p>
+        </div>
+      </BaseCard>
+
+      <BaseCard>
+        <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 class="text-xl font-extrabold">Remote Control</h2>
+            <p class="mt-1 text-sm text-zinc-500">Dieu khien app that trong LDPlayer: mo app, chup man hinh, tap va nhap text.</p>
+          </div>
+          <span :class="['rounded-full px-3 py-1 text-xs font-extrabold uppercase', selectedPlatform.status === 'ready' ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700']">
+            {{ selectedPlatform.status === 'ready' ? 'Ready' : 'Planned' }}
+          </span>
+        </div>
+
+        <div class="grid gap-4 lg:grid-cols-[minmax(260px,360px)_1fr]">
+          <div class="overflow-hidden rounded-lg border border-zinc-200 bg-zinc-950 dark:border-zinc-800">
+            <button
+              class="relative grid aspect-[9/16] w-full place-items-center text-sm text-zinc-400"
+              :disabled="screenshotLoading || !canUseRemote"
+              @click="clickScreenshot"
+            >
+              <img v-if="screenshotSrc" :src="screenshotSrc" alt="LDPlayer screenshot" class="h-full w-full object-contain" />
+              <span v-else>{{ screenshotLoading ? 'Dang tai man hinh...' : 'Bam Lam moi man hinh de remote' }}</span>
+              <span v-if="screenshotLoading" class="absolute right-3 top-3 rounded-full bg-black/70 px-3 py-1 text-xs text-white">Loading</span>
+            </button>
+          </div>
+
+          <div class="space-y-3">
+            <div class="grid gap-2 sm:grid-cols-2">
+              <button class="btn-primary" :disabled="running || !canUseRemote" @click="remoteLaunch">
+                <Smartphone class="h-4 w-4" />
+                Mo LDPlayer
+              </button>
+              <button class="btn-soft" :disabled="running || !canUseRemote" @click="remoteOpenApp">
+                <Play class="h-4 w-4" />
+                Mo app {{ selectedPlatform.label }}
+              </button>
+              <button class="btn-soft" :disabled="screenshotLoading || !canUseRemote" @click="refreshScreenshot">
+                <RefreshCcw class="h-4 w-4" />
+                Lam moi man hinh
+              </button>
+              <button class="btn-soft" :disabled="!canUseRemote" @click="probeDevice">
+                <Wifi class="h-4 w-4" />
+                Kiem tra ADB
+              </button>
+            </div>
+
+            <div class="grid gap-2 sm:grid-cols-3">
+              <button class="btn-soft" :disabled="!canUseRemote" @click="sendRemoteKey('back')">
+                <Undo2 class="h-4 w-4" />
+                Back
+              </button>
+              <button class="btn-soft" :disabled="!canUseRemote" @click="sendRemoteKey('home')">
+                <Home class="h-4 w-4" />
+                Home
+              </button>
+              <button class="btn-soft" :disabled="!canUseRemote" @click="sendRemoteKey('enter')">
+                <Keyboard class="h-4 w-4" />
+                Enter
+              </button>
+            </div>
+
+            <form class="grid gap-2 sm:grid-cols-[1fr_auto]" @submit.prevent="sendRemoteText">
+              <input v-model="remoteTextInput" class="field" placeholder="Nhap text vao o dang focus trong LDPlayer" />
+              <button class="btn-primary" :disabled="!remoteTextInput.trim() || !canUseRemote">
+                <Send class="h-4 w-4" />
+                Gui
+              </button>
+            </form>
+
+            <div class="rounded-lg border border-zinc-200 p-3 text-sm text-zinc-500 dark:border-zinc-800">
+              <div class="mb-2 flex items-center gap-2 font-bold text-zinc-700 dark:text-zinc-200">
+                <MousePointer2 class="h-4 w-4" />
+                Cach dung nhanh
+              </div>
+              <p>1. Bam Mo LDPlayer, sau do Kiem tra ADB.</p>
+              <p>2. Bam Mo app {{ selectedPlatform.label }} va Lam moi man hinh.</p>
+              <p>3. Click truc tiep vao screenshot de tap, dung o text de nhap thu cong khi can.</p>
+            </div>
+          </div>
+        </div>
+      </BaseCard>
+    </div>
+
+    <BaseCard>
+      <div class="mb-4 flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 class="text-xl font-extrabold">Facebook Mobile Fallback</h2>
+          <p class="mt-1 text-sm text-zinc-500">Soạn nội dung và mở composer trên LDPlayer để kiểm tra trước khi đăng thủ công.</p>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <button class="btn-soft h-10 px-3" title="Xóa nội dung đang soạn" @click="resetComposer">
+            <RefreshCcw class="h-4 w-4" />
+          </button>
+        </div>
+      </div>
+
+      <div class="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
+        <div class="space-y-3">
+          <div class="overflow-hidden rounded-2xl border border-zinc-200 bg-white text-zinc-950 shadow-sm dark:border-zinc-800 dark:bg-[#242526] dark:text-white">
+            <div class="relative border-b border-zinc-200 px-4 py-4 text-center dark:border-zinc-700">
+              <h3 class="text-xl font-extrabold">Tạo bài viết</h3>
+              <button
+                class="absolute right-3 top-3 inline-flex h-9 items-center justify-center gap-2 rounded-lg bg-white px-4 text-sm font-extrabold text-zinc-950 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50"
+                :disabled="posting || mediaUploading || !selectedAccount || !post.text.trim()"
+                @click="runPostWorkflow()"
+              >
+                <Loader2 v-if="posting" class="h-4 w-4 animate-spin" />
+                <Send v-else class="h-4 w-4" />
+                Đăng
+              </button>
+            </div>
+
+            <div class="space-y-4 p-4">
+              <div class="flex items-center gap-3">
+                <div class="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-gradient-to-br from-emerald-400 to-sky-600 text-sm font-extrabold text-white">
+                  {{ accountInitial }}
+                </div>
+                <div class="min-w-0">
+                  <p class="truncate font-extrabold">{{ selectedAccount?.displayName || 'Facebook profile' }}</p>
+                </div>
+              </div>
+
+              <div class="relative">
+                <textarea
+                  ref="composerTextarea"
+                  v-model="post.text"
+                  class="min-h-40 w-full resize-y bg-transparent pr-12 text-2xl leading-9 outline-none placeholder:text-zinc-400"
+                  placeholder="Bạn đang nghĩ gì?"
+                  @focus="showEmojiPicker = false"
+                ></textarea>
+                <button
+                  class="absolute bottom-2 right-1 grid h-9 w-9 place-items-center rounded-full border border-zinc-300 text-lg hover:bg-zinc-100 dark:border-zinc-600 dark:hover:bg-zinc-700"
+                  title="Chọn icon cảm xúc"
+                  type="button"
+                  @click="showEmojiPicker = !showEmojiPicker"
+                >
+                  ☺
+                </button>
+                <div
+                  v-if="showEmojiPicker"
+                  class="absolute bottom-12 right-0 z-20 w-[330px] max-w-[calc(100vw-5rem)] rounded-2xl border border-zinc-700 bg-zinc-900 p-3 text-white shadow-2xl"
+                >
+                  <div v-for="group in emojiGroups" :key="group.label" class="mb-3 last:mb-0">
+                    <p class="mb-2 text-xs font-bold text-zinc-400">{{ group.label }}</p>
+                    <div class="grid grid-cols-8 gap-1">
+                      <button
+                        v-for="emoji in group.items"
+                        :key="`${group.label}-${emoji}`"
+                        class="grid h-8 w-8 place-items-center rounded-lg text-xl hover:bg-zinc-700"
+                        type="button"
+                        @click="insertEmoji(emoji)"
+                      >
+                        {{ emoji }}
+                      </button>
+                    </div>
+                  </div>
+                  <div class="mt-3 flex items-center justify-between border-t border-zinc-700 pt-2 text-xs text-zinc-500">
+                    <span>Emoji se chen vao noi dung bai viet</span>
+                    <button class="font-bold text-zinc-300 hover:text-white" type="button" @click="showEmojiPicker = false">Dong</button>
+                  </div>
+                </div>
+              </div>
+
+              <div v-if="post.media.length" class="grid gap-2 sm:grid-cols-2">
+                <div
+                  v-for="item in post.media"
+                  :key="item.id"
+                  class="group relative overflow-hidden rounded-xl border border-zinc-200 bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900"
+                >
+                  <img v-if="item.type === 'photo'" :src="item.url" :alt="item.name" class="h-52 w-full object-cover" />
+                  <button
+                    class="absolute right-2 top-2 grid h-8 w-8 place-items-center rounded-full bg-black/70 text-white"
+                    title="Xóa tệp"
+                    @click="removeMedia(item)"
+                  >
+                    <XCircle class="h-5 w-5" />
+                  </button>
+                  <p class="truncate px-3 py-2 text-xs font-bold text-zinc-600 dark:text-zinc-300">{{ item.name }}</p>
+                </div>
+              </div>
+
+              <div class="rounded-xl border border-zinc-200 p-3 dark:border-zinc-700">
+                <div class="flex flex-wrap items-center justify-between gap-3">
+                  <p class="text-sm font-extrabold">Thêm vào bài viết của bạn</p>
+                  <div class="flex items-center gap-2">
+                    <button
+                      class="grid h-10 w-10 place-items-center rounded-lg text-emerald-500 hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-zinc-700"
+                      title="Thêm ảnh"
+                      :disabled="mediaUploading || post.media.length >= maxPhotos"
+                      @click="mediaInput?.click()"
+                    >
+                      <Loader2 v-if="mediaUploading" class="h-5 w-5 animate-spin" />
+                      <Image v-else class="h-5 w-5" />
+                    </button>
+                    <button
+                      class="grid h-10 w-10 place-items-center rounded-lg text-orange-500 hover:bg-zinc-100 dark:hover:bg-zinc-700"
+                      title="Chọn icon cảm xúc"
+                      type="button"
+                      @click="showEmojiPicker = !showEmojiPicker"
+                    >
+                      ☺
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <input ref="mediaInput" class="hidden" type="file" accept="image/*" multiple @change="addMedia" />
+            </div>
+          </div>
+        </div>
+
+        <div class="space-y-3">
+          <div v-if="composerScreenshotSrc" class="overflow-hidden rounded-lg border border-zinc-200 bg-zinc-950 dark:border-zinc-800">
+            <div class="grid aspect-[9/16] w-full place-items-center text-sm text-zinc-400">
+              <img :src="composerScreenshotSrc" alt="Composer screenshot" class="h-full w-full object-contain" />
+            </div>
+          </div>
         </div>
       </div>
     </BaseCard>
 
-    <div class="space-y-5">
-        <BaseCard>
-          <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <h2 class="text-xl font-extrabold">Remote LDPlayer fallback</h2>
-              <p class="mt-1 text-sm text-zinc-500">Mở giả lập, xem màn hình, click để tap và xử lý thủ công khi API cần hỗ trợ.</p>
-            </div>
-            <select v-model="selectedRemoteId" class="field max-w-xs" @change="screenshot = null">
-              <option v-for="account in accounts" :key="account._id" :value="account._id">
-                {{ account.displayName }} - {{ account.instanceName }}
-              </option>
-            </select>
-          </div>
-
-          <div class="grid gap-4 lg:grid-cols-[minmax(260px,360px)_1fr]">
-            <div class="overflow-hidden rounded-lg border border-zinc-200 bg-zinc-950 dark:border-zinc-800">
-              <button
-                class="relative grid aspect-[9/16] w-full place-items-center text-sm text-zinc-400"
-                :disabled="screenshotLoading || !selectedRemoteAccount"
-                @click="clickScreenshot"
-              >
-                <img v-if="screenshotSrc" :src="screenshotSrc" alt="LDPlayer screenshot" class="h-full w-full object-contain" />
-                <span v-else>{{ screenshotLoading ? 'Đang tải màn hình...' : 'Bấm Làm mới màn hình để remote' }}</span>
-                <span v-if="screenshotLoading" class="absolute right-3 top-3 rounded-full bg-black/70 px-3 py-1 text-xs text-white">Loading</span>
-              </button>
-            </div>
-
-            <div class="space-y-3">
-              <div class="grid gap-2 sm:grid-cols-2">
-                <button class="btn-primary" :disabled="running || !selectedRemoteAccount" @click="remoteLaunch">
-                  <Smartphone class="h-4 w-4" />
-                  Mở LDPlayer
-                </button>
-                <button class="btn-soft" :disabled="running || !selectedRemoteAccount" @click="remoteOpenApp">
-                  <Play class="h-4 w-4" />
-                  Mở app
-                </button>
-                <button class="btn-soft" :disabled="screenshotLoading || !selectedRemoteAccount" @click="refreshScreenshot">
-                  <RefreshCcw class="h-4 w-4" />
-                  Làm mới màn hình
-                </button>
-                <button class="btn-soft" :disabled="!selectedRemoteAccount" @click="probe(selectedRemoteAccount)">
-                  <Wifi class="h-4 w-4" />
-                  Kiểm tra ADB
-                </button>
-              </div>
-
-              <div class="grid gap-2 sm:grid-cols-3">
-                <button class="btn-soft" :disabled="!selectedRemoteAccount" @click="sendRemoteKey('back')">
-                  <Undo2 class="h-4 w-4" />
-                  Back
-                </button>
-                <button class="btn-soft" :disabled="!selectedRemoteAccount" @click="sendRemoteKey('home')">
-                  <Home class="h-4 w-4" />
-                  Home
-                </button>
-                <button class="btn-soft" :disabled="!selectedRemoteAccount" @click="sendRemoteKey('enter')">
-                  <Keyboard class="h-4 w-4" />
-                  Enter
-                </button>
-              </div>
-
-              <form class="grid gap-2 sm:grid-cols-[1fr_auto]" @submit.prevent="sendRemoteText">
-                <input v-model="remoteTextInput" class="field" placeholder="Nhập text vào ô đang focus trong LDPlayer" />
-                <button class="btn-primary" :disabled="!remoteTextInput.trim() || !selectedRemoteAccount">
-                  <Send class="h-4 w-4" />
-                  Gửi
-                </button>
-              </form>
-
-              <div class="rounded-lg border border-zinc-200 p-3 text-sm text-zinc-500 dark:border-zinc-800">
-                <div class="mb-2 flex items-center gap-2 font-bold text-zinc-700 dark:text-zinc-200">
-                  <MousePointer2 class="h-4 w-4" />
-                  Cách dùng
-                </div>
-                <p>1. Chọn nick, bấm Mở LDPlayer.</p>
-                <p>2. Bấm Mở app hoặc tự mở app trong giả lập.</p>
-                <p>3. Làm mới màn hình, click vào ảnh để tap, dùng ô nhập text để đăng nhập.</p>
-              </div>
-            </div>
-          </div>
-        </BaseCard>
-
-        <BaseCard>
-          <div class="mb-4 flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <h2 class="text-xl font-extrabold">Fallback Facebook qua LDPlayer</h2>
-              <p class="mt-1 text-sm text-zinc-500">Chỉ dùng khi cần kiểm tra thủ công, checkpoint hoặc test composer. Đăng Page hàng ngày nên chạy qua Meta API.</p>
-            </div>
-            <select v-model="selectedFacebookId" class="field max-w-xs">
-              <option v-for="account in accounts" :key="account._id" :value="account._id">
-                {{ account.displayName }} - {{ account.instanceName }}
-              </option>
-            </select>
-          </div>
-
-          <div class="grid gap-4 lg:grid-cols-[minmax(0,1fr)_260px]">
-            <div class="space-y-3">
-              <div class="overflow-hidden rounded-lg border border-zinc-200 bg-white text-zinc-950 shadow-sm dark:border-zinc-800 dark:bg-zinc-950 dark:text-white">
-                <div class="flex items-center justify-between border-b border-zinc-200 px-4 py-3 dark:border-zinc-800">
-                  <button class="text-sm font-bold text-zinc-500" @click="resetFacebookComposer">Hủy</button>
-                  <p class="font-extrabold">Bài viết mới</p>
-                  <button
-                    class="inline-flex items-center gap-2 rounded-full bg-[#1877f2] px-4 py-1.5 text-sm font-extrabold text-white disabled:opacity-50"
-                    :disabled="facebookPosting || facebookImageUploading || !selectedFacebookAccount || !facebookAutomationText.trim()"
-                    @click="publishFacebookPost({ forceAutoSubmit: true })"
-                  >
-                    <Loader2 v-if="facebookPosting" class="h-4 w-4 animate-spin" />
-                    Đăng
-                  </button>
-                </div>
-
-                <div class="p-4">
-                  <div class="mb-3 flex items-center gap-3">
-                    <div class="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-gradient-to-br from-emerald-400 to-sky-600 text-sm font-extrabold text-white">
-                      {{ selectedFacebookAccount?.displayName?.slice(0, 1)?.toUpperCase() || 'F' }}
-                    </div>
-                    <div class="min-w-0">
-                      <p class="font-extrabold">
-                        {{ selectedFacebookAccount?.displayName || 'Facebook account' }}
-                        <span v-if="facebookMetaTitle" class="font-semibold text-zinc-500 dark:text-zinc-400">
-                          {{ facebookMetaTitle }}
-                        </span>
-                      </p>
-                      <div class="mt-1 flex flex-wrap gap-1.5 text-[11px] font-bold text-zinc-600 dark:text-zinc-300">
-                        <select v-model="facebookPost.audience" class="rounded-md border-0 bg-zinc-100 px-2 py-1 text-[11px] font-bold outline-none dark:bg-zinc-800">
-                          <option>Bạn bè</option>
-                          <option>Công khai</option>
-                          <option>Chỉ mình tôi</option>
-                        </select>
-                        <select v-model="facebookPost.album" class="rounded-md border-0 bg-zinc-100 px-2 py-1 text-[11px] font-bold outline-none dark:bg-zinc-800">
-                          <option>Album</option>
-                          <option>Dòng thời gian</option>
-                          <option>Ảnh đại diện</option>
-                        </select>
-                      </div>
-                    </div>
-                  </div>
-
-                  <textarea
-                    v-model="facebookPost.text"
-                    class="min-h-44 w-full resize-y bg-transparent text-xl leading-8 outline-none placeholder:text-zinc-400"
-                    placeholder="Bạn đang nghĩ gì?"
-                  ></textarea>
-
-                  <div v-if="facebookPost.text.trim()" class="mt-3 rounded-lg border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-800 dark:bg-zinc-900">
-                    <p class="whitespace-pre-line text-base leading-7">{{ facebookPost.text }}</p>
-                    <div v-if="facebookPostMeta.length" class="mt-3 flex flex-wrap gap-2">
-                      <span
-                        v-for="item in facebookPostMeta"
-                        :key="item.key"
-                        :class="['inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-extrabold', item.bg, item.tone]"
-                      >
-                        <span class="text-sm leading-none">{{ item.icon }}</span>
-                        {{ item.text }}
-                      </span>
-                    </div>
-                  </div>
-
-                  <div v-if="facebookPost.attachments.length" class="mt-3 grid gap-2 sm:grid-cols-2">
-                    <div
-                      v-for="item in facebookPost.attachments"
-                      :key="item.id"
-                      class="group relative overflow-hidden rounded-lg border border-zinc-200 bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900"
-                    >
-                      <img v-if="item.type === 'photo'" :src="item.url" :alt="item.name" class="h-40 w-full object-cover" />
-                      <video v-else :src="item.url" class="h-40 w-full object-cover" muted controls></video>
-                      <button
-                        class="absolute right-2 top-2 grid h-7 w-7 place-items-center rounded-full bg-black/70 text-white"
-                        title="Xóa tệp"
-                        @click="removeFacebookAttachment(item)"
-                      >
-                        <XCircle class="h-4 w-4" />
-                      </button>
-                      <p class="truncate px-3 py-2 text-xs font-bold text-zinc-600 dark:text-zinc-300">{{ item.name }}</p>
-                    </div>
-                  </div>
-
-                  <div class="mt-4 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
-                    <div class="mb-3 flex items-center justify-between">
-                      <p class="text-sm font-extrabold">Thêm vào bài viết của bạn</p>
-                      <span class="text-xs font-bold text-zinc-500">Facebook composer</span>
-                    </div>
-                    <div class="grid grid-cols-3 gap-2 sm:grid-cols-6">
-                      <button
-                        class="grid h-11 place-items-center rounded-lg bg-zinc-100 text-emerald-500 disabled:cursor-not-allowed disabled:opacity-40 dark:bg-zinc-900"
-                        :title="facebookPost.attachments.filter((item) => item.type === 'photo').length >= maxFacebookPhotos ? `Đã đủ ${maxFacebookPhotos} ảnh` : 'Tải tối đa 4 ảnh vào LDPlayer'"
-                        :disabled="facebookImageUploading || facebookPost.attachments.filter((item) => item.type === 'photo').length >= maxFacebookPhotos"
-                        @click="triggerFacebookAttachment('photo')"
-                      >
-                        <Loader2 v-if="facebookImageUploading" class="h-5 w-5 animate-spin" />
-                        <Image v-else class="h-5 w-5" />
-                      </button>
-                      <button class="grid h-11 place-items-center rounded-lg bg-zinc-100 text-sky-500 dark:bg-zinc-900" title="Gắn thẻ" @click="setFacebookToolMode('tag')"><UserRoundPlus class="h-5 w-5" /></button>
-                      <button class="grid h-11 place-items-center rounded-lg bg-zinc-100 text-amber-500 dark:bg-zinc-900" title="Cảm xúc" @click="setFacebookToolMode('feeling')"><Laugh class="h-5 w-5" /></button>
-                      <button class="grid h-11 place-items-center rounded-lg bg-zinc-100 text-red-500 dark:bg-zinc-900" title="Vị trí" @click="setFacebookToolMode('location')"><MapPin class="h-5 w-5" /></button>
-                      <button class="grid h-11 place-items-center rounded-lg bg-zinc-100 text-violet-500 dark:bg-zinc-900" title="Video" @click="triggerFacebookAttachment('video')"><Video class="h-5 w-5" /></button>
-                      <button class="grid h-11 place-items-center rounded-lg bg-zinc-100 text-blue-500 dark:bg-zinc-900" title="Chủ đề" @click="setFacebookToolMode('topic')"><Tag class="h-5 w-5" /></button>
-                    </div>
-                    <input ref="facebookImageInput" class="hidden" type="file" accept="image/*" multiple @change="addFacebookAttachments($event, 'photo')" />
-                    <input ref="facebookVideoInput" class="hidden" type="file" accept="video/*" multiple @change="addFacebookAttachments($event, 'video')" />
-
-                    <div v-if="facebookToolMode" class="mt-3 rounded-lg bg-zinc-100 p-3 dark:bg-zinc-900">
-                      <input
-                        v-if="facebookToolMode === 'tag'"
-                        v-model="facebookPost.tags"
-                        class="field"
-                        placeholder="Nhập tên bạn bè muốn gắn thẻ"
-                      />
-                      <div v-else-if="facebookToolMode === 'feeling'" class="grid gap-2 sm:grid-cols-4">
-                        <button
-                          v-for="feeling in feelingOptions"
-                          :key="feeling.label"
-                          class="flex items-center justify-center gap-2 rounded-lg border border-zinc-200 px-3 py-2 text-sm font-extrabold transition hover:bg-white dark:border-zinc-800 dark:hover:bg-zinc-950"
-                          :class="facebookPost.feeling === feeling.label ? ['border-[#1877f2] text-[#1877f2]', feeling.bg] : 'text-zinc-700 dark:text-zinc-200'"
-                          @click="facebookPost.feeling = facebookPost.feeling === feeling.label ? '' : feeling.label"
-                        >
-                          <span class="text-base leading-none">{{ feeling.icon }}</span>
-                          {{ feeling.label }}
-                        </button>
-                      </div>
-                      <input
-                        v-else-if="facebookToolMode === 'location'"
-                        v-model="facebookPost.location"
-                        class="field"
-                        placeholder="Bạn đang ở đâu?"
-                      />
-                      <input
-                        v-else-if="facebookToolMode === 'topic'"
-                        v-model="facebookPost.topic"
-                        class="field"
-                        placeholder="Nhập chủ đề cho bài viết"
-                      />
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              <div class="grid gap-3 sm:grid-cols-[1fr_auto_auto]">
-                <label class="flex items-center gap-3 rounded-lg border border-zinc-200 px-4 py-3 text-sm font-bold dark:border-zinc-800">
-                  <input v-model="facebookPost.autoSubmit" type="checkbox" class="h-4 w-4" />
-                  Auto post sau khi mở composer
-                </label>
-                <label class="grid grid-cols-[auto_90px] items-center gap-2 text-sm font-bold text-zinc-500">
-                  X
-                  <input v-model.number="facebookPost.submitTap.x" class="field px-3 py-2 text-sm" type="number" />
-                </label>
-                <label class="grid grid-cols-[auto_90px] items-center gap-2 text-sm font-bold text-zinc-500">
-                  Y
-                  <input v-model.number="facebookPost.submitTap.y" class="field px-3 py-2 text-sm" type="number" />
-                </label>
-              </div>
-              <div class="grid gap-3 sm:grid-cols-[1fr_auto_auto]">
-                <p class="rounded-lg border border-zinc-200 px-4 py-3 text-sm font-bold text-zinc-500 dark:border-zinc-800">
-                  Tọa độ ô "What's on your mind?"
-                </p>
-                <label class="grid grid-cols-[auto_90px] items-center gap-2 text-sm font-bold text-zinc-500">
-                  X
-                  <input v-model.number="facebookPost.composerTap.x" class="field px-3 py-2 text-sm" type="number" />
-                </label>
-                <label class="grid grid-cols-[auto_90px] items-center gap-2 text-sm font-bold text-zinc-500">
-                  Y
-                  <input v-model.number="facebookPost.composerTap.y" class="field px-3 py-2 text-sm" type="number" />
-                </label>
-              </div>
-
-              <div class="flex flex-wrap gap-2">
-                <button class="btn-primary" :disabled="facebookPosting || facebookImageUploading || !selectedFacebookAccount || !facebookAutomationText.trim()" @click="publishFacebookPost()">
-                  <Loader2 v-if="facebookPosting" class="h-4 w-4 animate-spin" />
-                  <Send v-else class="h-4 w-4" />
-                  {{ facebookPost.autoSubmit ? 'Đăng Facebook' : 'Mở composer' }}
-                </button>
-                <button class="btn-soft" :disabled="!selectedFacebookAccount" @click="selectedRemoteId = selectedFacebookAccount._id; refreshScreenshot()">
-                  <RefreshCcw class="h-4 w-4" />
-                  Xem màn hình
-                </button>
-              </div>
-
-              <p class="text-sm text-zinc-500">
-                Ảnh được tải lên server rồi chép vào thư mục Pictures của LDPlayer trước khi mở Facebook. Luồng fallback hỗ trợ tối đa 4 ảnh mỗi bài. Khi test lần đầu, hãy tắt Auto post để kiểm tra ảnh và nội dung trong composer.
-              </p>
-            </div>
-
-            <div class="overflow-hidden rounded-lg border border-zinc-200 bg-zinc-950 dark:border-zinc-800">
-              <div class="grid aspect-[9/16] w-full place-items-center text-sm text-zinc-400">
-                <img v-if="facebookScreenshotSrc" :src="facebookScreenshotSrc" alt="Facebook composer screenshot" class="h-full w-full object-contain" />
-                <span v-else>Screenshot composer sẽ hiển thị ở đây</span>
-              </div>
-            </div>
-          </div>
-        </BaseCard>
-
-        <BaseCard>
-          <div class="mb-4 flex items-center gap-2">
-            <Terminal class="h-5 w-5 text-zinc-500" />
-            <h3 class="text-lg font-extrabold">Log tự động</h3>
-          </div>
-          <div class="max-h-[440px] space-y-2 overflow-auto pr-1">
-            <article v-for="log in latestLogs" :key="log._id" class="rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
-              <div class="flex flex-wrap items-center justify-between gap-2">
-                <p class="font-bold">{{ formatLog(log) }} · {{ log.action }}</p>
-                <span :class="['rounded-full px-2 py-1 text-xs font-bold uppercase', log.level === 'error' ? 'bg-red-100 text-red-700' : log.level === 'warn' ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700']">
-                  {{ log.level }}
-                </span>
-              </div>
-              <p class="mt-1 text-sm text-zinc-600 dark:text-zinc-300">{{ log.message }}</p>
-              <p class="mt-2 text-xs text-zinc-500">{{ formatDate(log.createdAt) }}</p>
-            </article>
-            <p v-if="!latestLogs.length" class="rounded-lg border border-dashed border-zinc-300 p-5 text-sm text-zinc-500 dark:border-zinc-700">
-              Chưa có log tự động.
-            </p>
-          </div>
-        </BaseCard>
+    <BaseCard>
+      <div class="mb-4 flex items-center gap-2">
+        <Terminal class="h-5 w-5 text-zinc-500" />
+        <h3 class="text-lg font-extrabold">Automation Logs</h3>
       </div>
-    </div>
+      <div class="max-h-[440px] space-y-2 overflow-auto pr-1">
+        <article v-for="log in latestLogs" :key="log._id" class="rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <p class="font-bold">{{ formatLog(log) }} - {{ log.action }}</p>
+            <span :class="['rounded-full px-2 py-1 text-xs font-bold uppercase', log.level === 'error' ? 'bg-red-100 text-red-700' : log.level === 'warn' ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700']">
+              {{ log.level }}
+            </span>
+          </div>
+          <p class="mt-1 text-sm text-zinc-600 dark:text-zinc-300">{{ log.message }}</p>
+          <p class="mt-2 text-xs text-zinc-500">{{ formatDate(log.createdAt) }}</p>
+        </article>
+        <p v-if="!latestLogs.length" class="rounded-lg border border-dashed border-zinc-300 p-5 text-sm text-zinc-500 dark:border-zinc-700">
+          Chua co log automation.
+        </p>
+      </div>
+    </BaseCard>
+  </div>
 </template>

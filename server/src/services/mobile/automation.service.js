@@ -38,6 +38,19 @@ const composerLabels = [
 ];
 
 const submitLabels = ['Post', 'POST', 'Đăng', 'Dang'];
+const postedConfirmationLabels = [
+  'Đã chia sẻ bài viết của bạn',
+  'Da chia se bai viet cua ban',
+  'Bài viết của bạn đã được chia sẻ',
+  'Bai viet cua ban da duoc chia se',
+  'Đã chia sẻ',
+  'Da chia se',
+  'Xem bài viết',
+  'Xem bai viet',
+  'Your post was shared',
+  'View post'
+];
+const postingProgressLabels = ['Đang đăng', 'Dang dang', 'Đang chia sẻ', 'Dang chia se', 'Posting'];
 const closeMenuLabels = ['Đóng menu.', 'Dong menu.', 'Close menu'];
 const doneLabels = ['Xong', 'Done'];
 const galleryLabels = ['Thư viện', 'Ảnh/video', 'Photo/video', 'Gallery'];
@@ -265,7 +278,19 @@ export async function captureScreenshot(account, userId, reason = 'debug') {
 }
 
 export async function openLdPlayer(account, userId) {
-  const result = await runCommand(env.mobileAutomation.ldconsolePath, ['launch', '--name', account.instanceName]);
+  let result = await runCommand(env.mobileAutomation.ldconsolePath, ['launch', '--name', account.instanceName]);
+  if (!result.ok) {
+    const fallbackName = await getFirstLdPlayerInstanceName();
+    if (fallbackName && fallbackName !== account.instanceName) {
+      const retry = await runCommand(env.mobileAutomation.ldconsolePath, ['launch', '--name', fallbackName]);
+      result = {
+        ...retry,
+        requestedInstanceName: account.instanceName,
+        fallbackInstanceName: fallbackName,
+        firstError: result.error || result.stderr || ''
+      };
+    }
+  }
   await writeLog(userId, account._id, result.ok ? 'info' : 'error', 'remote_launch_ldplayer', result.ok ? 'Đã mở LDPlayer.' : 'Mở LDPlayer lỗi.', result);
   if (account.adbHost) {
     await delay(env.mobileAutomation.launchWaitMs);
@@ -274,6 +299,13 @@ export async function openLdPlayer(account, userId) {
     return { launch: result, connect };
   }
   return { launch: result, connect: null };
+}
+
+async function getFirstLdPlayerInstanceName() {
+  const list = await runCommand(env.mobileAutomation.ldconsolePath, ['list2'], { timeoutMs: 10_000 });
+  if (!list.ok || !list.stdout) return '';
+  const firstLine = list.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+  return firstLine?.split(',')[1]?.trim() || '';
 }
 
 export async function openAccountApp(account, userId, appPackage) {
@@ -524,10 +556,14 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
   const stateMachine = await runFacebookPostStateMachine(account, userId, target, config, text, preparedImages);
   steps.push(...stateMachine.steps);
 
-  await writeLog(userId, account._id, 'info', 'facebook_post_finished', config.autoSubmit ? 'Đã chạy luồng tự đăng Facebook.' : 'Đã mở composer Facebook, chờ kiểm tra/tự bấm đăng.', {
+  const submitVerified = stateMachine.submitVerified ?? false;
+  const finishedLevel = config.autoSubmit && !submitVerified ? 'warn' : 'info';
+  await writeLog(userId, account._id, finishedLevel, 'facebook_post_finished', config.autoSubmit && !submitVerified ? 'Đã bấm Đăng nhưng chưa xác nhận Facebook đã nhận bài.' : (config.autoSubmit ? 'Đã chạy luồng tự đăng Facebook.' : 'Đã mở composer Facebook, chờ kiểm tra/tự bấm đăng.'), {
     autoSubmit: config.autoSubmit,
     submitTap: config.submitTap,
     finalState: stateMachine.finalState,
+    submitVerified,
+    submitReason: stateMachine.submitReason || '',
     imageCount: preparedImages.length
   });
 
@@ -537,6 +573,9 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
     composerTap: config.composerTap,
     submitTap: config.submitTap,
     composerPending: stateMachine.composerPending,
+    finalState: stateMachine.finalState,
+    submitVerified,
+    submitReason: stateMachine.submitReason || '',
     screenshot: stateMachine.screenshot,
     steps
   };
@@ -577,6 +616,17 @@ async function openFacebookComposer(account, userId, target, config, text, image
   ]);
   await writeLog(userId, account._id, stop.ok ? 'info' : 'warn', 'facebook_post_reset_app_task', stop.ok ? 'Đã đóng task Facebook cũ trước khi mở composer mới.' : 'Không đóng được task Facebook cũ.', stop);
   await delay(800);
+
+  if (!images.length) {
+    const launcher = await openFacebookHome(account, userId, target, config, {
+      ok: true,
+      reason: 'text_only_uses_composer_input'
+    });
+    await writeLog(userId, account._id, 'info', 'facebook_post_text_only_no_share_intent', 'Bài text-only sẽ nhập trực tiếp vào composer để tránh Facebook tạo link preview/attachment lạ.', {
+      method: launcher.method
+    });
+    return launcher;
+  }
 
   const intentArgs = [
     '-s',
@@ -816,12 +866,8 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
         return { finalState, screenshot, steps, composerPending: false };
       }
 
-      await delay(env.mobileAutomation.stepDelayMs * 2);
-      const submit = await tapTextOrPoint(account, userId, target, submitLabels, config.submitTap, 'facebook_post_submit_tap', { exact: true });
-      steps.push(submit);
-      await delay(env.mobileAutomation.stepDelayMs * 4);
-      screenshot = await captureScreenshot(account, userId, 'facebook_post_after_submit');
-      return { finalState: 'submitted', screenshot, steps, composerPending: false };
+      const submitted = await submitFacebookPost(account, userId, target, config, text, steps, 'facebook_post_submit_tap');
+      return submitted;
     }
 
     if (state.name === 'text_editor') {
@@ -863,12 +909,8 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
           screenshot = await captureScreenshot(account, userId, 'facebook_post_composer_ready');
           return { finalState, screenshot, steps, composerPending: false };
         }
-        await delay(env.mobileAutomation.stepDelayMs * 2);
-        const submit = await tapTextOrPoint(account, userId, target, submitLabels, config.submitTap, 'facebook_post_submit_from_composer', { exact: true });
-        steps.push(submit);
-        await delay(env.mobileAutomation.stepDelayMs * 4);
-        screenshot = await captureScreenshot(account, userId, 'facebook_post_after_submit');
-        return { finalState: 'submitted', screenshot, steps, composerPending: false };
+        const submitted = await submitFacebookPost(account, userId, target, config, text, steps, 'facebook_post_submit_from_composer');
+        return submitted;
       }
 
       const bodyTap = await tapTextOrPoint(account, userId, target, composerLabels, { x: 450, y: 360 }, 'facebook_post_open_text_editor');
@@ -904,6 +946,78 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
     finalState
   });
   return { finalState, screenshot, steps, composerPending: true };
+}
+
+async function submitFacebookPost(account, userId, target, config, text, steps, action) {
+  await delay(env.mobileAutomation.stepDelayMs * 2);
+  const submit = await tapTextOrPoint(account, userId, target, submitLabels, config.submitTap, action, { exact: true });
+  steps.push(submit);
+  const verification = await verifyFacebookPostSubmit(account, userId, target, text);
+  return {
+    finalState: verification.ok ? 'submitted' : verification.finalState,
+    screenshot: verification.screenshot,
+    steps,
+    composerPending: verification.composerPending,
+    submitVerified: verification.ok,
+    submitReason: verification.reason
+  };
+}
+
+async function verifyFacebookPostSubmit(account, userId, target, text) {
+  let lastState = null;
+  for (let attempt = 1; attempt <= 8; attempt += 1) {
+    await delay(attempt <= 2 ? env.mobileAutomation.stepDelayMs * 2 : env.mobileAutomation.stepDelayMs);
+    const nodes = await dumpVisibleNodes(target);
+    const confirmation = findNodeInNodes(nodes, postedConfirmationLabels);
+    if (confirmation) {
+      const screenshot = await captureScreenshot(account, userId, 'facebook_post_submit_verified');
+      await writeLog(userId, account._id, 'info', 'facebook_post_submit_verified', `Đã xác nhận Facebook nhận bài qua text "${confirmation.label}".`, {
+        attempt,
+        confirmation
+      });
+      return { ok: true, reason: 'confirmation_label', screenshot, composerPending: false, finalState: 'submitted' };
+    }
+
+    const progress = findNodeInNodes(nodes, postingProgressLabels);
+    if (progress) {
+      await writeLog(userId, account._id, 'info', 'facebook_post_submit_waiting', `Facebook đang xử lý: "${progress.label}".`, {
+        attempt,
+        progress
+      });
+      continue;
+    }
+
+    lastState = await detectFacebookState(target, text);
+    if (lastState.name === 'blocked') {
+      const screenshot = await captureScreenshot(account, userId, 'facebook_post_submit_blocked');
+      await writeLog(userId, account._id, 'error', 'facebook_post_submit_blocked', 'Facebook chuyển sang đăng nhập/checkpoint sau khi bấm Đăng.', {
+        attempt,
+        state: lastState
+      });
+      return { ok: false, reason: 'blocked_after_submit', screenshot, composerPending: true, finalState: 'blocked' };
+    }
+
+    if (['ready_to_post', 'composer', 'text_editor', 'stale_composer'].includes(lastState.name)) {
+      const screenshot = await captureScreenshot(account, userId, 'facebook_post_submit_still_in_composer');
+      await writeLog(userId, account._id, 'warn', 'facebook_post_submit_still_in_composer', 'Sau khi bấm Đăng, Facebook vẫn đang ở composer nên chưa thể coi là đã đăng.', {
+        attempt,
+        state: lastState
+      });
+      return { ok: false, reason: 'still_in_composer', screenshot, composerPending: true, finalState: lastState.name };
+    }
+  }
+
+  const screenshot = await captureScreenshot(account, userId, 'facebook_post_submit_unverified');
+  await writeLog(userId, account._id, 'warn', 'facebook_post_submit_unverified', 'Đã bấm Đăng nhưng không thấy tín hiệu xác nhận bài đã được Facebook nhận.', {
+    state: lastState
+  });
+  return {
+    ok: false,
+    reason: lastState?.name === 'home' ? 'returned_home_without_confirmation' : 'no_confirmation_after_submit',
+    screenshot,
+    composerPending: false,
+    finalState: lastState?.name || 'submit_unverified'
+  };
 }
 
 async function attachFacebookImages(account, userId, target, imageCount = 1) {
