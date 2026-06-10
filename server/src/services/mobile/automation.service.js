@@ -73,6 +73,10 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function postStepDelay(multiplier = 1) {
+  return Math.round(Math.max(250, Math.min(env.mobileAutomation.stepDelayMs, 500)) * multiplier);
+}
+
 function cleanText(value = '') {
   return normalizeAdbInputText(value)
     .replace(/\\/g, '\\\\')
@@ -551,7 +555,7 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
 
   const openHome = await openFacebookComposer(account, userId, target, config, text, preparedImages);
   steps.push(openHome);
-  await delay(env.mobileAutomation.stepDelayMs);
+  await delay(postStepDelay());
 
   const stateMachine = await runFacebookPostStateMachine(account, userId, target, config, text, preparedImages);
   steps.push(...stateMachine.steps);
@@ -615,19 +619,10 @@ async function openFacebookComposer(account, userId, target, config, text, image
     config.appPackage
   ]);
   await writeLog(userId, account._id, stop.ok ? 'info' : 'warn', 'facebook_post_reset_app_task', stop.ok ? 'Đã đóng task Facebook cũ trước khi mở composer mới.' : 'Không đóng được task Facebook cũ.', stop);
-  await delay(800);
+  await delay(postStepDelay());
 
-  if (!images.length) {
-    const launcher = await openFacebookHome(account, userId, target, config, {
-      ok: true,
-      reason: 'text_only_uses_composer_input'
-    });
-    await writeLog(userId, account._id, 'info', 'facebook_post_text_only_no_share_intent', 'Bài text-only sẽ nhập trực tiếp vào composer để tránh Facebook tạo link preview/attachment lạ.', {
-      method: launcher.method
-    });
-    return launcher;
-  }
-
+  const primaryImage = images.length === 1 ? images[0] : null;
+  const intentType = primaryImage?.mimeType || 'text/plain';
   const intentArgs = [
     '-s',
     target,
@@ -637,11 +632,19 @@ async function openFacebookComposer(account, userId, target, config, text, image
     '-a',
     'android.intent.action.SEND',
     '-t',
-    'text/plain',
+    intentType,
     '--es',
     'android.intent.extra.TEXT',
-    quoteAdbShellArg(text),
+    quoteAdbShellArg(text)
   ];
+  if (primaryImage?.remotePath) {
+    intentArgs.push(
+      '--grant-read-uri-permission',
+      '--eu',
+      'android.intent.extra.STREAM',
+      `file://${primaryImage.remotePath}`
+    );
+  }
   intentArgs.push(
     '-n',
     `${config.appPackage}/com.facebook.composer.shareintent.ImplicitShareIntentHandlerDefaultAlias`
@@ -656,9 +659,9 @@ async function openFacebookComposer(account, userId, target, config, text, image
 
     await writeLog(userId, account._id, 'info', 'facebook_post_open_share_composer', 'Đã mở Facebook composer bằng Android share intent để giữ Unicode.', {
       ...shareIntent,
-      args: intentArgs.map((value, index) => intentArgs[index - 1] === 'android.intent.extra.TEXT' ? '***' : value)
+      args: maskShareIntentArgs(intentArgs)
     });
-    return { ...shareIntent, method: images.length ? 'text_share_then_gallery' : 'share_intent' };
+    return { ...shareIntent, method: primaryImage ? 'image_share_intent' : 'text_share_intent' };
   }
 
   return openFacebookHome(account, userId, target, config, shareIntent);
@@ -700,7 +703,7 @@ async function pushFacebookImage(account, userId, target, image) {
     `file://${remotePath}`
   ]);
   steps.push(scan);
-  await delay(600);
+  await delay(postStepDelay());
 
   const grantRead = await runCommand(env.mobileAutomation.adbPath, [
     '-s',
@@ -746,13 +749,22 @@ async function pushFacebookImage(account, userId, target, image) {
     `datetaken:l:${Date.now()}`
   ]);
   steps.push(mediaInsert);
-  await delay(600);
+  await delay(postStepDelay());
 
   return {
     mimeType: image.mimeType || mimeTypeFromExtension(extension),
     remotePath,
     steps
   };
+}
+
+function maskShareIntentArgs(args = []) {
+  return args.map((value, index) => {
+    const previous = args[index - 1];
+    if (previous === 'android.intent.extra.TEXT') return '***';
+    if (previous === 'android.intent.extra.STREAM') return 'file://***';
+    return value;
+  });
 }
 
 function mimeTypeFromExtension(extension) {
@@ -790,10 +802,12 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
   for (let attempt = 1; attempt <= 10; attempt += 1) {
     const state = await detectFacebookState(target, text);
     if (state.hasTargetText) textEntered = true;
+    if (state.hasAttachedImage) imageAttached = true;
     finalState = state.name;
     await writeLog(userId, account._id, 'info', 'facebook_post_state', `Facebook state: ${state.name}.`, {
       attempt,
       reason: state.reason,
+      hasAttachedImage: Boolean(state.hasAttachedImage),
       observedText: state.observedText || ''
     });
 
@@ -805,23 +819,23 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
     if (state.name === 'share_chooser') {
       const feed = await tapTextOrPoint(account, userId, target, shareFeedLabels, { x: 225, y: 1368 }, 'facebook_post_choose_feed', { exact: true });
       steps.push(feed);
-      await delay(env.mobileAutomation.stepDelayMs);
+      await delay(postStepDelay());
       const once = await tapTextOrPoint(account, userId, target, shareOnceLabels, { x: 600, y: 1550 }, 'facebook_post_choose_feed_once', { exact: true });
       steps.push(once);
-      await delay(env.mobileAutomation.stepDelayMs * 3);
+      await delay(postStepDelay(1.5));
       continue;
     }
 
     if (state.name === 'menu') {
       await closeFacebookMenuIfOpen(account, userId, target);
-      await delay(env.mobileAutomation.stepDelayMs);
+      await delay(postStepDelay());
       continue;
     }
 
     if (state.name === 'discard_dialog') {
       const discard = await tapTextOrPoint(account, userId, target, discardPostLabels, { x: 450, y: 1460 }, 'facebook_post_discard_stale_draft', { exact: true });
       steps.push(discard);
-      await delay(env.mobileAutomation.stepDelayMs * 2);
+      await delay(postStepDelay(1.25));
       continue;
     }
 
@@ -836,18 +850,18 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
         { exact: Boolean(state.observedText) }
       );
       steps.push(editor);
-      await delay(env.mobileAutomation.stepDelayMs * 2);
+      await delay(postStepDelay(1.25));
       const replace = await replaceFocusedText(target, text);
       await writeLog(userId, account._id, replace.ok ? 'info' : 'error', 'facebook_post_replace_stale_text', replace.ok ? 'Đã thay nội dung draft cũ bằng nội dung mới.' : 'Không thay được nội dung draft cũ.', replace);
       if (!replace.ok) throw new Error(replace.error || replace.stderr || 'Không thay được nội dung draft cũ.');
       steps.push(replace);
       textEntered = true;
-      await delay(env.mobileAutomation.stepDelayMs * 2);
+      await delay(postStepDelay(1.25));
       const editorState = await detectFacebookState(target, text);
       if (editorState.name === 'text_editor') {
         const done = await tapTextOrPoint(account, userId, target, doneLabels, config.doneTap || { x: 844, y: 70 }, 'facebook_post_done_replaced_text', { exact: true });
         steps.push(done);
-        await delay(env.mobileAutomation.stepDelayMs * 2);
+        await delay(postStepDelay(1.25));
       }
       continue;
     }
@@ -857,7 +871,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
         const attachment = await attachFacebookImages(account, userId, target, imageCount);
         steps.push(...attachment.steps);
         imageAttached = true;
-        await delay(env.mobileAutomation.stepDelayMs * 2);
+        await delay(postStepDelay(1.25));
         continue;
       }
 
@@ -875,7 +889,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
         const input = await inputAndLog(userId, account._id, target, 'facebook_post_input_text', text);
         steps.push(input);
         textEntered = true;
-        await delay(env.mobileAutomation.stepDelayMs * 2);
+        await delay(postStepDelay(1.25));
         const enteredState = await detectFacebookState(target, text);
         await writeLog(userId, account._id, enteredState.hasTargetText ? 'info' : 'warn', 'facebook_post_verify_text', enteredState.hasTargetText ? 'Đã xác nhận text xuất hiện trong editor.' : 'Chưa xác nhận được text trong editor sau khi nhập.', {
           state: enteredState.name,
@@ -891,7 +905,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
 
       const done = await tapTextOrPoint(account, userId, target, doneLabels, { x: 846, y: 72 }, 'facebook_post_done_text', { exact: true });
       steps.push(done);
-      await delay(env.mobileAutomation.stepDelayMs * 3);
+      await delay(postStepDelay(1.5));
       continue;
     }
 
@@ -901,7 +915,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
           const attachment = await attachFacebookImages(account, userId, target, imageCount);
           steps.push(...attachment.steps);
           imageAttached = true;
-          await delay(env.mobileAutomation.stepDelayMs * 2);
+          await delay(postStepDelay(1.25));
           continue;
         }
 
@@ -915,14 +929,14 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
 
       const bodyTap = await tapTextOrPoint(account, userId, target, composerLabels, { x: 450, y: 360 }, 'facebook_post_open_text_editor');
       steps.push(bodyTap);
-      await delay(env.mobileAutomation.stepDelayMs * 2);
+      await delay(postStepDelay(1.25));
       continue;
     }
 
     if (state.name === 'home') {
       const composerTap = await tapTextOrPoint(account, userId, target, composerLabels, config.composerTap, 'facebook_post_tap_composer');
       steps.push(composerTap);
-      await delay(env.mobileAutomation.stepDelayMs * 2);
+      await delay(postStepDelay(1.25));
       continue;
     }
 
@@ -931,14 +945,14 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
         attempt,
         state: state.name
       });
-      await delay(env.mobileAutomation.stepDelayMs * 2);
+      await delay(postStepDelay(1.25));
       continue;
     }
 
     const home = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'monkey', '-p', config.appPackage, '-c', 'android.intent.category.LAUNCHER', '1']);
     steps.push(home);
     await writeLog(userId, account._id, home.ok ? 'info' : 'warn', 'facebook_post_reopen_home', home.ok ? 'Đã mở lại Facebook để tìm Home.' : 'Mở lại Facebook lỗi.', home);
-    await delay(env.mobileAutomation.stepDelayMs * 2);
+    await delay(postStepDelay(1.25));
   }
 
   screenshot = await captureScreenshot(account, userId, 'facebook_post_state_machine_pending');
@@ -949,24 +963,73 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
 }
 
 async function submitFacebookPost(account, userId, target, config, text, steps, action) {
-  await delay(env.mobileAutomation.stepDelayMs * 2);
-  const submit = await tapTextOrPoint(account, userId, target, submitLabels, config.submitTap, action, { exact: true });
-  steps.push(submit);
-  const verification = await verifyFacebookPostSubmit(account, userId, target, text);
+  await delay(postStepDelay(1.25));
+  const submitAttempts = await buildSubmitTapAttempts(target, config.submitTap);
+  let verification = null;
+
+  for (let index = 0; index < submitAttempts.length; index += 1) {
+    const attempt = submitAttempts[index];
+    const submit = attempt.useText
+      ? await tapTextOrPoint(account, userId, target, submitLabels, attempt.point, action, { exact: true })
+      : await tapAndLog(userId, account._id, target, `${action}_fallback_${index}`, attempt.point);
+    steps.push(submit);
+
+    verification = await verifyFacebookPostSubmit(account, userId, target, text);
+    if (verification.ok || !verification.composerPending) break;
+
+    await writeLog(userId, account._id, 'warn', 'facebook_post_submit_retry', 'Facebook vẫn ở composer sau khi bấm Đăng, thử lại bằng tọa độ dự phòng.', {
+      attempt: index + 1,
+      reason: verification.reason,
+      point: attempt.point,
+      useText: attempt.useText
+    });
+    await delay(postStepDelay());
+  }
+
   return {
-    finalState: verification.ok ? 'submitted' : verification.finalState,
-    screenshot: verification.screenshot,
+    finalState: verification?.ok ? 'submitted' : verification?.finalState,
+    screenshot: verification?.screenshot,
     steps,
-    composerPending: verification.composerPending,
-    submitVerified: verification.ok,
-    submitReason: verification.reason
+    composerPending: verification?.composerPending ?? true,
+    submitVerified: Boolean(verification?.ok),
+    submitReason: verification?.reason || ''
   };
+}
+
+async function buildSubmitTapAttempts(target, configuredPoint = {}) {
+  const size = await getDeviceScreenSize(target);
+  const dynamicPoint = size
+    ? { x: Math.max(1, Math.round(size.width - 72)), y: Math.max(1, Math.round(size.height - 42)) }
+    : null;
+  const lowerDynamicPoint = size
+    ? { x: Math.max(1, Math.round(size.width * 0.94)), y: Math.max(1, Math.round(size.height * 0.955)) }
+    : null;
+  const points = [
+    { useText: true, point: configuredPoint },
+    dynamicPoint ? { useText: false, point: dynamicPoint } : null,
+    lowerDynamicPoint ? { useText: false, point: lowerDynamicPoint } : null
+  ].filter((item) => item?.point?.x && item?.point?.y);
+
+  const seen = new Set();
+  return points.filter((item) => {
+    const key = `${item.useText}:${item.point.x},${item.point.y}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+async function getDeviceScreenSize(target) {
+  const result = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'wm', 'size'], { timeoutMs: 10_000 });
+  const match = `${result.stdout || ''}\n${result.stderr || ''}`.match(/Physical size:\s*(\d+)x(\d+)/i);
+  if (!match) return null;
+  return { width: Number(match[1]), height: Number(match[2]) };
 }
 
 async function verifyFacebookPostSubmit(account, userId, target, text) {
   let lastState = null;
   for (let attempt = 1; attempt <= 8; attempt += 1) {
-    await delay(attempt <= 2 ? env.mobileAutomation.stepDelayMs * 2 : env.mobileAutomation.stepDelayMs);
+    await delay(attempt <= 2 ? postStepDelay(1.25) : postStepDelay());
     const nodes = await dumpVisibleNodes(target);
     const confirmation = findNodeInNodes(nodes, postedConfirmationLabels);
     if (confirmation) {
@@ -1038,7 +1101,7 @@ async function attachFacebookImages(account, userId, target, imageCount = 1) {
       { exact: true }
     );
     steps.push(remove);
-    await delay(env.mobileAutomation.stepDelayMs * 2);
+    await delay(postStepDelay(1.25));
   }
 
   const gallery = await tapTextOrPoint(
@@ -1051,13 +1114,13 @@ async function attachFacebookImages(account, userId, target, imageCount = 1) {
     { exact: true }
   );
   steps.push(gallery);
-  await delay(env.mobileAutomation.stepDelayMs * 2);
+  await delay(postStepDelay(1.25));
 
   const permission = await findVisibleTextBounds(target, galleryPermissionLabels);
   if (permission) {
     const allow = await tapTextOrPoint(account, userId, target, galleryPermissionLabels, { x: 450, y: 965 }, 'facebook_post_allow_gallery');
     steps.push(allow);
-    await delay(env.mobileAutomation.stepDelayMs * 2);
+    await delay(postStepDelay(1.25));
   }
 
   const imageMatch = await waitForAnyText(target, selectedImageLabels, 8_000);
@@ -1068,12 +1131,12 @@ async function attachFacebookImages(account, userId, target, imageCount = 1) {
   for (let index = 0; index < imagePoints.length; index += 1) {
     const selectImage = await tapAndLog(userId, account._id, target, `facebook_post_select_image_${index + 1}`, imagePoints[index]);
     steps.push(selectImage);
-    await delay(env.mobileAutomation.stepDelayMs);
+    await delay(postStepDelay());
   }
 
   const next = await tapTextOrPoint(account, userId, target, galleryNextLabels, { x: 835, y: 1530 }, 'facebook_post_gallery_next', { exact: true });
   steps.push(next);
-  await delay(env.mobileAutomation.stepDelayMs * 3);
+  await delay(postStepDelay(1.5));
 
   const attached = await waitForAnyText(target, attachedImageLabels, 10_000);
   if (!attached) {
@@ -1129,20 +1192,26 @@ async function detectFacebookState(target, text) {
   const hasAttachedImage = Boolean(findNodeInNodes(nodes, attachedImageLabels));
   const observedText = nodes.find((node) => node.className.includes('EditText') && normalizeSearchText(node.text))?.text || '';
   const hasComposerText = Boolean(observedText);
+  if (hasSubmit && (hasTargetText || hasComposerText || hasAttachedImage)) {
+    return { name: 'ready_to_post', reason: 'submit_visible_without_title', hasTargetText, hasAttachedImage, observedText };
+  }
   if (hasPostTitle && !hasTargetText && (hasAttachedImage || hasComposerText)) {
     return {
       name: 'stale_composer',
       reason: hasAttachedImage ? 'existing_image_draft' : 'existing_text_draft',
       hasTargetText,
+      hasAttachedImage,
       observedText
     };
   }
-  if ((hasSubmit || hasPostTitle) && hasTargetText) return { name: 'ready_to_post', reason: hasSubmit ? 'submit_visible' : 'post_title_with_text', hasTargetText };
-  if (hasPostTitle) return { name: 'composer', reason: 'post_title_visible', hasTargetText };
+  if ((hasSubmit || hasPostTitle) && hasTargetText) {
+    return { name: 'ready_to_post', reason: hasSubmit ? 'submit_visible' : 'post_title_with_text', hasTargetText, hasAttachedImage };
+  }
+  if (hasPostTitle) return { name: 'composer', reason: 'post_title_visible', hasTargetText, hasAttachedImage };
 
-  if (findNodeInNodes(nodes, composerLabels)) return { name: 'home', reason: 'composer_entry_visible', hasTargetText };
+  if (findNodeInNodes(nodes, composerLabels)) return { name: 'home', reason: 'composer_entry_visible', hasTargetText, hasAttachedImage };
 
-  return { name: 'unknown', reason: 'no_known_labels', hasTargetText };
+  return { name: 'unknown', reason: 'no_known_labels', hasTargetText, hasAttachedImage };
 }
 
 const jobs = new Map();
@@ -1285,7 +1354,7 @@ async function tapAndLog(userId, accountId, target, action, point = {}) {
   }
   await writeLog(userId, accountId, result.ok ? 'info' : 'error', action, result.ok ? `Tap ${point.x},${point.y}.` : `Tap lỗi ${point.x},${point.y}.`, result);
   if (!result.ok) throw new Error(result.error || result.stderr || `${action} failed.`);
-  await delay(env.mobileAutomation.stepDelayMs);
+  await delay(action.startsWith('facebook_post') ? postStepDelay() : env.mobileAutomation.stepDelayMs);
   return result;
 }
 
@@ -1397,11 +1466,16 @@ function screenHasText(nodes, text) {
   const normalized = normalizeSearchText(text);
   if (!normalized) return false;
   const compactNeedle = normalized.replace(/\s+/g, '');
+  const lineSnippets = normalized
+    .split(/\s*#|\n|\r/)
+    .map((item) => item.trim())
+    .filter(Boolean);
   const snippets = [
     normalized,
     normalized.slice(0, 40).trim(),
-    compactNeedle.slice(0, 40)
-  ].filter((item) => item.length >= 8);
+    compactNeedle.slice(0, 40),
+    ...lineSnippets
+  ].filter((item) => item.length >= 3);
   const haystack = nodes
     .map((node) => normalizeSearchText(`${node.text} ${node.desc}`))
     .join(' ');
@@ -1446,7 +1520,7 @@ async function inputAndLog(userId, accountId, target, action, text, sensitive = 
     args: sensitive ? ['-s', target, 'shell', result.method || 'input_text', '***'] : result.args
   });
   if (!result.ok) throw new Error(result.error || result.stderr || `${action} failed.`);
-  await delay(env.mobileAutomation.stepDelayMs);
+  await delay(action.startsWith('facebook_post') ? postStepDelay() : env.mobileAutomation.stepDelayMs);
   return result;
 }
 
