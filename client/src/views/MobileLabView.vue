@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import { AlertTriangle, BarChart3, CalendarClock, CheckCircle2, ChevronLeft, ChevronRight, Clock3, Eye, FileText, Gauge, GripVertical, Home, Image, Keyboard, ListChecks, Loader2, MousePointer2, Play, RefreshCcw, Save, Send, ShieldCheck, Smartphone, Sparkles, Terminal, Timer, Trash2, Undo2, Users, Wifi, XCircle, Zap } from 'lucide-vue-next';
 import { http } from '../api/http';
 import BaseCard from '../components/BaseCard.vue';
@@ -27,6 +27,7 @@ const composerTextarea = ref(null);
 const showEmojiPicker = ref(false);
 const showDeviceTools = ref(false);
 const facebookSessionAccountId = ref('');
+const runtimeStatusChecking = ref(false);
 const technicalLogsOpen = ref(false);
 const workflowStage = ref('idle');
 const publishMode = ref('direct');
@@ -41,6 +42,8 @@ const draggedPreviewPhotoId = ref('');
 
 const maxPhotos = 4;
 const draftStorageKey = 'socialpilot-facebook-composer-drafts';
+const runtimeStatusIntervalMs = 4_000;
+let runtimeStatusTimer = null;
 
 const platforms = [
   {
@@ -655,6 +658,7 @@ async function remoteOpenApp() {
       appPackage: nextAccount.metadata?.appPackage || selectedPlatform.value.packageName
     });
     facebookSessionAccountId.value = nextAccount._id;
+    await syncSelectedAccountRuntimeStatus();
     ui.notify(shouldClosePrevious ? `Đã chuyển sang ${nextAccount.displayName}.` : `Đã mở ${selectedPlatform.value.label}.`);
     if (showDeviceTools.value) await refreshScreenshot();
   } catch (error) {
@@ -664,6 +668,43 @@ async function remoteOpenApp() {
     facebookOpening.value = false;
     running.value = false;
   }
+}
+
+async function syncSelectedAccountRuntimeStatus() {
+  const account = selectedAccount.value;
+  if (!account || runtimeStatusChecking.value || posting.value || queueRunning.value) return;
+
+  runtimeStatusChecking.value = true;
+  try {
+    const { data } = await http.get(`/mobile/accounts/${account._id}/runtime-status`, {
+      params: {
+        appPackage: account.metadata?.appPackage || selectedPlatform.value.packageName
+      }
+    });
+    if (selectedAccount.value?._id !== account._id) return;
+    facebookSessionAccountId.value = data.status?.deviceReady && data.status?.appReady
+      ? account._id
+      : '';
+  } catch {
+    // Lỗi mạng tạm thời không nên làm thay đổi trạng thái đang hiển thị.
+  } finally {
+    runtimeStatusChecking.value = false;
+  }
+}
+
+function startRuntimeStatusPolling() {
+  stopRuntimeStatusPolling();
+  runtimeStatusTimer = window.setInterval(() => {
+    if (document.visibilityState === 'visible') {
+      syncSelectedAccountRuntimeStatus();
+    }
+  }, runtimeStatusIntervalMs);
+}
+
+function stopRuntimeStatusPolling() {
+  if (!runtimeStatusTimer) return;
+  window.clearInterval(runtimeStatusTimer);
+  runtimeStatusTimer = null;
 }
 
 async function probeDevice() {
@@ -789,27 +830,30 @@ async function runQueueWorkflow() {
     return;
   }
 
+  const queueAccounts = [...selectedQueueAccounts.value];
+  const interAccountDelaySeconds = Math.max(0, Math.min(Number(queueDelaySeconds.value) || 0, 600));
   posting.value = true;
   queueRunning.value = true;
   postResult.value = null;
   workflowStage.value = 'posting';
-  queueItems.value = selectedQueueAccounts.value.map((account, index) => ({
+  queueItems.value = queueAccounts.map((account) => ({
     id: account._id,
     name: account.displayName,
     instanceName: account.instanceName,
-    status: index === 0 ? 'running' : 'pending',
-    message: index === 0 ? 'Đang xử lý' : 'Đang chờ',
+    status: 'pending',
+    message: 'Đang chuẩn bị',
     result: null
   }));
 
   try {
+    await prepareQueueEnvironment();
     let stopQueue = false;
-    for (let index = 0; index < selectedQueueAccounts.value.length; index += 1) {
-      const account = selectedQueueAccounts.value[index];
+    for (let index = 0; index < queueAccounts.length; index += 1) {
+      const account = queueAccounts[index];
       selectedAccountId.value = account._id;
 
       try {
-        updateQueueItem(account._id, { status: 'running', message: 'Đang mở và đăng bài' });
+        updateQueueItem(account._id, { status: 'running', message: 'Đang khởi động LDPlayer' });
         const queueSubmitWaitMs = 8_000 + (uploadedPhotoCount.value * 5_000);
         updateQueueItem(account._id, {
           status: 'running',
@@ -829,31 +873,35 @@ async function runQueueWorkflow() {
           });
           stopQueue = true;
         } else {
+          const successMessage = uploadedPhotoCount.value
+            ? `Đã tải xong ${uploadedPhotoCount.value} ảnh và đăng bài`
+            : 'Đã đăng và xác minh';
           updateQueueItem(account._id, {
             status: 'done',
-            message: uploadedPhotoCount.value
-              ? `Đã tải xong ${uploadedPhotoCount.value} ảnh và đăng bài`
-              : 'Đã đăng và xác minh',
+            message: successMessage,
             result: data.result
           });
-          await closeQueueAccount(account);
+          await closeQueueAccount(account, successMessage);
         }
       } catch (error) {
         updateQueueItem(account._id, { status: 'failed', message: error.message });
-        stopQueue = true;
+        await closeQueueAccount(account, `Lỗi: ${error.message}`);
       }
 
       if (stopQueue) {
-        for (let pendingIndex = index + 1; pendingIndex < selectedQueueAccounts.value.length; pendingIndex += 1) {
-          const pendingAccount = selectedQueueAccounts.value[pendingIndex];
+        for (let pendingIndex = index + 1; pendingIndex < queueAccounts.length; pendingIndex += 1) {
+          const pendingAccount = queueAccounts[pendingIndex];
           updateQueueItem(pendingAccount._id, { status: 'pending', message: 'Tạm dừng do lượt trước chưa hoàn tất' });
         }
         break;
       }
 
-      if (index < selectedQueueAccounts.value.length - 1 && queueDelaySeconds.value > 0) {
-        updateQueueItem(selectedQueueAccounts.value[index + 1]._id, { status: 'waiting', message: `Chờ ${queueDelaySeconds.value}s trước lượt đăng` });
-        await wait(queueDelaySeconds.value * 1000);
+      if (index < queueAccounts.length - 1 && interAccountDelaySeconds > 0) {
+        updateQueueItem(queueAccounts[index + 1]._id, {
+          status: 'waiting',
+          message: `Nghỉ ${interAccountDelaySeconds} giây trước lượt tiếp theo`
+        });
+        await wait(interAccountDelaySeconds * 1000);
       }
     }
 
@@ -864,6 +912,26 @@ async function runQueueWorkflow() {
     posting.value = false;
     queueRunning.value = false;
   }
+}
+
+async function prepareQueueEnvironment() {
+  queueItems.value = queueItems.value.map((item) => ({
+    ...item,
+    status: 'pending',
+    message: 'Đang tắt các LDPlayer trước khi bắt đầu'
+  }));
+
+  await Promise.allSettled(facebookAccounts.value.map((account) => http.post(
+    `/mobile/accounts/${account._id}/remote/close-session`,
+    { appPackage: account.metadata?.appPackage || selectedPlatform.value.packageName }
+  )));
+
+  facebookSessionAccountId.value = '';
+  queueItems.value = queueItems.value.map((item) => ({
+    ...item,
+    message: 'Đang chờ đến lượt'
+  }));
+  await wait(1_000);
 }
 
 function submitFacebookForAccount(account, autoSubmit, waitAfterSubmitMs = 0) {
@@ -894,9 +962,9 @@ function updateQueueItem(id, patch) {
   queueItems.value = queueItems.value.map((item) => item.id === id ? { ...item, ...patch } : item);
 }
 
-async function closeQueueAccount(account) {
+async function closeQueueAccount(account, message = '') {
   const current = queueItems.value.find((item) => item.id === account._id);
-  const baseMessage = current?.message || 'Đã xử lý';
+  const baseMessage = message || current?.message || 'Đã xử lý';
   updateQueueItem(account._id, { message: `${baseMessage} · Đang tắt LDPlayer` });
   try {
     await http.post(`/mobile/accounts/${account._id}/remote/close-session`, {
@@ -1210,10 +1278,18 @@ onMounted(async () => {
   loadDrafts();
   await load();
   await ensureDefaultProfile();
+  await syncSelectedAccountRuntimeStatus();
+  startRuntimeStatusPolling();
 });
 
 onUnmounted(() => {
+  stopRuntimeStatusPolling();
   post.media.forEach((item) => URL.revokeObjectURL(item.url));
+});
+
+watch(selectedAccountId, () => {
+  facebookSessionAccountId.value = '';
+  syncSelectedAccountRuntimeStatus();
 });
 </script>
 
@@ -1485,7 +1561,7 @@ onUnmounted(() => {
 
             <div class="rounded-xl border border-zinc-200 bg-white p-3 dark:border-zinc-800 dark:bg-zinc-950">
               <label class="block text-xs font-extrabold uppercase tracking-wide text-zinc-500">
-                Khoảng nghỉ
+                Nghỉ giữa hai LDPlayer
                 <input
                   v-model.number="queueDelaySeconds"
                   class="field mt-2"

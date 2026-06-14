@@ -10,6 +10,7 @@ import {
   closeAccountSession,
   createMobileLoginJob,
   encryptSecret,
+  getAccountRuntimeStatus,
   getMobileLoginJob,
   openAccountApp,
   openLdPlayer,
@@ -183,6 +184,12 @@ mobileRoutes.post('/accounts/:id/probe', requireAuth, asyncHandler(async (req, r
   const account = await findAccount(req.params.id, req.user._id);
   const result = await probeDevice(account, req.user._id);
   res.json({ account: sanitizeAccount(account), result });
+}));
+
+mobileRoutes.get('/accounts/:id/runtime-status', requireAuth, asyncHandler(async (req, res) => {
+  const account = await findAccount(req.params.id, req.user._id);
+  const status = await getAccountRuntimeStatus(account, req.query.appPackage);
+  res.json({ status });
 }));
 
 mobileRoutes.post('/accounts/:id/remote/launch', requireAuth, asyncHandler(async (req, res) => {

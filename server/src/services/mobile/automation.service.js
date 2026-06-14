@@ -828,6 +828,43 @@ export async function probeDevice(account, userId, targetOverride = '') {
   return result;
 }
 
+export async function getAccountRuntimeStatus(account, appPackage) {
+  const target = getDeviceTarget(account);
+  const packageName = appPackage || account.metadata?.appPackage || defaultPackages[account.platform];
+  if (!target) {
+    return {
+      target: '',
+      deviceReady: false,
+      appReady: false,
+      foregroundPackage: ''
+    };
+  }
+
+  const device = await runCommand(
+    env.mobileAutomation.adbPath,
+    ['-s', target, 'get-state'],
+    { timeoutMs: 5_000 }
+  );
+  const deviceReady = device.ok && String(device.stdout || '').trim() === 'device';
+  if (!deviceReady) {
+    return {
+      target,
+      deviceReady: false,
+      appReady: false,
+      foregroundPackage: ''
+    };
+  }
+
+  const foreground = await getForegroundAndroidPackage(target);
+  return {
+    target,
+    deviceReady: true,
+    appReady: Boolean(packageName) && foreground.packageName === packageName,
+    foregroundPackage: foreground.packageName,
+    foregroundActivity: foreground.activityName
+  };
+}
+
 export async function runMobileLogin(account, userId, override = {}) {
   const target = getDeviceTarget(account);
   const config = buildAutomationConfig(account, override);
@@ -1214,32 +1251,39 @@ async function prepareFacebookMediaSession(account, userId, target) {
 
 async function prepareFacebookImages(account, userId, target, images) {
   const mediaSession = await prepareFacebookMediaSession(account, userId, target);
-  const reversedImages = [...images].reverse();
-  const baseTimestamp = Date.now() - reversedImages.length * 2000;
-  const registeredImages = [];
+  const baseTimestamp = Date.now() - images.length * 2000;
+  const descriptors = images.map((image, index) => createFacebookImageDescriptor(
+    image,
+    mediaSession,
+    index + 1,
+    baseTimestamp + ((images.length - index - 1) * 2000)
+  ));
+  const pushedImages = await Promise.all(descriptors.map((descriptor) => pushFacebookImageFile(
+    account,
+    userId,
+    target,
+    descriptor
+  )));
 
-  // Facebook Gallery ưu tiên media mới nhất. Đăng ký tuần tự từ ảnh cuối
-  // đến ảnh đầu để thứ tự hiển thị và thứ tự chọn khớp Preview.
-  for (let index = 0; index < reversedImages.length; index += 1) {
-    registeredImages.push(await pushFacebookImage(
+  // Chép file là bước nặng nên chạy song song. MediaStore vẫn đăng ký tuần tự
+  // từ ảnh cuối đến ảnh đầu để Facebook Gallery giữ đúng thứ tự Preview.
+  const preparedImages = [];
+  for (const pushedImage of [...pushedImages].reverse()) {
+    preparedImages.push(await registerFacebookImageMedia(
       account,
       userId,
       target,
-      reversedImages[index],
-      mediaSession,
-      baseTimestamp + index * 2000,
-      images.length - index
+      pushedImage
     ));
   }
-
-  const preparedImages = registeredImages.reverse();
+  preparedImages.reverse();
   if (preparedImages[0]) {
     preparedImages[0].steps = [...mediaSession.steps, ...preparedImages[0].steps];
   }
   return preparedImages;
 }
 
-async function pushFacebookImage(account, userId, target, image, mediaSession = null, mediaTimestamp = Date.now(), displayOrder = 1) {
+function createFacebookImageDescriptor(image, mediaSession, displayOrder, mediaTimestamp) {
   const localPath = getLocalUploadPath(image.url);
   if (!localPath || !existsSync(localPath)) {
     throw new Error('Ảnh chưa được upload vào server hoặc không còn tồn tại.');
@@ -1248,14 +1292,27 @@ async function pushFacebookImage(account, userId, target, image, mediaSession = 
   const extension = path.extname(localPath).toLowerCase() || '.jpg';
   const imageHash = getLocalImageHash(localPath);
   const filename = `socialpilot-${String(displayOrder).padStart(2, '0')}-${imageHash.slice(0, 20)}${extension}`;
-  const remoteDir = mediaSession?.remoteDir || facebookMediaRoot;
+  const remoteDir = mediaSession.remoteDir;
   const remotePath = `${remoteDir}/${filename}`;
-  const steps = [];
 
-  if (!mediaSession) {
-    const fallbackSession = await prepareFacebookMediaSession(account, userId, target);
-    steps.push(...fallbackSession.steps);
-  }
+  return {
+    localPath,
+    imageHash,
+    filename,
+    remotePath,
+    mediaTimestamp,
+    mimeType: image.mimeType || mimeTypeFromExtension(extension)
+  };
+}
+
+async function pushFacebookImageFile(account, userId, target, descriptor) {
+  const {
+    localPath,
+    filename,
+    remotePath,
+    imageHash
+  } = descriptor;
+  const steps = [];
 
   const remoteExists = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'test', '-f', remotePath], { timeoutMs: 10_000 });
   steps.push(remoteExists);
@@ -1276,6 +1333,18 @@ async function pushFacebookImage(account, userId, target, image, mediaSession = 
     });
   }
 
+  return { ...descriptor, steps, cacheHit };
+}
+
+async function registerFacebookImageMedia(account, userId, target, preparedImage) {
+  const {
+    filename,
+    remotePath,
+    mediaTimestamp,
+    mimeType,
+    cacheHit
+  } = preparedImage;
+  const steps = [...preparedImage.steps];
   const existingMedia = await findAndroidMediaByPath(target, remotePath);
   steps.push(existingMedia.query);
   let contentUri = existingMedia.contentUri;
@@ -1309,7 +1378,7 @@ async function pushFacebookImage(account, userId, target, image, mediaSession = 
       '--bind',
       `_data:s:${remotePath}`,
       '--bind',
-      `mime_type:s:${image.mimeType || mimeTypeFromExtension(extension)}`,
+      `mime_type:s:${mimeType}`,
       '--bind',
       `_display_name:s:${filename}`,
       '--bind',
@@ -1377,7 +1446,7 @@ async function pushFacebookImage(account, userId, target, image, mediaSession = 
   );
 
   return {
-    mimeType: image.mimeType || mimeTypeFromExtension(extension),
+    mimeType,
     remotePath,
     contentUri,
     steps
