@@ -5,24 +5,28 @@ import { ApiError, asyncHandler } from '../../utils/api-error.js';
 import { MobileAccount } from '../../models/mobile-account.model.js';
 import { MobileAccountLog } from '../../models/mobile-account-log.model.js';
 import {
-  cancelMobileLoginJob,
   captureScreenshot,
   closeAccountSession,
-  createMobileLoginJob,
-  encryptSecret,
   getAccountRuntimeStatus,
-  getMobileLoginJob,
   openAccountApp,
   openLdPlayer,
-  publishFacebookPostViaMobile,
   probeDevice,
   remoteKey,
   remoteSwipe,
   remoteTap,
-  remoteText,
+  remoteText
+} from '../../services/mobile/device-automation.service.js';
+import {
+  publishFacebookPostViaMobile
+} from '../../services/mobile/facebook-automation.service.js';
+import {
+  cancelMobileLoginJob,
+  createMobileLoginJob,
+  encryptSecret,
+  getMobileLoginJob,
   runMobileLogin,
   sanitizeAccount
-} from '../../services/mobile/automation.service.js';
+} from '../../services/mobile/login-automation.service.js';
 
 export const mobileRoutes = Router();
 

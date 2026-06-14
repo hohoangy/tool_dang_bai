@@ -35,7 +35,7 @@ const composerTab = ref('compose');
 const selectedQueueAccountIds = ref([]);
 const queueItems = ref([]);
 const queueRunning = ref(false);
-const queueDelaySeconds = ref(5);
+const queueDelaySeconds = ref(0);
 const scheduleDateTime = ref(defaultScheduleDateTime());
 const drafts = ref([]);
 const draggedPreviewPhotoId = ref('');
@@ -52,27 +52,6 @@ const platforms = [
     packageName: 'com.facebook.katana',
     status: 'ready',
     description: 'Mo composer, nhap text, gan anh va dang truc tiep bang Facebook app trong LDPlayer.'
-  },
-  {
-    id: 'x',
-    label: 'X',
-    packageName: 'com.twitter.android',
-    status: 'planned',
-    description: 'Se dung cung LDPlayer engine, them workflow compose/post rieng cho X.'
-  },
-  {
-    id: 'tiktok',
-    label: 'TikTok',
-    packageName: 'com.zhiliaoapp.musically',
-    status: 'planned',
-    description: 'Se can workflow chon video, caption, next va post.'
-  },
-  {
-    id: 'instagram',
-    label: 'Instagram',
-    packageName: 'com.instagram.android',
-    status: 'planned',
-    description: 'Se can workflow chon media, caption va share.'
   }
 ];
 
@@ -830,7 +809,12 @@ async function runQueueWorkflow() {
     return;
   }
 
-  const queueAccounts = [...selectedQueueAccounts.value];
+  const warmAccountId = facebookSessionAccountId.value;
+  const queueAccounts = [...selectedQueueAccounts.value].sort((left, right) => {
+    if (left._id === warmAccountId) return -1;
+    if (right._id === warmAccountId) return 1;
+    return 0;
+  });
   const interAccountDelaySeconds = Math.max(0, Math.min(Number(queueDelaySeconds.value) || 0, 600));
   posting.value = true;
   queueRunning.value = true;
@@ -850,10 +834,9 @@ async function runQueueWorkflow() {
     let stopQueue = false;
     for (let index = 0; index < queueAccounts.length; index += 1) {
       const account = queueAccounts[index];
-      selectedAccountId.value = account._id;
 
       try {
-        updateQueueItem(account._id, { status: 'running', message: 'Đang khởi động LDPlayer' });
+        updateQueueItem(account._id, { status: 'running', message: 'Đang kiểm tra LDPlayer và ADB' });
         const queueSubmitWaitMs = 8_000 + (uploadedPhotoCount.value * 5_000);
         updateQueueItem(account._id, {
           status: 'running',
@@ -918,20 +901,12 @@ async function prepareQueueEnvironment() {
   queueItems.value = queueItems.value.map((item) => ({
     ...item,
     status: 'pending',
-    message: 'Đang tắt các LDPlayer trước khi bắt đầu'
-  }));
-
-  await Promise.allSettled(facebookAccounts.value.map((account) => http.post(
-    `/mobile/accounts/${account._id}/remote/close-session`,
-    { appPackage: account.metadata?.appPackage || selectedPlatform.value.packageName }
-  )));
-
-  facebookSessionAccountId.value = '';
-  queueItems.value = queueItems.value.map((item) => ({
-    ...item,
     message: 'Đang chờ đến lượt'
   }));
-  await wait(1_000);
+
+  // Giữ profile đang chạy để lượt đầu có thể dùng warm start. Mỗi profile
+  // vẫn được đóng ngay sau khi hoàn tất để giải phóng RAM trước lượt kế tiếp.
+  await wait(100);
 }
 
 function submitFacebookForAccount(account, autoSubmit, waitAfterSubmitMs = 0) {
