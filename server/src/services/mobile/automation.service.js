@@ -1,7 +1,7 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from 'crypto';
-import { existsSync } from 'fs';
+import { existsSync, readFileSync, statSync } from 'fs';
 import path from 'path';
 import { env } from '../../config/env.js';
 import { MobileAccount } from '../../models/mobile-account.model.js';
@@ -9,6 +9,8 @@ import { MobileAccountLog } from '../../models/mobile-account-log.model.js';
 import { getLocalUploadPath } from '../../utils/media-file.js';
 
 const execFileAsync = promisify(execFile);
+const localImageHashCache = new Map();
+const facebookMediaRoot = '/sdcard/Pictures/SocialPilot';
 
 const defaultPackages = {
   facebook: 'com.facebook.katana',
@@ -25,8 +27,7 @@ const defaultLoginSteps = {
 };
 
 const defaultPostSteps = {
-  composerTap: { x: 390, y: 145 },
-  submitTap: { x: 818, y: 1552 }
+  composerTap: { x: 390, y: 145 }
 };
 
 const composerLabels = [
@@ -37,7 +38,7 @@ const composerLabels = [
   'Tạo bài viết'
 ];
 
-const submitLabels = ['Post', 'POST', 'Đăng', 'Dang'];
+const submitLabels = ['Đăng', 'Dang', 'Post', 'POST', 'Share', 'Publish'];
 const postedConfirmationLabels = [
   'Đã chia sẻ bài viết của bạn',
   'Da chia se bai viet cua ban',
@@ -50,12 +51,39 @@ const postedConfirmationLabels = [
   'Your post was shared',
   'View post'
 ];
-const postingProgressLabels = ['Đang đăng', 'Dang dang', 'Đang chia sẻ', 'Dang chia se', 'Posting'];
+const postingProgressLabels = [
+  'Đang đăng',
+  'Dang dang',
+  'Đang chia sẻ',
+  'Dang chia se',
+  'Không đóng Facebook',
+  'Khong dong Facebook',
+  'Posting',
+  "Don't close Facebook"
+];
 const closeMenuLabels = ['Đóng menu.', 'Dong menu.', 'Close menu'];
+const auxiliaryMenuLabels = ['Lựa chọn khác', 'Lua chon khac', 'Thêm nhãn AI', 'Them nhan AI'];
 const doneLabels = ['Xong', 'Done'];
 const galleryLabels = ['Thư viện', 'Ảnh/video', 'Photo/video', 'Gallery'];
+const addMorePhotoLabels = [
+  'Thêm ảnh/video khác từ thư viện.',
+  'Them anh/video khac tu thu vien.',
+  'Add more photos/videos from gallery.',
+  'Add more photos or videos from gallery.',
+  'Thêm file phương tiện',
+  'Them file phuong tien',
+  'Thêm phương tiện',
+  'Them phuong tien',
+  'Add media',
+  'Add more media',
+  'Thêm ảnh',
+  'Thêm ảnh/video',
+  'Add more',
+  'Add photos',
+  'Add photo'
+];
 const galleryPermissionLabels = ['Cho phép truy cập', 'Allow access'];
-const galleryNextLabels = ['Tiếp', 'Next'];
+const galleryNextLabels = ['Tiếp', 'Next', 'Xong', 'Done'];
 const selectedImageLabels = ['Ảnh chụp vào ngày', 'Photo taken on'];
 const attachedImageLabels = ['Gỡ ảnh', 'Chỉnh sửa ảnh', 'mở rộng ảnh', 'Remove photo', 'Edit photo', 'expand photo'];
 const removeImageLabels = ['Gỡ ảnh', 'Remove photo'];
@@ -66,6 +94,7 @@ const shareOnceLabels = ['JUST ONCE'];
 const postTitleLabels = ['Bài viết mới', 'Bai viet moi', 'Create post'];
 const textEditorLabels = ['Thêm văn bản', 'Them van ban', 'Add text'];
 const loginBlockLabels = ['Log in', 'Đăng nhập', 'Dang nhap', 'Choose a way to confirm your account', 'Confirm your account', 'Session Expired'];
+const facebookHomeLabels = ['Trang chủ', 'Trang chu', 'Home'];
 
 const defaultAdbHost = '127.0.0.1:5555';
 
@@ -74,7 +103,7 @@ function delay(ms) {
 }
 
 function postStepDelay(multiplier = 1) {
-  return Math.round(Math.max(250, Math.min(env.mobileAutomation.stepDelayMs, 500)) * multiplier);
+  return Math.round(Math.max(140, Math.min(env.mobileAutomation.stepDelayMs, 260)) * multiplier);
 }
 
 function cleanText(value = '') {
@@ -283,43 +312,389 @@ export async function captureScreenshot(account, userId, reason = 'debug') {
 
 export async function openLdPlayer(account, userId) {
   let result = await runCommand(env.mobileAutomation.ldconsolePath, ['launch', '--name', account.instanceName]);
-  if (!result.ok) {
-    const fallbackName = await getFirstLdPlayerInstanceName();
-    if (fallbackName && fallbackName !== account.instanceName) {
-      const retry = await runCommand(env.mobileAutomation.ldconsolePath, ['launch', '--name', fallbackName]);
-      result = {
-        ...retry,
-        requestedInstanceName: account.instanceName,
-        fallbackInstanceName: fallbackName,
-        firstError: result.error || result.stderr || ''
-      };
-    }
-  }
   await writeLog(userId, account._id, result.ok ? 'info' : 'error', 'remote_launch_ldplayer', result.ok ? 'Đã mở LDPlayer.' : 'Mở LDPlayer lỗi.', result);
-  if (account.adbHost) {
+  if (result.ok) {
     await delay(env.mobileAutomation.launchWaitMs);
+  }
+  const startServer = await runCommand(env.mobileAutomation.adbPath, ['start-server'], { timeoutMs: 10_000 });
+  await writeLog(userId, account._id, startServer.ok ? 'info' : 'warn', 'remote_adb_start_server', startServer.ok ? 'ADB server đã sẵn sàng.' : 'Không khởi động được ADB server.', startServer);
+  if (account.adbHost) {
     const connect = await runCommand(env.mobileAutomation.adbPath, ['connect', account.adbHost]);
     await writeLog(userId, account._id, connect.ok ? 'info' : 'error', 'remote_adb_connect', connect.ok ? `Đã nối ADB ${account.adbHost}.` : `Nối ADB lỗi ${account.adbHost}.`, connect);
     return { launch: result, connect };
   }
-  return { launch: result, connect: null };
+  return { launch: result, connect: null, startServer };
 }
 
-async function getFirstLdPlayerInstanceName() {
+async function getLdPlayerDeviceTarget(instanceName = '') {
+  if (!instanceName) return '';
   const list = await runCommand(env.mobileAutomation.ldconsolePath, ['list2'], { timeoutMs: 10_000 });
   if (!list.ok || !list.stdout) return '';
-  const firstLine = list.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
-  return firstLine?.split(',')[1]?.trim() || '';
+  const row = list.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => line.split(','))
+    .find((parts) => parts[1]?.trim() === instanceName);
+  const index = Number(row?.[0]);
+  if (!Number.isInteger(index) || index < 0) return '';
+  return `emulator-${5554 + (index * 2)}`;
+}
+
+async function ensureDeviceReady(account, userId, target, attempts = 8) {
+  let lastState = null;
+  await runCommand(env.mobileAutomation.adbPath, ['start-server'], { timeoutMs: 10_000 });
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const state = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'get-state'], { timeoutMs: 10_000 });
+    lastState = state;
+    if (state.ok && String(state.stdout || '').trim() === 'device') {
+      if (attempt > 1) {
+        await writeLog(userId, account._id, 'info', 'adb_ready_after_retry', `ADB ${target} đã sẵn sàng sau ${attempt} lần kiểm tra.`, state);
+      }
+      return state;
+    }
+
+    if (account.adbHost && /^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(account.adbHost)) {
+      await runCommand(env.mobileAutomation.adbPath, ['disconnect', account.adbHost], { timeoutMs: 10_000 });
+      await delay(400);
+      await runCommand(env.mobileAutomation.adbPath, ['connect', account.adbHost], { timeoutMs: 10_000 });
+    }
+    await delay(attempt < 3 ? 800 : 1200);
+  }
+
+  await writeLog(userId, account._id, 'error', 'adb_not_ready', `ADB ${target} chưa sẵn sàng để mở app.`, lastState || {});
+  return lastState || { ok: false, error: 'ADB target is not ready.' };
+}
+
+async function ensureAndroidStorageReady(account, userId, target, attempts = 45) {
+  let lastCheck = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const boot = await runCommand(env.mobileAutomation.adbPath, [
+      '-s',
+      target,
+      'shell',
+      'getprop',
+      'sys.boot_completed'
+    ], { timeoutMs: 10_000 });
+    const storage = await runCommand(env.mobileAutomation.adbPath, [
+      '-s',
+      target,
+      'shell',
+      'mkdir',
+      '-p',
+      '/sdcard/Pictures'
+    ], { timeoutMs: 10_000 });
+    const probePath = '/sdcard/Pictures/.socialpilot-ready';
+    const writable = storage.ok
+      ? await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'touch', probePath], { timeoutMs: 10_000 })
+      : { ok: false, error: 'Pictures directory is unavailable.' };
+    if (writable.ok) {
+      await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'rm', '-f', probePath], { timeoutMs: 10_000 });
+    }
+    lastCheck = { boot, storage, writable };
+
+    if (
+      boot.ok
+      && String(boot.stdout || '').trim() === '1'
+      && storage.ok
+      && writable.ok
+    ) {
+      if (attempt > 1) {
+        await writeLog(userId, account._id, 'info', 'android_storage_ready', `Bộ nhớ ${target} đã sẵn sàng sau ${attempt} lần kiểm tra.`);
+      }
+      return { ok: true, attempt, boot, storage };
+    }
+
+    await delay(attempt < 5 ? 1000 : 1500);
+  }
+
+  await writeLog(userId, account._id, 'error', 'android_storage_not_ready', `Android trên ${target} chưa hoàn tất khởi động bộ nhớ.`, lastCheck || {});
+  return {
+    ok: false,
+    error: 'LDPlayer chưa khởi động xong bộ nhớ ảnh.',
+    ...lastCheck
+  };
+}
+
+async function getDeviceScreenSize(target) {
+  const nodes = await dumpVisibleNodes(target);
+  const width = nodes.reduce((max, node) => Math.max(max, node.bounds?.right || 0), 0);
+  const height = nodes.reduce((max, node) => Math.max(max, node.bounds?.bottom || 0), 0);
+  if (width > 0 && height > 0) {
+    return { width, height, source: 'ui_hierarchy' };
+  }
+
+  const result = await runCommand(env.mobileAutomation.adbPath, [
+    '-s',
+    target,
+    'shell',
+    'wm',
+    'size'
+  ], { timeoutMs: 10_000 });
+  const match = String(result.stdout || '').match(/(?:Override|Physical) size:\s*(\d+)x(\d+)/i);
+  if (!match) return null;
+  return {
+    width: Number(match[1]),
+    height: Number(match[2]),
+    source: 'wm_size'
+  };
+}
+
+async function ensurePortraitOrientation(account, userId, target) {
+  const before = await getDeviceScreenSize(target);
+  if (!before || before.height >= before.width) return { ok: true, changed: false, size: before };
+
+  const lock = await runCommand(env.mobileAutomation.adbPath, [
+    '-s',
+    target,
+    'shell',
+    'settings',
+    'put',
+    'system',
+    'accelerometer_rotation',
+    '0'
+  ], { timeoutMs: 10_000 });
+  const rotate = await runCommand(env.mobileAutomation.adbPath, [
+    '-s',
+    target,
+    'shell',
+    'settings',
+    'put',
+    'system',
+    'user_rotation',
+    '1'
+  ], { timeoutMs: 10_000 });
+  await delay(1200);
+  const after = await getDeviceScreenSize(target);
+  await writeLog(userId, account._id, rotate.ok ? 'info' : 'warn', 'facebook_post_portrait_orientation', rotate.ok ? 'Đã chuẩn hóa LDPlayer về màn hình dọc.' : 'Không khóa được hướng màn hình dọc.', {
+    before,
+    after,
+    lock,
+    rotate
+  });
+  return { ok: lock.ok && rotate.ok, changed: true, before, after };
 }
 
 export async function openAccountApp(account, userId, appPackage) {
-  const target = getDeviceTarget(account);
+  let target = getDeviceTarget(account);
   const packageName = appPackage || account.metadata?.appPackage || defaultPackages[account.platform];
   if (!target) throw new Error('Thiếu deviceId hoặc adbHost.');
   if (!packageName) throw new Error('Thiếu Android package name.');
-  const result = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'monkey', '-p', packageName, '-c', 'android.intent.category.LAUNCHER', '1']);
+
+  let ready = await ensureDeviceReady(account, userId, target, 2);
+  if (!ready.ok || ready.stdout !== 'device') {
+    await writeLog(userId, account._id, 'warn', 'remote_open_app_launch_retry', `ADB ${target} chưa sẵn sàng, thử khởi động lại LDPlayer trước khi mở app.`);
+    await openLdPlayer(account, userId);
+    target = await getLdPlayerDeviceTarget(account.instanceName) || target;
+    ready = await ensureDeviceReady(account, userId, target, 40);
+  }
+  if (!ready.ok || String(ready.stdout || '').trim() !== 'device') {
+    throw new Error(ready.error || ready.stderr || `ADB ${target} chưa sẵn sàng.`);
+  }
+
+  let result = packageName === defaultPackages.facebook
+    ? await launchFacebookFresh(target, packageName)
+    : await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'monkey', '-p', packageName, '-c', 'android.intent.category.LAUNCHER', '1']);
+  if (!result.ok && /offline|not found|no devices/i.test(`${result.error || ''} ${result.stderr || ''}`)) {
+    const retryReady = await ensureDeviceReady(account, userId, target, 4);
+    if (retryReady.ok && retryReady.stdout === 'device') {
+      result = packageName === defaultPackages.facebook
+        ? await launchFacebookFresh(target, packageName)
+        : await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'monkey', '-p', packageName, '-c', 'android.intent.category.LAUNCHER', '1']);
+    }
+  }
   await writeLog(userId, account._id, result.ok ? 'info' : 'error', 'remote_open_app', result.ok ? `Đã mở app ${packageName}.` : `Mở app lỗi ${packageName}.`, result);
   if (!result.ok) throw new Error(result.error || result.stderr || 'Open app failed.');
+  let home = null;
+  if (packageName === defaultPackages.facebook) {
+    home = await ensureFacebookHomeOnOpen(account, userId, target, packageName);
+  }
+  return { ...result, home };
+}
+
+async function launchFacebookFresh(target, packageName) {
+  await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'am', 'force-stop', packageName], { timeoutMs: 10_000 });
+  const feed = await runCommand(env.mobileAutomation.adbPath, [
+    '-s',
+    target,
+    'shell',
+    'am',
+    'start',
+    '-W',
+    '-a',
+    'android.intent.action.VIEW',
+    '-d',
+    'fb://feed',
+    '-p',
+    packageName,
+    '-f',
+    '0x14000000'
+  ], { timeoutMs: 20_000 });
+  const feedOutput = `${feed.stdout || ''}\n${feed.stderr || ''}`;
+  if (feed.ok && !/error:|unable to resolve|activity not started/i.test(feedOutput)) {
+    return { ...feed, launchMethod: 'facebook_feed_uri' };
+  }
+
+  const resolve = await runCommand(env.mobileAutomation.adbPath, [
+    '-s',
+    target,
+    'shell',
+    'cmd',
+    'package',
+    'resolve-activity',
+    '--brief',
+    '-a',
+    'android.intent.action.MAIN',
+    '-c',
+    'android.intent.category.LAUNCHER',
+    packageName
+  ], { timeoutMs: 10_000 });
+  const component = String(resolve.stdout || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.includes('/') && line.startsWith(`${packageName}/`));
+  if (component) {
+    const launch = await runCommand(env.mobileAutomation.adbPath, [
+      '-s',
+      target,
+      'shell',
+      'am',
+      'start',
+      '-W',
+      '-a',
+      'android.intent.action.MAIN',
+      '-c',
+      'android.intent.category.LAUNCHER',
+      '-n',
+      component,
+      '-f',
+      '0x14000000'
+    ], { timeoutMs: 20_000 });
+    if (launch.ok) {
+      return {
+        ...launch,
+        launchMethod: 'launcher_activity',
+        launcherComponent: component,
+        feedError: feed.error || feed.stderr || feed.stdout || ''
+      };
+    }
+  }
+  const fallback = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'monkey', '-p', packageName, '-c', 'android.intent.category.LAUNCHER', '1']);
+  return {
+    ...fallback,
+    launchMethod: 'monkey_fallback',
+    feedError: feed.error || feed.stderr || feed.stdout || ''
+  };
+}
+
+async function ensureFacebookHomeOnOpen(account, userId, target, packageName) {
+  await delay(1200);
+  let state = await detectFacebookState(target, '');
+  if (state.name === 'blocked') {
+    throw new Error('Facebook đang yêu cầu đăng nhập hoặc xác minh tài khoản.');
+  }
+  if (state.name === 'home') {
+    await writeLog(userId, account._id, 'info', 'remote_open_facebook_home', 'Facebook đã sẵn sàng tại trang chủ.', { state });
+    return { ok: true, verified: true, state };
+  }
+
+  if (state.name === 'discard_dialog') {
+    await tapTextOrPoint(account, userId, target, discardPostLabels, { x: 450, y: 1460 }, 'remote_open_app_discard_draft', { exact: true });
+    await delay(500);
+  }
+
+  const screen = await getDeviceScreenSize(target);
+  const homePoint = {
+    x: Math.round((screen?.width || 900) / 12),
+    y: Math.round((screen?.height || 1600) * 0.085)
+  };
+  const active = await getForegroundAndroidPackage(target);
+  if (active.packageName === packageName) {
+    await tapAndLog(userId, account._id, target, 'remote_open_facebook_home_tab', homePoint);
+    await delay(900);
+    state = await detectFacebookState(target, '');
+  }
+
+  const verified = state.name === 'home';
+  await writeLog(
+    userId,
+    account._id,
+    verified ? 'info' : 'warn',
+    'remote_open_facebook_home',
+    verified ? 'Facebook đã sẵn sàng tại trang chủ.' : 'Facebook đã mở; chưa đọc được nhãn trang chủ.',
+    { state, active, homePoint }
+  );
+  if (state.name === 'blocked') {
+    throw new Error('Facebook đang yêu cầu đăng nhập hoặc xác minh tài khoản.');
+  }
+  if (active.packageName !== packageName) {
+    throw new Error('Facebook chưa mở thành công trên LDPlayer.');
+  }
+  return { ok: true, verified, state };
+}
+
+async function getForegroundAndroidPackage(target) {
+  const activity = await runCommand(env.mobileAutomation.adbPath, [
+    '-s',
+    target,
+    'shell',
+    'dumpsys',
+    'activity',
+    'activities'
+  ], { timeoutMs: 10_000 });
+  const activityOutput = `${activity.stdout || ''}\n${activity.stderr || ''}`;
+  const resumed = activityOutput.match(/mResumedActivity:.*?\s([A-Za-z0-9._]+)\/([A-Za-z0-9.$_]+)/)
+    || activityOutput.match(/topResumedActivity=.*?\s([A-Za-z0-9._]+)\/([A-Za-z0-9.$_]+)/);
+  if (resumed) {
+    return {
+      ok: true,
+      packageName: resumed[1],
+      activityName: resumed[2],
+      source: 'resumed_activity',
+      error: ''
+    };
+  }
+
+  const focus = await runCommand(env.mobileAutomation.adbPath, [
+    '-s',
+    target,
+    'shell',
+    'dumpsys',
+    'window',
+    'windows'
+  ], { timeoutMs: 10_000 });
+  const output = `${focus.stdout || ''}\n${focus.stderr || ''}`;
+  const match = output.match(/mCurrentFocus=.*?\s([A-Za-z0-9._]+)\/([A-Za-z0-9.$_]+)/)
+    || output.match(/mFocusedApp=.*?ActivityRecord\{.*?\s([A-Za-z0-9._]+)\/([A-Za-z0-9.$_]+)/);
+  return {
+    ok: activity.ok || focus.ok,
+    packageName: match?.[1] || '',
+    activityName: match?.[2] || '',
+    source: match ? 'focused_window' : 'unknown',
+    error: activity.ok || focus.ok ? '' : (focus.error || focus.stderr || activity.error || activity.stderr || '')
+  };
+}
+
+export async function closeAccountSession(account, userId, appPackage) {
+  const target = getDeviceTarget(account);
+  const packageName = appPackage || account.metadata?.appPackage || defaultPackages[account.platform];
+  const result = {
+    app: null,
+    ldplayer: null
+  };
+
+  if (target && packageName) {
+    const app = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'am', 'force-stop', packageName], { timeoutMs: 10_000 });
+    result.app = app;
+    await writeLog(userId, account._id, app.ok ? 'info' : 'warn', 'remote_close_app', app.ok ? `Đã đóng app ${packageName}.` : `Không đóng được app ${packageName}.`, app);
+  }
+
+  if (account.instanceName) {
+    const ldplayer = await runCommand(env.mobileAutomation.ldconsolePath, ['quit', '--name', account.instanceName], { timeoutMs: 10_000 });
+    result.ldplayer = ldplayer;
+    await writeLog(userId, account._id, ldplayer.ok ? 'info' : 'warn', 'remote_close_ldplayer', ldplayer.ok ? `Đã tắt ${account.instanceName}.` : `Không tắt được ${account.instanceName}.`, ldplayer);
+  }
+
   return result;
 }
 
@@ -403,8 +778,8 @@ function buildPostConfig(account, override = {}) {
   return {
     appPackage: override.appPackage || metadata.appPackage || defaultPackages[account.platform] || defaultPackages.facebook,
     composerTap: override.composerTap || metadata.postSteps?.composerTap || defaultPostSteps.composerTap,
-    submitTap: override.submitTap || metadata.postSteps?.submitTap || defaultPostSteps.submitTap,
-    autoSubmit: Boolean(override.autoSubmit)
+    autoSubmit: Boolean(override.autoSubmit),
+    waitAfterSubmitMs: Math.max(0, Math.min(Number(override.waitAfterSubmitMs) || 0, 60_000))
   };
 }
 
@@ -516,8 +891,8 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
   const config = buildPostConfig(account, {
     appPackage: payload.appPackage || defaultPackages.facebook,
     composerTap: payload.composerTap,
-    submitTap: payload.submitTap,
-    autoSubmit: payload.autoSubmit
+    autoSubmit: payload.autoSubmit,
+    waitAfterSubmitMs: payload.waitAfterSubmitMs
   });
   const text = cleanIntentText(payload.text);
   const images = Array.isArray(payload.images) ? payload.images.slice(0, 4) : [];
@@ -542,47 +917,96 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
   }
 
   target = await resolveStableDeviceTarget(target);
-  const device = await probeDevice(account, userId, target);
-  steps.push(device);
-  if (!device.ok || device.stdout !== 'device') throw new Error(device.error || device.stderr || 'Device is not ready.');
-
-  const preparedImages = [];
-  for (const image of [...images].reverse()) {
-    const preparedImage = await pushFacebookImage(account, userId, target, image);
-    preparedImages.push(preparedImage);
-    steps.push(...preparedImage.steps);
+  let device = await ensureDeviceReady(account, userId, target, 2);
+  if (!device.ok || String(device.stdout || '').trim() !== 'device') {
+    await writeLog(userId, account._id, 'warn', 'facebook_post_launch_retry', `ADB ${target} chưa sẵn sàng, tự mở LDPlayer trước khi đăng.`);
+    await openLdPlayer(account, userId);
+    const launchedTarget = await getLdPlayerDeviceTarget(account.instanceName);
+    target = await resolveStableDeviceTarget(launchedTarget || getDeviceTarget(account) || target);
+    device = await ensureDeviceReady(account, userId, target, 28);
+    if (!device.ok || String(device.stdout || '').trim() !== 'device') {
+      await writeLog(userId, account._id, 'warn', 'facebook_post_launch_second_retry', `${account.instanceName} chưa sẵn sàng, thử khởi động lại lần cuối.`);
+      await delay(2500);
+      await openLdPlayer(account, userId);
+      const retriedTarget = await getLdPlayerDeviceTarget(account.instanceName);
+      target = await resolveStableDeviceTarget(retriedTarget || target);
+      device = await ensureDeviceReady(account, userId, target, 24);
+    }
   }
+  steps.push(device);
+  if (!device.ok || String(device.stdout || '').trim() !== 'device') throw new Error(device.error || device.stderr || 'Device is not ready.');
 
-  const openHome = await openFacebookComposer(account, userId, target, config, text, preparedImages);
-  steps.push(openHome);
-  await delay(postStepDelay());
+  const orientation = await ensurePortraitOrientation(account, userId, target);
+  steps.push(orientation);
 
-  const stateMachine = await runFacebookPostStateMachine(account, userId, target, config, text, preparedImages);
-  steps.push(...stateMachine.steps);
+  let preparedImages = [];
+  try {
+    let openHome = null;
+    if (images.length > 1) {
+      const pipelineStartedAt = Date.now();
+      [preparedImages, openHome] = await Promise.all([
+        prepareFacebookImages(account, userId, target, images),
+        openFacebookComposer(account, userId, target, config, text, [])
+      ]);
+      await writeLog(
+        userId,
+        account._id,
+        'info',
+        'facebook_post_parallel_preparation',
+        'Đã chuẩn bị ảnh song song; Facebook sẽ chọn toàn bộ ảnh trong một lượt theo đúng thứ tự.',
+        {
+          imageCount: preparedImages.length,
+          durationMs: Date.now() - pipelineStartedAt,
+          attachMode: 'single_gallery_batch'
+        }
+      );
+    } else if (images.length === 1) {
+      preparedImages = await prepareFacebookImages(account, userId, target, images);
+      openHome = await openFacebookComposer(account, userId, target, config, text, preparedImages);
+    } else {
+      openHome = await openFacebookComposer(account, userId, target, config, text, []);
+    }
+    for (const preparedImage of preparedImages) steps.push(...preparedImage.steps);
+    steps.push(openHome);
+    await delay(postStepDelay());
 
-  const submitVerified = stateMachine.submitVerified ?? false;
-  const finishedLevel = config.autoSubmit && !submitVerified ? 'warn' : 'info';
-  await writeLog(userId, account._id, finishedLevel, 'facebook_post_finished', config.autoSubmit && !submitVerified ? 'Đã bấm Đăng nhưng chưa xác nhận Facebook đã nhận bài.' : (config.autoSubmit ? 'Đã chạy luồng tự đăng Facebook.' : 'Đã mở composer Facebook, chờ kiểm tra/tự bấm đăng.'), {
-    autoSubmit: config.autoSubmit,
-    submitTap: config.submitTap,
-    finalState: stateMachine.finalState,
-    submitVerified,
-    submitReason: stateMachine.submitReason || '',
-    imageCount: preparedImages.length
-  });
+    const stateMachine = await runFacebookPostStateMachine(
+      account,
+      userId,
+      target,
+      config,
+      text,
+      preparedImages,
+      { imageSharedByIntent: openHome.method === 'image_share_intent' }
+    );
+    steps.push(...stateMachine.steps);
 
-  return {
-    ok: true,
-    autoSubmit: config.autoSubmit,
-    composerTap: config.composerTap,
-    submitTap: config.submitTap,
-    composerPending: stateMachine.composerPending,
-    finalState: stateMachine.finalState,
-    submitVerified,
-    submitReason: stateMachine.submitReason || '',
-    screenshot: stateMachine.screenshot,
-    steps
-  };
+    const submitVerified = stateMachine.submitVerified ?? false;
+    const finishedLevel = config.autoSubmit && !submitVerified ? 'warn' : 'info';
+    await writeLog(userId, account._id, finishedLevel, 'facebook_post_finished', config.autoSubmit && !submitVerified ? 'Đã bấm Đăng nhưng chưa xác nhận Facebook đã nhận bài.' : (config.autoSubmit ? 'Đã chạy luồng tự đăng Facebook.' : 'Đã mở composer Facebook, chờ kiểm tra/tự bấm đăng.'), {
+      autoSubmit: config.autoSubmit,
+      finalState: stateMachine.finalState,
+      submitVerified,
+      submitReason: stateMachine.submitReason || '',
+      imageCount: preparedImages.length
+    });
+
+    return {
+      ok: true,
+      autoSubmit: config.autoSubmit,
+      composerTap: config.composerTap,
+      composerPending: stateMachine.composerPending,
+      finalState: stateMachine.finalState,
+      submitVerified,
+      submitReason: stateMachine.submitReason || '',
+      screenshot: stateMachine.screenshot,
+      stepCount: steps.length
+    };
+  } finally {
+    if (images.length > 0 && config.autoSubmit) {
+      await cleanupFacebookMediaLibrary(account, userId, target, 'after_publish').catch(() => null);
+    }
+  }
 }
 
 async function resolveStableDeviceTarget(target) {
@@ -621,6 +1045,9 @@ async function openFacebookComposer(account, userId, target, config, text, image
   await writeLog(userId, account._id, stop.ok ? 'info' : 'warn', 'facebook_post_reset_app_task', stop.ok ? 'Đã đóng task Facebook cũ trước khi mở composer mới.' : 'Không đóng được task Facebook cũ.', stop);
   await delay(postStepDelay());
 
+  // Facebook hides the gallery action after receiving an image through a share
+  // intent. Use that fast path only for one image; multi-image posts must start
+  // from a clean text composer and select all media from Facebook's gallery.
   const primaryImage = images.length === 1 ? images[0] : null;
   const intentType = primaryImage?.mimeType || 'text/plain';
   const intentArgs = [
@@ -642,7 +1069,7 @@ async function openFacebookComposer(account, userId, target, config, text, image
       '--grant-read-uri-permission',
       '--eu',
       'android.intent.extra.STREAM',
-      `file://${primaryImage.remotePath}`
+      primaryImage.contentUri || `file://${primaryImage.remotePath}`
     );
   }
   intentArgs.push(
@@ -667,43 +1094,100 @@ async function openFacebookComposer(account, userId, target, config, text, image
   return openFacebookHome(account, userId, target, config, shareIntent);
 }
 
-async function pushFacebookImage(account, userId, target, image) {
-  const localPath = getLocalUploadPath(image.url);
-  if (!localPath || !existsSync(localPath)) {
-    throw new Error('Ảnh chưa được upload vào server hoặc không còn tồn tại.');
-  }
-
-  const extension = path.extname(localPath).toLowerCase() || '.jpg';
-  const filename = `socialpilot-${randomUUID()}${extension}`;
-  const remoteDir = '/sdcard/Pictures/SocialPilot';
-  const remotePath = `${remoteDir}/${filename}`;
+async function cleanupFacebookMediaLibrary(account, userId, target, reason) {
   const steps = [];
-
-  const mkdir = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'mkdir', '-p', remoteDir]);
-  steps.push(mkdir);
-  if (!mkdir.ok) throw new Error(mkdir.error || mkdir.stderr || 'Không tạo được thư mục ảnh trong LDPlayer.');
-
-  const push = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'push', localPath, remotePath], { timeoutMs: 120_000 });
-  steps.push(push);
-  await writeLog(userId, account._id, push.ok ? 'info' : 'error', 'facebook_post_push_image', push.ok ? `Đã chép ảnh ${filename} vào LDPlayer.` : 'Không chép được ảnh vào LDPlayer.', {
-    ...push,
-    args: ['-s', target, 'push', path.basename(localPath), remotePath]
-  });
-  if (!push.ok) throw new Error(push.error || push.stderr || 'ADB push ảnh thất bại.');
-
-  const scan = await runCommand(env.mobileAutomation.adbPath, [
+  const query = await runCommand(env.mobileAutomation.adbPath, [
     '-s',
     target,
     'shell',
-    'am',
-    'broadcast',
-    '-a',
-    'android.intent.action.MEDIA_SCANNER_SCAN_FILE',
-    '-d',
-    `file://${remotePath}`
-  ]);
-  steps.push(scan);
-  await delay(postStepDelay());
+    'content',
+    'query',
+    '--uri',
+    'content://media/external/images/media',
+    '--projection',
+    '_id:_data'
+  ], { timeoutMs: 20_000 });
+  steps.push(query);
+
+  const mediaIds = query.ok
+    ? String(query.stdout || '')
+      .split(/\r?\n/)
+      .filter((row) => row.includes(`${facebookMediaRoot}/`))
+      .map((row) => row.match(/_id=(\d+)/)?.[1])
+      .filter(Boolean)
+    : [];
+
+  const mediaDeletes = await Promise.all(mediaIds.map((mediaId) => runCommand(
+    env.mobileAutomation.adbPath,
+    [
+      '-s',
+      target,
+      'shell',
+      'content',
+      'delete',
+      '--uri',
+      'content://media/external/images/media',
+      '--where',
+      `_id=${mediaId}`
+    ],
+    { timeoutMs: 10_000 }
+  )));
+  steps.push(...mediaDeletes);
+
+  const removeFiles = await runCommand(env.mobileAutomation.adbPath, [
+    '-s',
+    target,
+    'shell',
+    'rm',
+    '-rf',
+    facebookMediaRoot
+  ], { timeoutMs: 20_000 });
+  steps.push(removeFiles);
+
+  const mediaStoreOk = !query.ok || mediaDeletes.every((result) => result.ok);
+  const ok = removeFiles.ok;
+  await writeLog(
+    userId,
+    account._id,
+    'info',
+    'facebook_post_media_cleanup',
+    ok
+      ? 'Đã dọn ảnh tạm của phiên đăng khỏi LDPlayer.'
+      : 'Không xóa được thư mục ảnh tạm; tool sẽ thử lại trước phiên đăng tiếp theo.',
+    {
+      reason,
+      deletedMediaRows: mediaIds.length,
+      mediaStoreOk,
+      removeFiles: {
+        ok: removeFiles.ok,
+        stderr: removeFiles.stderr,
+        error: removeFiles.error
+      }
+    }
+  );
+
+  return { ok, steps, deletedMediaRows: mediaIds.length };
+}
+
+async function prepareFacebookMediaSession(account, userId, target) {
+  const steps = [];
+  const storageReady = await ensureAndroidStorageReady(account, userId, target);
+  steps.push(storageReady);
+  if (!storageReady.ok) throw new Error(storageReady.error);
+
+  const cleanup = await cleanupFacebookMediaLibrary(account, userId, target, 'before_publish');
+  steps.push(...cleanup.steps);
+  const sessionId = `${Date.now()}-${randomUUID().slice(0, 8)}`;
+  const remoteDir = `${facebookMediaRoot}/${sessionId}`;
+
+  let mkdir = null;
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    mkdir = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'mkdir', '-p', remoteDir]);
+    if (mkdir.ok) break;
+    await delay(1200);
+  }
+  steps.push(mkdir);
+  if (!mkdir?.ok) throw new Error(mkdir?.error || mkdir?.stderr || 'Không tạo được thư mục ảnh trong LDPlayer.');
 
   const grantRead = await runCommand(env.mobileAutomation.adbPath, [
     '-s',
@@ -725,36 +1209,214 @@ async function pushFacebookImage(account, userId, target, image) {
   ]);
   steps.push(grantRead, grantWrite);
 
-  const mediaInsert = await runCommand(env.mobileAutomation.adbPath, [
-    '-s',
-    target,
-    'shell',
-    'content',
-    'insert',
-    '--uri',
-    'content://media/external/images/media',
-    '--bind',
-    `_data:s:${remotePath}`,
-    '--bind',
-    `mime_type:s:${image.mimeType || mimeTypeFromExtension(extension)}`,
-    '--bind',
-    `_display_name:s:${filename}`,
-    '--bind',
-    `title:s:${path.parse(filename).name}`,
-    '--bind',
-    `date_added:l:${Math.floor(Date.now() / 1000)}`,
-    '--bind',
-    `date_modified:l:${Math.floor(Date.now() / 1000)}`,
-    '--bind',
-    `datetaken:l:${Date.now()}`
-  ]);
-  steps.push(mediaInsert);
-  await delay(postStepDelay());
+  return { remoteDir, steps };
+}
+
+async function prepareFacebookImages(account, userId, target, images) {
+  const mediaSession = await prepareFacebookMediaSession(account, userId, target);
+  const reversedImages = [...images].reverse();
+  const baseTimestamp = Date.now() - reversedImages.length * 2000;
+  const registeredImages = [];
+
+  // Facebook Gallery ưu tiên media mới nhất. Đăng ký tuần tự từ ảnh cuối
+  // đến ảnh đầu để thứ tự hiển thị và thứ tự chọn khớp Preview.
+  for (let index = 0; index < reversedImages.length; index += 1) {
+    registeredImages.push(await pushFacebookImage(
+      account,
+      userId,
+      target,
+      reversedImages[index],
+      mediaSession,
+      baseTimestamp + index * 2000,
+      images.length - index
+    ));
+  }
+
+  const preparedImages = registeredImages.reverse();
+  if (preparedImages[0]) {
+    preparedImages[0].steps = [...mediaSession.steps, ...preparedImages[0].steps];
+  }
+  return preparedImages;
+}
+
+async function pushFacebookImage(account, userId, target, image, mediaSession = null, mediaTimestamp = Date.now(), displayOrder = 1) {
+  const localPath = getLocalUploadPath(image.url);
+  if (!localPath || !existsSync(localPath)) {
+    throw new Error('Ảnh chưa được upload vào server hoặc không còn tồn tại.');
+  }
+
+  const extension = path.extname(localPath).toLowerCase() || '.jpg';
+  const imageHash = getLocalImageHash(localPath);
+  const filename = `socialpilot-${String(displayOrder).padStart(2, '0')}-${imageHash.slice(0, 20)}${extension}`;
+  const remoteDir = mediaSession?.remoteDir || facebookMediaRoot;
+  const remotePath = `${remoteDir}/${filename}`;
+  const steps = [];
+
+  if (!mediaSession) {
+    const fallbackSession = await prepareFacebookMediaSession(account, userId, target);
+    steps.push(...fallbackSession.steps);
+  }
+
+  const remoteExists = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'test', '-f', remotePath], { timeoutMs: 10_000 });
+  steps.push(remoteExists);
+  const cacheHit = remoteExists.ok;
+  if (!cacheHit) {
+    const push = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'push', localPath, remotePath], { timeoutMs: 120_000 });
+    steps.push(push);
+    await writeLog(userId, account._id, push.ok ? 'info' : 'error', 'facebook_post_push_image', push.ok ? `Đã chép ảnh ${filename} vào LDPlayer.` : 'Không chép được ảnh vào LDPlayer.', {
+      ...push,
+      args: ['-s', target, 'push', path.basename(localPath), remotePath]
+    });
+    if (!push.ok) throw new Error(push.error || push.stderr || 'ADB push ảnh thất bại.');
+  } else {
+    await writeLog(userId, account._id, 'info', 'facebook_post_image_cache_hit', 'Ảnh đã có trong LDPlayer, bỏ qua bước sao chép.', {
+      filename,
+      remotePath,
+      imageHash
+    });
+  }
+
+  const existingMedia = await findAndroidMediaByPath(target, remotePath);
+  steps.push(existingMedia.query);
+  let contentUri = existingMedia.contentUri;
+  let mediaInsert = null;
+  if (contentUri) {
+    const mediaUpdate = await runCommand(env.mobileAutomation.adbPath, [
+      '-s',
+      target,
+      'shell',
+      'content',
+      'update',
+      '--uri',
+      contentUri,
+      '--bind',
+      `date_added:l:${Math.floor(mediaTimestamp / 1000)}`,
+      '--bind',
+      `date_modified:l:${Math.floor(mediaTimestamp / 1000)}`,
+      '--bind',
+      `datetaken:l:${mediaTimestamp}`
+    ]);
+    steps.push(mediaUpdate);
+  } else {
+    mediaInsert = await runCommand(env.mobileAutomation.adbPath, [
+      '-s',
+      target,
+      'shell',
+      'content',
+      'insert',
+      '--uri',
+      'content://media/external/images/media',
+      '--bind',
+      `_data:s:${remotePath}`,
+      '--bind',
+      `mime_type:s:${image.mimeType || mimeTypeFromExtension(extension)}`,
+      '--bind',
+      `_display_name:s:${filename}`,
+      '--bind',
+      `title:s:${path.parse(filename).name}`,
+      '--bind',
+      `date_added:l:${Math.floor(mediaTimestamp / 1000)}`,
+      '--bind',
+      `date_modified:l:${Math.floor(mediaTimestamp / 1000)}`,
+      '--bind',
+      `datetaken:l:${mediaTimestamp}`
+    ]);
+    steps.push(mediaInsert);
+    contentUri = String(mediaInsert.stdout || '').match(/content:\/\/media\/external\/images\/media\/\d+/)?.[0] || '';
+  }
+  let mediaQuery = null;
+  if (!contentUri) {
+    const scan = await runCommand(env.mobileAutomation.adbPath, [
+      '-s',
+      target,
+      'shell',
+      'am',
+      'broadcast',
+      '-a',
+      'android.intent.action.MEDIA_SCANNER_SCAN_FILE',
+      '-d',
+      `file://${remotePath}`
+    ]);
+    steps.push(scan);
+    await delay(postStepDelay());
+    mediaQuery = await runCommand(env.mobileAutomation.adbPath, [
+      '-s',
+      target,
+      'shell',
+      'content',
+      'query',
+      '--uri',
+      'content://media/external/images/media',
+      '--projection',
+      '_id:_data'
+    ]);
+    steps.push(mediaQuery);
+    const mediaRow = mediaQuery.ok
+      ? String(mediaQuery.stdout || '').split(/\r?\n/).find((row) => row.includes(remotePath))
+      : '';
+    const mediaId = mediaRow?.match(/_id=(\d+)/)?.[1] || null;
+    contentUri = mediaId ? `content://media/external/images/media/${mediaId}` : '';
+  }
+  await writeLog(
+    userId,
+    account._id,
+    contentUri ? 'info' : 'warn',
+    'facebook_post_media_ready',
+    contentUri ? 'Ảnh đã sẵn sàng trong thư viện Android.' : 'Chưa lấy được media URI, sẽ dùng đường dẫn ảnh dự phòng.',
+    {
+      remotePath,
+      contentUri,
+      mediaQuery: {
+        ok: mediaQuery?.ok ?? true,
+        stdout: mediaQuery?.stdout || mediaInsert?.stdout || existingMedia.query.stdout,
+        stderr: mediaQuery?.stderr || mediaInsert?.stderr || existingMedia.query.stderr,
+        error: mediaQuery?.error || mediaInsert?.error || existingMedia.query.error
+      },
+      cacheHit
+    }
+  );
 
   return {
     mimeType: image.mimeType || mimeTypeFromExtension(extension),
     remotePath,
+    contentUri,
     steps
+  };
+}
+
+function getLocalImageHash(localPath) {
+  const stats = statSync(localPath);
+  const cacheKey = `${localPath}:${stats.size}:${stats.mtimeMs}`;
+  const cached = localImageHashCache.get(cacheKey);
+  if (cached) return cached;
+
+  const hash = createHash('sha256').update(readFileSync(localPath)).digest('hex');
+  localImageHashCache.set(cacheKey, hash);
+  if (localImageHashCache.size > 200) {
+    localImageHashCache.delete(localImageHashCache.keys().next().value);
+  }
+  return hash;
+}
+
+async function findAndroidMediaByPath(target, remotePath) {
+  const query = await runCommand(env.mobileAutomation.adbPath, [
+    '-s',
+    target,
+    'shell',
+    'content',
+    'query',
+    '--uri',
+    'content://media/external/images/media',
+    '--projection',
+    '_id:_data'
+  ]);
+  const mediaRow = query.ok
+    ? String(query.stdout || '').split(/\r?\n/).find((row) => row.includes(remotePath))
+    : '';
+  const mediaId = mediaRow?.match(/_id=(\d+)/)?.[1] || null;
+  return {
+    query,
+    contentUri: mediaId ? `content://media/external/images/media/${mediaId}` : ''
   };
 }
 
@@ -791,18 +1453,32 @@ async function openFacebookHome(account, userId, target, config, shareIntent) {
   return { ...launcher, method: 'launcher' };
 }
 
-async function runFacebookPostStateMachine(account, userId, target, config, text, images = []) {
+async function runFacebookPostStateMachine(account, userId, target, config, text, images = [], options = {}) {
   const steps = [];
   let textEntered = false;
-  let imageAttached = false;
+  let attachedImageCount = options.imageSharedByIntent && images.length ? 1 : 0;
   const imageCount = images.length;
   let screenshot = null;
   let finalState = 'unknown';
 
+  if (attachedImageCount) {
+    await writeLog(
+      userId,
+      account._id,
+      'info',
+      'facebook_post_image_attached',
+      'Ảnh đã được chuyển trực tiếp vào Facebook composer.',
+      {
+        requestedCount: imageCount,
+        method: 'android_share_intent',
+        contentUri: images[0]?.contentUri || ''
+      }
+    );
+  }
+
   for (let attempt = 1; attempt <= 10; attempt += 1) {
     const state = await detectFacebookState(target, text);
     if (state.hasTargetText) textEntered = true;
-    if (state.hasAttachedImage) imageAttached = true;
     finalState = state.name;
     await writeLog(userId, account._id, 'info', 'facebook_post_state', `Facebook state: ${state.name}.`, {
       attempt,
@@ -867,10 +1543,20 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
     }
 
     if (state.name === 'ready_to_post') {
-      if (imageCount && !imageAttached) {
-        const attachment = await attachFacebookImages(account, userId, target, imageCount);
+      if (attachedImageCount < imageCount) {
+        const attachment = await attachFacebookImages(
+          account,
+          userId,
+          target,
+          imageCount - attachedImageCount,
+          text,
+          {
+            preserveExisting: attachedImageCount > 0,
+            galleryStartOffset: attachedImageCount
+          }
+        );
         steps.push(...attachment.steps);
-        imageAttached = true;
+        attachedImageCount += attachment.attachedCount || 1;
         await delay(postStepDelay(1.25));
         continue;
       }
@@ -880,7 +1566,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
         return { finalState, screenshot, steps, composerPending: false };
       }
 
-      const submitted = await submitFacebookPost(account, userId, target, config, text, steps, 'facebook_post_submit_tap');
+      const submitted = await submitFacebookPost(account, userId, target, config, text, steps, 'facebook_post_submit_tap', imageCount);
       return submitted;
     }
 
@@ -911,10 +1597,20 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
 
     if (state.name === 'composer') {
       if (state.hasTargetText) {
-        if (imageCount && !imageAttached) {
-          const attachment = await attachFacebookImages(account, userId, target, imageCount);
+        if (attachedImageCount < imageCount) {
+          const attachment = await attachFacebookImages(
+            account,
+            userId,
+            target,
+            imageCount - attachedImageCount,
+            text,
+            {
+              preserveExisting: attachedImageCount > 0,
+              galleryStartOffset: attachedImageCount
+            }
+          );
           steps.push(...attachment.steps);
-          imageAttached = true;
+          attachedImageCount += attachment.attachedCount || 1;
           await delay(postStepDelay(1.25));
           continue;
         }
@@ -923,7 +1619,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
           screenshot = await captureScreenshot(account, userId, 'facebook_post_composer_ready');
           return { finalState, screenshot, steps, composerPending: false };
         }
-        const submitted = await submitFacebookPost(account, userId, target, config, text, steps, 'facebook_post_submit_from_composer');
+        const submitted = await submitFacebookPost(account, userId, target, config, text, steps, 'facebook_post_submit_from_composer', imageCount);
         return submitted;
       }
 
@@ -962,28 +1658,57 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
   return { finalState, screenshot, steps, composerPending: true };
 }
 
-async function submitFacebookPost(account, userId, target, config, text, steps, action) {
-  await delay(postStepDelay(1.25));
-  const submitAttempts = await buildSubmitTapAttempts(target, config.submitTap);
-  let verification = null;
+async function submitFacebookPost(account, userId, target, config, text, steps, action, imageCount = 0) {
+  await delay(postStepDelay());
+  const submitAttempts = await buildSubmitTapAttempts(target);
+  let submitAccepted = false;
 
   for (let index = 0; index < submitAttempts.length; index += 1) {
     const attempt = submitAttempts[index];
-    const submit = attempt.useText
-      ? await tapTextOrPoint(account, userId, target, submitLabels, attempt.point, action, { exact: true })
-      : await tapAndLog(userId, account._id, target, `${action}_fallback_${index}`, attempt.point);
+    const submit = await tapAndLog(
+      userId,
+      account._id,
+      target,
+      index === 0 ? action : `${action}_retry_${index}`,
+      attempt.point
+    );
     steps.push(submit);
 
-    verification = await verifyFacebookPostSubmit(account, userId, target, text);
-    if (verification.ok || !verification.composerPending) break;
+    await delay(900);
+    const nodes = await dumpVisibleNodes(target);
+    const progress = findNodeInNodes(nodes, postingProgressLabels);
+    const confirmation = findNodeInNodes(nodes, postedConfirmationLabels);
+    const submitStillVisible = findNodeInNodes(nodes, submitLabels, { exact: true, preferBottomRight: true });
+    if (progress || confirmation || !submitStillVisible) {
+      submitAccepted = true;
+      await writeLog(userId, account._id, 'info', 'facebook_post_submit_accepted', 'Facebook đã nhận thao tác bấm nút đăng.', {
+        attempt: index + 1,
+        method: attempt.method,
+        point: attempt.point,
+        progress,
+        confirmation
+      });
+      break;
+    }
 
-    await writeLog(userId, account._id, 'warn', 'facebook_post_submit_retry', 'Facebook vẫn ở composer sau khi bấm Đăng, thử lại bằng tọa độ dự phòng.', {
+    await writeLog(userId, account._id, 'warn', 'facebook_post_submit_retry', 'Nút đăng vẫn còn hiển thị, thử bấm lại.', {
       attempt: index + 1,
-      reason: verification.reason,
       point: attempt.point,
-      useText: attempt.useText
+      method: attempt.method,
+      matchedSubmit: submitStillVisible
     });
     await delay(postStepDelay());
+  }
+
+  const verification = await verifyFacebookPostSubmit(account, userId, target, text, config.waitAfterSubmitMs, imageCount);
+  if (!submitAccepted && verification.composerPending) {
+    await writeLog(userId, account._id, 'warn', 'facebook_post_submit_not_accepted', 'Facebook chưa nhận thao tác bấm nút đăng sau các lần thử.', {
+      attempts: submitAttempts.length
+    });
+  }
+
+  if (verification && verification.composerPending && !verification.screenshot) {
+    verification.screenshot = await captureScreenshot(account, userId, 'facebook_post_submit_pending_final');
   }
 
   return {
@@ -996,40 +1721,64 @@ async function submitFacebookPost(account, userId, target, config, text, steps, 
   };
 }
 
-async function buildSubmitTapAttempts(target, configuredPoint = {}) {
-  const size = await getDeviceScreenSize(target);
-  const dynamicPoint = size
-    ? { x: Math.max(1, Math.round(size.width - 72)), y: Math.max(1, Math.round(size.height - 42)) }
-    : null;
-  const lowerDynamicPoint = size
-    ? { x: Math.max(1, Math.round(size.width * 0.94)), y: Math.max(1, Math.round(size.height * 0.955)) }
+async function buildSubmitTapAttempts(target) {
+  const nodes = await dumpVisibleNodes(target);
+  const submitNode = findSemanticSubmitButton(nodes);
+  if (!submitNode) {
+    throw new Error('Không nhận diện được nút Đăng/Post trên màn hình Facebook.');
+  }
+
+  const submitPoint = submitNode
+    ? {
+      x: Math.round((submitNode.left + submitNode.right) / 2),
+      y: Math.round((submitNode.top + submitNode.bottom) / 2)
+    }
     : null;
   const points = [
-    { useText: true, point: configuredPoint },
-    dynamicPoint ? { useText: false, point: dynamicPoint } : null,
-    lowerDynamicPoint ? { useText: false, point: lowerDynamicPoint } : null
+    { method: 'semantic_button', point: submitPoint },
+    { method: 'semantic_button_retry', point: submitPoint }
   ].filter((item) => item?.point?.x && item?.point?.y);
 
-  const seen = new Set();
-  return points.filter((item) => {
-    const key = `${item.useText}:${item.point.x},${item.point.y}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+  return points;
 }
 
-async function getDeviceScreenSize(target) {
-  const result = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'wm', 'size'], { timeoutMs: 10_000 });
-  const match = `${result.stdout || ''}\n${result.stderr || ''}`.match(/Physical size:\s*(\d+)x(\d+)/i);
-  if (!match) return null;
-  return { width: Number(match[1]), height: Number(match[2]) };
+function findSemanticSubmitButton(nodes) {
+  const labels = submitLabels.map(normalizeSearchText);
+  const candidates = nodes
+    .filter((node) => {
+      if (!node.enabled || !node.clickable) return false;
+      if (!node.className.includes('Button')) return false;
+      const value = normalizeSearchText(`${node.text} ${node.desc}`);
+      return labels.some((label) => value === label || value.includes(label));
+    })
+    .map((node) => ({
+      ...node.bounds,
+      label: node.text || node.desc,
+      text: node.text,
+      desc: node.desc,
+      className: node.className
+    }));
+
+  return candidates.sort((a, b) => (b.bottom - a.bottom) || (b.right - a.right))[0] || null;
 }
 
-async function verifyFacebookPostSubmit(account, userId, target, text) {
+async function verifyFacebookPostSubmit(account, userId, target, text, waitAfterSubmitMs = 0, imageCount = 0) {
   let lastState = null;
-  for (let attempt = 1; attempt <= 8; attempt += 1) {
-    await delay(attempt <= 2 ? postStepDelay(1.25) : postStepDelay());
+  const verificationWindowMs = Math.max(8_000, waitAfterSubmitMs || 0);
+  const verificationStartedAt = Date.now();
+  const verificationDeadline = verificationStartedAt + verificationWindowMs;
+  const uploadDeadline = verificationStartedAt + Math.max(verificationWindowMs, imageCount > 0 ? 120_000 : 30_000);
+  let sawPostingProgress = false;
+  if (waitAfterSubmitMs > 0) {
+    await writeLog(userId, account._id, 'info', 'facebook_post_submit_grace_period', `Xác minh kết quả đăng trong tối đa ${Math.round(verificationWindowMs / 1000)} giây.`, {
+      waitAfterSubmitMs,
+      verificationWindowMs,
+      mode: 'adaptive_maximum'
+    });
+  }
+
+  for (let attempt = 1; attempt <= 40; attempt += 1) {
+    await delay(attempt === 1 ? 900 : 1_000);
     const nodes = await dumpVisibleNodes(target);
     const confirmation = findNodeInNodes(nodes, postedConfirmationLabels);
     if (confirmation) {
@@ -1043,14 +1792,19 @@ async function verifyFacebookPostSubmit(account, userId, target, text) {
 
     const progress = findNodeInNodes(nodes, postingProgressLabels);
     if (progress) {
-      await writeLog(userId, account._id, 'info', 'facebook_post_submit_waiting', `Facebook đang xử lý: "${progress.label}".`, {
-        attempt,
-        progress
-      });
-      continue;
+      if (!sawPostingProgress) {
+        await writeLog(userId, account._id, 'info', 'facebook_post_media_uploading', imageCount > 0 ? `Facebook đang tải ${imageCount} ảnh và đăng bài.` : 'Facebook đang xử lý bài đăng.', {
+          attempt,
+          progress,
+          imageCount
+        });
+      }
+      sawPostingProgress = true;
+      if (Date.now() < uploadDeadline) continue;
+      break;
     }
 
-    lastState = await detectFacebookState(target, text);
+    lastState = await detectFacebookState(target, text, nodes);
     if (lastState.name === 'blocked') {
       const screenshot = await captureScreenshot(account, userId, 'facebook_post_submit_blocked');
       await writeLog(userId, account._id, 'error', 'facebook_post_submit_blocked', 'Facebook chuyển sang đăng nhập/checkpoint sau khi bấm Đăng.', {
@@ -1060,33 +1814,75 @@ async function verifyFacebookPostSubmit(account, userId, target, text) {
       return { ok: false, reason: 'blocked_after_submit', screenshot, composerPending: true, finalState: 'blocked' };
     }
 
-    if (['ready_to_post', 'composer', 'text_editor', 'stale_composer'].includes(lastState.name)) {
-      const screenshot = await captureScreenshot(account, userId, 'facebook_post_submit_still_in_composer');
-      await writeLog(userId, account._id, 'warn', 'facebook_post_submit_still_in_composer', 'Sau khi bấm Đăng, Facebook vẫn đang ở composer nên chưa thể coi là đã đăng.', {
+    if (!['ready_to_post', 'composer', 'text_editor', 'stale_composer'].includes(lastState.name)) {
+      const screenshot = await captureScreenshot(account, userId, 'facebook_post_submit_verified');
+      const reason = sawPostingProgress ? 'upload_completed_after_progress' : 'composer_closed_after_submit';
+      await writeLog(userId, account._id, 'info', 'facebook_post_submit_verified', sawPostingProgress ? 'Facebook đã tải ảnh xong và hoàn tất đăng bài.' : 'Facebook đã rời màn soạn bài sau khi bấm Đăng.', {
         attempt,
+        elapsedMs: Date.now() - verificationStartedAt,
+        imageCount,
+        sawPostingProgress,
         state: lastState
       });
-      return { ok: false, reason: 'still_in_composer', screenshot, composerPending: true, finalState: lastState.name };
+      return { ok: true, reason, screenshot, composerPending: false, finalState: 'submitted' };
     }
+
+    if (Date.now() < verificationDeadline) {
+      await writeLog(userId, account._id, 'info', 'facebook_post_submit_waiting', 'Facebook vẫn đang hoàn tất đăng bài.', {
+        attempt,
+        elapsedMs: Date.now() - verificationStartedAt,
+        state: lastState
+      });
+      continue;
+    }
+
+    await writeLog(userId, account._id, 'warn', 'facebook_post_submit_still_in_composer', 'Hết thời gian xác minh nhưng Facebook vẫn ở màn soạn bài.', {
+      attempt,
+      elapsedMs: Date.now() - verificationStartedAt,
+      state: lastState
+    });
+    return { ok: false, reason: 'still_in_composer', screenshot: null, composerPending: true, finalState: lastState.name };
   }
 
   const screenshot = await captureScreenshot(account, userId, 'facebook_post_submit_unverified');
-  await writeLog(userId, account._id, 'warn', 'facebook_post_submit_unverified', 'Đã bấm Đăng nhưng không thấy tín hiệu xác nhận bài đã được Facebook nhận.', {
+  const returnedHome = lastState?.name === 'home';
+  await writeLog(userId, account._id, returnedHome ? 'info' : 'warn', returnedHome ? 'facebook_post_submit_verified' : 'facebook_post_submit_unverified', returnedHome ? 'Đã xác nhận Facebook rời composer sau khi bấm Đăng.' : 'Đã bấm Đăng nhưng không thấy tín hiệu xác nhận bài đã được Facebook nhận.', {
     state: lastState
   });
   return {
-    ok: false,
-    reason: lastState?.name === 'home' ? 'returned_home_without_confirmation' : 'no_confirmation_after_submit',
+    ok: returnedHome,
+    reason: returnedHome ? 'returned_home_without_confirmation' : 'no_confirmation_after_submit',
     screenshot,
     composerPending: false,
-    finalState: lastState?.name || 'submit_unverified'
+    finalState: returnedHome ? 'submitted' : (lastState?.name || 'submit_unverified')
   };
 }
 
-async function attachFacebookImages(account, userId, target, imageCount = 1) {
+async function attachFacebookImages(account, userId, target, imageCount = 1, text = '', options = {}) {
   const steps = [];
   const count = Math.max(1, Math.min(Number(imageCount) || 1, 4));
-  const staleImage = await findVisibleTextBounds(target, removeImageLabels, { exact: true });
+  let currentState = await detectFacebookState(target, text);
+  if (currentState.name === 'text_editor') {
+    const done = await tapTextOrPoint(
+      account,
+      userId,
+      target,
+      doneLabels,
+      { x: 846, y: 72 },
+      'facebook_post_close_text_editor_before_gallery',
+      { exact: true }
+    );
+    steps.push(done);
+    await delay(postStepDelay(1.5));
+    currentState = await detectFacebookState(target, text);
+  }
+  if (!['ready_to_post', 'composer', 'stale_composer'].includes(currentState.name)) {
+    throw new Error(`Facebook chưa ở composer để thêm ảnh (${currentState.name}).`);
+  }
+
+  const staleImage = options.preserveExisting
+    ? null
+    : await findVisibleTextBounds(target, removeImageLabels, { exact: true });
   if (staleImage) {
     const remove = await tapTextOrPoint(
       account,
@@ -1104,42 +1900,105 @@ async function attachFacebookImages(account, userId, target, imageCount = 1) {
     await delay(postStepDelay(1.25));
   }
 
-  const gallery = await tapTextOrPoint(
-    account,
-    userId,
-    target,
-    galleryLabels,
-    { x: 88, y: 1430 },
-    'facebook_post_open_gallery',
-    { exact: true }
-  );
-  steps.push(gallery);
-  await delay(postStepDelay(1.25));
+  const openGalleryLabels = options.preserveExisting
+    ? [...addMorePhotoLabels, ...galleryLabels]
+    : galleryLabels;
+  const galleryMatch = await waitForAnyText(target, openGalleryLabels, 5_000, { exact: true });
+  if (!galleryMatch) {
+    const screenshot = await captureScreenshot(account, userId, 'facebook_post_add_media_missing');
+    await writeLog(userId, account._id, 'error', 'facebook_post_add_media_missing', 'Không tìm thấy nút thêm file phương tiện trong Facebook composer.', {
+      state: currentState,
+      labels: openGalleryLabels,
+      screenshot
+    });
+    throw new Error('Không tìm thấy nút thêm file phương tiện trong Facebook composer.');
+  }
+  const galleryPoint = {
+    x: Math.round((galleryMatch.left + galleryMatch.right) / 2),
+    y: Math.round((galleryMatch.top + galleryMatch.bottom) / 2)
+  };
+  let imageMatch = null;
+  let shouldTapGallery = true;
+  for (let openAttempt = 1; openAttempt <= 3 && !imageMatch; openAttempt += 1) {
+    if (shouldTapGallery) {
+      const gallery = await tapAndLog(
+        userId,
+        account._id,
+        target,
+        openAttempt === 1 ? 'facebook_post_open_gallery' : `facebook_post_open_gallery_retry_${openAttempt}`,
+        galleryPoint
+      );
+      steps.push(gallery);
+      await delay(openAttempt === 1 ? 1_200 : 1_800);
+    }
 
-  const permission = await findVisibleTextBounds(target, galleryPermissionLabels);
-  if (permission) {
-    const allow = await tapTextOrPoint(account, userId, target, galleryPermissionLabels, { x: 450, y: 965 }, 'facebook_post_allow_gallery');
-    steps.push(allow);
-    await delay(postStepDelay(1.25));
+    const permission = await findVisibleTextBounds(target, galleryPermissionLabels);
+    if (permission) {
+      const allow = await tapTextOrPoint(account, userId, target, galleryPermissionLabels, { x: 450, y: 965 }, 'facebook_post_allow_gallery');
+      steps.push(allow);
+      await delay(1_500);
+    }
+
+    imageMatch = await waitForAnyText(target, selectedImageLabels, openAttempt === 1 ? 10_000 : 7_000);
+    if (!imageMatch && openAttempt < 3) {
+      const composerGallery = await findVisibleTextBounds(target, openGalleryLabels, { exact: true });
+      const pickerAlreadyOpen = composerGallery && composerGallery.top < 300;
+      shouldTapGallery = !pickerAlreadyOpen;
+      if (composerGallery && !pickerAlreadyOpen) {
+        galleryPoint.x = Math.round((composerGallery.left + composerGallery.right) / 2);
+        galleryPoint.y = Math.round((composerGallery.top + composerGallery.bottom) / 2);
+      }
+    }
+  }
+  if (!imageMatch) {
+    const unexpectedState = await detectFacebookState(target, text);
+    const screenshot = await captureScreenshot(account, userId, 'facebook_post_gallery_not_open');
+    await writeLog(userId, account._id, 'error', 'facebook_post_gallery_not_open', 'Facebook không chuyển sang màn chọn ảnh.', {
+      state: unexpectedState,
+      screenshot
+    });
+    throw new Error('Facebook không mở được thư viện ảnh.');
+  }
+  const selection = await selectGalleryImagesByAccessibility(account, userId, target, count);
+  steps.push(...selection.steps);
+  const selectedCount = selection.selectedCount;
+  if (selectedCount < count) {
+    const screenshot = await captureScreenshot(account, userId, 'facebook_post_gallery_selection_incomplete');
+    await writeLog(userId, account._id, 'error', 'facebook_post_gallery_selection_incomplete', 'Facebook chưa ghi nhận đủ ảnh đã chọn.', {
+      requestedCount: count,
+      selectedCount,
+      screenshot
+    });
+    throw new Error(`Facebook mới ghi nhận ${selectedCount}/${count} ảnh. Đã dừng để tránh bấm lặp.`);
   }
 
-  const imageMatch = await waitForAnyText(target, selectedImageLabels, 8_000);
-  const firstImagePoint = imageMatch
-    ? { x: Math.round((imageMatch.left + imageMatch.right) / 2), y: Math.round((imageMatch.top + imageMatch.bottom) / 2) }
-    : { x: 150, y: 380 };
-  const imagePoints = buildGalleryImagePoints(firstImagePoint, count);
-  for (let index = 0; index < imagePoints.length; index += 1) {
-    const selectImage = await tapAndLog(userId, account._id, target, `facebook_post_select_image_${index + 1}`, imagePoints[index]);
-    steps.push(selectImage);
-    await delay(postStepDelay());
+  const nextMatch = await waitForAnyText(target, galleryNextLabels, 8_000, { exact: true, preferBottomRight: true });
+  if (!nextMatch) {
+    const screenshot = await captureScreenshot(account, userId, 'facebook_post_gallery_confirm_missing');
+    await writeLog(userId, account._id, 'error', 'facebook_post_gallery_confirm_missing', 'Không tìm thấy nút xác nhận sau khi chọn ảnh.', {
+      screenshot
+    });
+    throw new Error('Không tìm thấy nút xác nhận chọn ảnh.');
   }
-
-  const next = await tapTextOrPoint(account, userId, target, galleryNextLabels, { x: 835, y: 1530 }, 'facebook_post_gallery_next', { exact: true });
+  const next = await tapAndLog(userId, account._id, target, 'facebook_post_gallery_next', {
+    x: Math.round((nextMatch.left + nextMatch.right) / 2),
+    y: Math.round((nextMatch.top + nextMatch.bottom) / 2)
+  });
   steps.push(next);
   await delay(postStepDelay(1.5));
 
   const attached = await waitForAnyText(target, attachedImageLabels, 10_000);
   if (!attached) {
+    const composerState = await detectFacebookState(target, text);
+    if (['ready_to_post', 'stale_composer'].includes(composerState.name)) {
+      await writeLog(userId, account._id, 'info', 'facebook_post_image_attached', 'Facebook đã quay lại composer sau khi chọn ảnh.', {
+        requestedCount: count,
+        method: 'composer_state_fallback',
+        state: composerState
+      });
+      return { steps, attachedCount: count };
+    }
+
     const screenshot = await captureScreenshot(account, userId, 'facebook_post_image_attach_failed');
     await writeLog(userId, account._id, 'error', 'facebook_post_image_attach_failed', 'Không xác nhận được ảnh trong Facebook composer.', {
       screenshot
@@ -1152,25 +2011,113 @@ async function attachFacebookImages(account, userId, target, imageCount = 1) {
     matchedLabel: attached.label,
     bounds: attached
   });
-  return { steps };
+  return { steps, attachedCount: count };
 }
 
-function buildGalleryImagePoints(firstPoint, count) {
-  const cell = 250;
-  const left = Math.max(120, firstPoint.x);
-  const top = Math.max(320, firstPoint.y);
-  const points = [];
-  for (let index = 0; index < count; index += 1) {
-    points.push({
-      x: left + (index % 3) * cell,
-      y: top + Math.floor(index / 3) * cell
-    });
+async function selectGalleryImagesByAccessibility(account, userId, target, count) {
+  const steps = [];
+  let nodes = await dumpVisibleNodes(target);
+  let selectedCount = countSelectedGalleryImages(nodes);
+  let attempts = 0;
+
+  while (selectedCount < count && attempts < count * 3) {
+    attempts += 1;
+    const cells = getGalleryImageCells(nodes);
+    const candidate = cells.find((cell) => !cell.selected);
+    if (!candidate) break;
+
+    const beforeCount = selectedCount;
+    const selectImage = await tapAndLog(
+      userId,
+      account._id,
+      target,
+      `facebook_post_select_image_${beforeCount + 1}`,
+      { x: candidate.x, y: candidate.y }
+    );
+    steps.push(selectImage);
+
+    let changed = false;
+    for (let poll = 0; poll < 6; poll += 1) {
+      await delay(300);
+      nodes = await dumpVisibleNodes(target);
+      selectedCount = countSelectedGalleryImages(nodes);
+      if (selectedCount > beforeCount) {
+        changed = true;
+        break;
+      }
+    }
+    if (!changed) {
+      await writeLog(userId, account._id, 'warn', 'facebook_post_gallery_cell_not_selected', 'Facebook chưa ghi nhận node ảnh vừa chọn; chuyển sang node tiếp theo.', {
+        attempt: attempts,
+        beforeCount,
+        candidate
+      });
+      break;
+    }
   }
-  return points;
+
+  return { steps, selectedCount };
 }
 
-async function detectFacebookState(target, text) {
-  const nodes = await dumpVisibleNodes(target);
+function getGalleryImageCells(nodes) {
+  const labels = selectedImageLabels.map(normalizeSearchText);
+  const galleryCells = [];
+  for (const node of nodes) {
+    const description = normalizeSearchText(`${node.text} ${node.desc}`);
+    if (
+      !node.clickable
+      || !['android.widget.Button', 'android.view.ViewGroup'].includes(node.className)
+      || !labels.some((label) => description.includes(label))
+    ) {
+      continue;
+    }
+    const candidate = {
+      x: Math.round((node.bounds.left + node.bounds.right) / 2),
+      y: Math.round((node.bounds.top + node.bounds.bottom) / 2),
+      ...node.bounds,
+      selected: isGalleryCellSelected(node),
+      label: node.text || node.desc
+    };
+    const duplicate = galleryCells.find((cell) => boundsOverlap(cell, candidate) >= 0.8);
+    if (duplicate) {
+      duplicate.selected = duplicate.selected || candidate.selected;
+    } else {
+      galleryCells.push(candidate);
+    }
+  }
+
+  return galleryCells.sort((a, b) => (a.top - b.top) || (a.left - b.left));
+}
+
+function isGalleryCellSelected(node) {
+  const label = normalizeSearchText(`${node.text} ${node.desc}`);
+  return Boolean(
+    node.selected
+    || node.checked
+    || /\b(da chon|selected|selection)\b/.test(label)
+    || /\b(selected|da chon)\s*\d+\b/.test(label)
+  );
+}
+
+function boundsOverlap(a, b) {
+  const left = Math.max(a.left, b.left);
+  const top = Math.max(a.top, b.top);
+  const right = Math.min(a.right, b.right);
+  const bottom = Math.min(a.bottom, b.bottom);
+  const intersection = Math.max(0, right - left) * Math.max(0, bottom - top);
+  const smallerArea = Math.min(
+    Math.max(1, (a.right - a.left) * (a.bottom - a.top)),
+    Math.max(1, (b.right - b.left) * (b.bottom - b.top))
+  );
+  return intersection / smallerArea;
+}
+
+function countSelectedGalleryImages(nodes) {
+  return getGalleryImageCells(nodes).filter((cell) => cell.selected).length;
+}
+
+async function detectFacebookState(target, text, existingNodes = null) {
+  const nodes = existingNodes || await dumpVisibleNodes(target);
   if (!nodes.length) return { name: 'unknown', reason: 'no_uiautomator_nodes', hasTargetText: false };
 
   const hasTargetText = screenHasText(nodes, text);
@@ -1181,9 +2128,10 @@ async function detectFacebookState(target, text) {
     return { name: 'discard_dialog', reason: 'discard_post_visible', hasTargetText };
   }
   if (findNodeInNodes(nodes, loginBlockLabels)) return { name: 'blocked', reason: 'login_or_checkpoint', hasTargetText };
-  if (findNodeInNodes(nodes, closeMenuLabels)) return { name: 'menu', reason: 'menu_close_button_visible', hasTargetText };
+  if (findNodeInNodes(nodes, closeMenuLabels)) return { name: 'menu', reason: 'menu_overlay_visible', hasTargetText };
 
-  const hasDone = Boolean(findNodeInNodes(nodes, doneLabels, { exact: true }));
+  const doneNode = findNodeInNodes(nodes, doneLabels, { exact: true });
+  const hasDone = Boolean(doneNode && doneNode.top < 180);
   const hasTextEditor = Boolean(findNodeInNodes(nodes, textEditorLabels));
   if (hasDone || hasTextEditor) return { name: 'text_editor', reason: hasDone ? 'done_visible' : 'text_editor_title', hasTargetText };
 
@@ -1210,6 +2158,7 @@ async function detectFacebookState(target, text) {
   if (hasPostTitle) return { name: 'composer', reason: 'post_title_visible', hasTargetText, hasAttachedImage };
 
   if (findNodeInNodes(nodes, composerLabels)) return { name: 'home', reason: 'composer_entry_visible', hasTargetText, hasAttachedImage };
+  if (findNodeInNodes(nodes, facebookHomeLabels)) return { name: 'home', reason: 'home_navigation_visible', hasTargetText, hasAttachedImage };
 
   return { name: 'unknown', reason: 'no_known_labels', hasTargetText, hasAttachedImage };
 }
@@ -1346,16 +2295,30 @@ export function sanitizeAccount(account) {
 async function tapAndLog(userId, accountId, target, action, point = {}) {
   const args = ['-s', target, 'shell', 'input', 'tap', String(point.x), String(point.y)];
   let result = await runCommand(env.mobileAutomation.adbPath, args, { timeoutMs: 10_000 });
-  if (!result.ok && target.includes(':')) {
-    await runCommand(env.mobileAutomation.adbPath, ['connect', target]);
-    await delay(600);
-    const retry = await runCommand(env.mobileAutomation.adbPath, args, { timeoutMs: 10_000 });
-    result = { ...retry, retried: true, firstError: result.error || result.stderr };
+  const firstError = result.error || result.stderr || '';
+  if (!result.ok && isTransientAdbFailure(firstError)) {
+    await runCommand(env.mobileAutomation.adbPath, ['start-server'], { timeoutMs: 10_000 });
+    if (target.includes(':')) {
+      await runCommand(env.mobileAutomation.adbPath, ['disconnect', target], { timeoutMs: 10_000 });
+      await runCommand(env.mobileAutomation.adbPath, ['connect', target], { timeoutMs: 10_000 });
+    }
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      await delay(attempt === 1 ? 700 : 1200);
+      const state = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'get-state'], { timeoutMs: 10_000 });
+      if (!state.ok || String(state.stdout || '').trim() !== 'device') continue;
+      const retry = await runCommand(env.mobileAutomation.adbPath, args, { timeoutMs: 10_000 });
+      result = { ...retry, retried: true, retryAttempt: attempt, firstError };
+      if (retry.ok || !isTransientAdbFailure(retry.error || retry.stderr || '')) break;
+    }
   }
   await writeLog(userId, accountId, result.ok ? 'info' : 'error', action, result.ok ? `Tap ${point.x},${point.y}.` : `Tap lỗi ${point.x},${point.y}.`, result);
   if (!result.ok) throw new Error(result.error || result.stderr || `${action} failed.`);
   await delay(action.startsWith('facebook_post') ? postStepDelay() : env.mobileAutomation.stepDelayMs);
   return result;
+}
+
+function isTransientAdbFailure(message = '') {
+  return /device offline|device ['"]?.+['"]? not found|no devices?\/emulators? found|closed|transport error|protocol fault/i.test(String(message));
 }
 
 async function tapTextOrPoint(account, userId, target, labels, fallbackPoint, action, options = {}) {
@@ -1384,7 +2347,18 @@ async function tapTextOrPoint(account, userId, target, labels, fallbackPoint, ac
 
 async function closeFacebookMenuIfOpen(account, userId, target) {
   const match = await findVisibleTextBounds(target, closeMenuLabels);
-  if (!match) return false;
+  if (!match) {
+    const auxiliaryMenu = await findVisibleTextBounds(target, auxiliaryMenuLabels);
+    if (!auxiliaryMenu) return false;
+    const dismissPoint = { x: Math.max(30, auxiliaryMenu.left - 80), y: Math.min(520, auxiliaryMenu.bottom + 80) };
+    const dismiss = await tapAndLog(userId, account._id, target, 'facebook_close_auxiliary_menu', dismissPoint);
+    await writeLog(userId, account._id, dismiss.ok ? 'info' : 'warn', 'facebook_close_auxiliary_menu_by_point', dismiss.ok ? 'Đã đóng menu phụ của Facebook.' : 'Không đóng được menu phụ của Facebook.', {
+      ...dismiss,
+      point: dismissPoint,
+      matchedLabel: auxiliaryMenu.label
+    });
+    return dismiss.ok;
+  }
 
   const point = {
     x: Math.round((match.left + match.right) / 2),
@@ -1437,6 +2411,10 @@ async function dumpVisibleNodes(target) {
       text: readXmlAttr(node, 'text'),
       desc: readXmlAttr(node, 'content-desc'),
       className: readXmlAttr(node, 'class'),
+      clickable: readXmlAttr(node, 'clickable') === 'true',
+      enabled: readXmlAttr(node, 'enabled') !== 'false',
+      checked: readXmlAttr(node, 'checked') === 'true',
+      selected: readXmlAttr(node, 'selected') === 'true',
       bounds: readBounds(node)
     }))
     .filter((node) => node.bounds);
@@ -1445,6 +2423,7 @@ async function dumpVisibleNodes(target) {
 function findNodeInNodes(nodes, labels, options = {}) {
   for (const label of labels) {
     const normalizedLabel = normalizeSearchText(label);
+    const matches = [];
     for (const node of nodes) {
       const normalizedText = normalizeSearchText(node.text);
       const normalizedDesc = normalizeSearchText(node.desc);
@@ -1455,7 +2434,12 @@ function findNodeInNodes(nodes, labels, options = {}) {
         : haystack.includes(normalizedLabel);
       if (!matched) continue;
 
-      return { ...node.bounds, label, text: node.text, desc: node.desc };
+      const match = { ...node.bounds, label, text: node.text, desc: node.desc };
+      if (!options.preferBottomRight) return match;
+      matches.push(match);
+    }
+    if (matches.length) {
+      return matches.sort((a, b) => (b.bottom - a.bottom) || (b.right - a.right) || (a.left - b.left))[0];
     }
   }
 
@@ -1569,25 +2553,30 @@ async function replaceFocusedText(target, text) {
   }
 
   const current = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'settings', 'get', 'secure', 'default_input_method'], { timeoutMs: 10_000 });
+  const previousIme = current.ok && current.stdout && current.stdout !== 'com.android.adbkeyboard/.AdbIME'
+    ? current.stdout.trim()
+    : 'com.android.inputmethod.pinyin/.InputService';
   const setIme = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'ime', 'set', 'com.android.adbkeyboard/.AdbIME'], { timeoutMs: 10_000 });
   if (!setIme.ok) return { ...setIme, method: 'adb_keyboard_replace_set_ime' };
 
-  const clear = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'am', 'broadcast', '-a', 'ADB_CLEAR_TEXT'], { timeoutMs: 3_000 });
-  const clearSent = clear.ok || /Broadcasting:\s+Intent/i.test(`${clear.stdout || ''}\n${clear.stderr || ''}`);
-  const payload = Buffer.from(cleanClipboardText(text), 'utf8').toString('base64');
-  const input = clearSent
-    ? await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'am', 'broadcast', '-a', 'ADB_INPUT_B64', '--es', 'msg', payload], { timeoutMs: 10_000 })
-    : clear;
-
-  if (current.ok && current.stdout && current.stdout !== 'com.android.adbkeyboard/.AdbIME') {
-    await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'ime', 'set', current.stdout], { timeoutMs: 10_000 });
+  let clear = { ok: false };
+  let input = { ok: false };
+  try {
+    clear = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'am', 'broadcast', '-a', 'ADB_CLEAR_TEXT'], { timeoutMs: 3_000 });
+    const clearSent = clear.ok || /Broadcasting:\s+Intent/i.test(`${clear.stdout || ''}\n${clear.stderr || ''}`);
+    const payload = Buffer.from(cleanClipboardText(text), 'utf8').toString('base64');
+    input = clearSent
+      ? await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'am', 'broadcast', '-a', 'ADB_INPUT_B64', '--es', 'msg', payload], { timeoutMs: 10_000 })
+      : clear;
+  } finally {
+    await restoreInputMethod(target, previousIme);
   }
 
   return {
     ...input,
     method: 'adb_keyboard_replace',
     clearOk: clear.ok,
-    clearSent,
+    clearSent: clear.ok || /Broadcasting:\s+Intent/i.test(`${clear.stdout || ''}\n${clear.stderr || ''}`),
     clearError: clear.ok ? '' : (clear.error || clear.stderr || '')
   };
 }
@@ -1599,17 +2588,28 @@ async function inputWithAdbKeyboard(target, text) {
   }
 
   const current = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'settings', 'get', 'secure', 'default_input_method'], { timeoutMs: 10_000 });
+  const previousIme = current.ok && current.stdout && current.stdout !== 'com.android.adbkeyboard/.AdbIME'
+    ? current.stdout.trim()
+    : 'com.android.inputmethod.pinyin/.InputService';
   const setIme = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'ime', 'set', 'com.android.adbkeyboard/.AdbIME'], { timeoutMs: 10_000 });
   if (!setIme.ok) return { ...setIme, method: 'adb_keyboard_set_ime' };
 
-  const payload = Buffer.from(text, 'utf8').toString('base64');
-  const broadcast = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'am', 'broadcast', '-a', 'ADB_INPUT_B64', '--es', 'msg', payload], { timeoutMs: 10_000 });
-
-  if (current.ok && current.stdout && current.stdout !== 'com.android.adbkeyboard/.AdbIME') {
-    await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'ime', 'set', current.stdout], { timeoutMs: 10_000 });
+  let broadcast;
+  try {
+    const payload = Buffer.from(text, 'utf8').toString('base64');
+    broadcast = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'am', 'broadcast', '-a', 'ADB_INPUT_B64', '--es', 'msg', payload], { timeoutMs: 10_000 });
+  } finally {
+    await restoreInputMethod(target, previousIme);
   }
 
   return { ...broadcast, method: 'adb_keyboard' };
+}
+
+async function restoreInputMethod(target, ime) {
+  if (!ime || ime === 'com.android.adbkeyboard/.AdbIME') return null;
+  const restored = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'ime', 'set', ime], { timeoutMs: 10_000 });
+  await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'input', 'keyevent', '4'], { timeoutMs: 3_000 });
+  return restored;
 }
 
 async function inputWithClipboardPaste(target, text) {

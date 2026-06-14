@@ -7,6 +7,7 @@ import { MobileAccountLog } from '../../models/mobile-account-log.model.js';
 import {
   cancelMobileLoginJob,
   captureScreenshot,
+  closeAccountSession,
   createMobileLoginJob,
   encryptSecret,
   getMobileLoginJob,
@@ -75,11 +76,11 @@ const keySchema = z.object({ key: z.enum(['back', 'home', 'enter', 'recent', 'po
 const openAppSchema = z.object({ appPackage: z.string().optional().or(z.literal('')) });
 const defaultMobileAccount = {
   platform: 'facebook',
-  displayName: 'LDPlayer Facebook',
+  displayName: 'Facebook Account 01',
   accountHandle: '',
-  instanceName: 'LDPlayer-1',
-  adbHost: '127.0.0.1:5555',
-  deviceId: '',
+  instanceName: 'LDPlayer',
+  adbHost: '',
+  deviceId: 'emulator-5554',
   status: 'ready',
   notes: 'Cấu hình mặc định để test đăng Facebook qua LDPlayer.',
   metadata: {
@@ -97,6 +98,7 @@ const facebookPostSchema = z.object({
   text: z.string().min(1).max(5000),
   appPackage: z.string().optional().or(z.literal('')),
   autoSubmit: z.boolean().default(false),
+  waitAfterSubmitMs: z.number().int().min(0).max(60_000).default(0),
   images: z.array(z.object({
     url: z.string().url(),
     name: z.string().optional(),
@@ -127,7 +129,7 @@ mobileRoutes.get('/accounts', requireAuth, asyncHandler(async (req, res) => {
   }
   let logs = [];
   try {
-    logs = await MobileAccountLog.find({ userId: req.user._id }).sort({ createdAt: -1 }).limit(40);
+    logs = await MobileAccountLog.find({ userId: req.user._id }).sort({ createdAt: -1 }).limit(120);
   } catch (error) {
     console.warn('mobile account logs skipped:', error.message);
   }
@@ -196,6 +198,13 @@ mobileRoutes.post('/accounts/:id/remote/open-app', requireAuth, asyncHandler(asy
   res.json({ account: sanitizeAccount(account), result });
 }));
 
+mobileRoutes.post('/accounts/:id/remote/close-session', requireAuth, asyncHandler(async (req, res) => {
+  const input = openAppSchema.parse(req.body || {});
+  const account = await findAccount(req.params.id, req.user._id);
+  const result = await closeAccountSession(account, req.user._id, input.appPackage);
+  res.json({ account: sanitizeAccount(account), result });
+}));
+
 mobileRoutes.get('/accounts/:id/remote/screenshot', requireAuth, asyncHandler(async (req, res) => {
   const account = await findAccount(req.params.id, req.user._id);
   const screenshot = await captureScreenshot(account, req.user._id, 'remote_view');
@@ -237,6 +246,11 @@ mobileRoutes.post('/accounts/:id/facebook/post', requireAuth, asyncHandler(async
     const result = await publishFacebookPostViaMobile(account, req.user._id, input);
     res.json({ result });
   } catch (error) {
+    await writeLog(req.user._id, account._id, 'error', 'facebook_post_failed', error.message, {
+      autoSubmit: input.autoSubmit,
+      appPackage: input.appPackage || account.metadata?.appPackage || '',
+      imageCount: input.images?.length || 0
+    });
     throw new ApiError(400, error.message);
   }
 }));

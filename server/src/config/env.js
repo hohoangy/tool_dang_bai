@@ -33,7 +33,7 @@ export const env = {
     ldconsolePath: process.env.LDCONSOLE_PATH || 'ldconsole',
     adbPath: process.env.ADB_PATH || 'adb',
     secret: process.env.MOBILE_AUTOMATION_SECRET || process.env.JWT_SECRET || 'dev-secret-change-me',
-    launchWaitMs: Number(process.env.MOBILE_LAUNCH_WAIT_MS || 8000),
+    launchWaitMs: Number(process.env.MOBILE_LAUNCH_WAIT_MS || 5000),
     stepDelayMs: Number(process.env.MOBILE_STEP_DELAY_MS || 900)
   }
 };
