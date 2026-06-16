@@ -116,6 +116,30 @@ function postStepDelay(multiplier = 1) {
   return Math.round(Math.max(140, Math.min(env.mobileAutomation.stepDelayMs, 260)) * multiplier);
 }
 
+function createPerfTimer() {
+  const startedAt = Date.now();
+  let lastMarkAt = startedAt;
+  const stages = [];
+  return {
+    mark(name, metadata = {}) {
+      const now = Date.now();
+      stages.push({
+        name,
+        durationMs: now - lastMarkAt,
+        elapsedMs: now - startedAt,
+        ...metadata
+      });
+      lastMarkAt = now;
+    },
+    snapshot() {
+      return {
+        totalMs: Date.now() - startedAt,
+        stages
+      };
+    }
+  };
+}
+
 function cleanText(value = '') {
   return normalizeAdbInputText(value)
     .replace(/\\/g, '\\\\')
@@ -493,10 +517,15 @@ export async function openAccountApp(account, userId, appPackage) {
 
   let ready = await ensureDeviceReady(account, userId, target, 2);
   if (!ready.ok || ready.stdout !== 'device') {
-    await writeLog(userId, account._id, 'warn', 'remote_open_app_launch_retry', `ADB ${target} chưa sẵn sàng, thử khởi động lại LDPlayer trước khi mở app.`);
+    await writeLog(userId, account._id, 'warn', 'remote_open_app_adb_wait', `ADB ${target} chưa sẵn sàng, đợi LDPlayer ổn định trước khi mở app.`);
+    target = await getLdPlayerDeviceTarget(account.instanceName) || target;
+    ready = await ensureDeviceReady(account, userId, target, 18);
+  }
+  if (!ready.ok || String(ready.stdout || '').trim() !== 'device') {
+    await writeLog(userId, account._id, 'warn', 'remote_open_app_launch_retry', `ADB ${target} vẫn chưa sẵn sàng, thử mở LDPlayer một lần.`);
     await openLdPlayer(account, userId);
     target = await getLdPlayerDeviceTarget(account.instanceName) || target;
-    ready = await ensureDeviceReady(account, userId, target, 40);
+    ready = await ensureDeviceReady(account, userId, target, 36);
   }
   if (!ready.ok || String(ready.stdout || '').trim() !== 'device') {
     throw new Error(ready.error || ready.stderr || `ADB ${target} chưa sẵn sàng.`);
@@ -789,7 +818,7 @@ function buildPostConfig(account, override = {}) {
     appPackage: override.appPackage || metadata.appPackage || defaultPackages[account.platform] || defaultPackages.facebook,
     composerTap: override.composerTap || metadata.postSteps?.composerTap || defaultPostSteps.composerTap,
     autoSubmit: Boolean(override.autoSubmit),
-    waitAfterSubmitMs: Math.max(0, Math.min(Number(override.waitAfterSubmitMs) || 0, 60_000))
+    waitAfterSubmitMs: Math.max(0, Math.min(Number(override.waitAfterSubmitMs) || 0, 180_000))
   };
 }
 
@@ -934,6 +963,7 @@ export async function runMobileLogin(account, userId, override = {}) {
 }
 
 export async function publishFacebookPostViaMobile(account, userId, payload = {}) {
+  const perf = createPerfTimer();
   let target = getDeviceTarget(account);
   const config = buildPostConfig(account, {
     appPackage: payload.appPackage || defaultPackages.facebook,
@@ -943,16 +973,19 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
   });
   const text = cleanIntentText(payload.text);
   const images = Array.isArray(payload.images) ? payload.images.slice(0, 4) : [];
+  const videos = Array.isArray(payload.videos) ? payload.videos.slice(0, 1) : [];
 
   if (!target) throw new Error('Thiếu deviceId hoặc adbHost.');
   if (!text.trim()) throw new Error('Thiếu nội dung bài đăng.');
   if (!config.appPackage) throw new Error('Thiếu Android package name của Facebook.');
+  if (images.length && videos.length) throw new Error('Facebook chỉ hỗ trợ một loại media mỗi lượt: ảnh/text hoặc video.');
 
   await writeLog(userId, account._id, 'info', 'facebook_post_started', `Bắt đầu mở composer Facebook cho ${account.displayName}.`, {
     target,
     appPackage: config.appPackage,
     autoSubmit: config.autoSubmit,
-    imageCount: images.length
+    imageCount: images.length,
+    videoCount: videos.length
   });
 
   const steps = [];
@@ -966,7 +999,13 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
   target = await resolveStableDeviceTarget(target);
   let device = await ensureDeviceReady(account, userId, target, 2);
   if (!device.ok || String(device.stdout || '').trim() !== 'device') {
-    await writeLog(userId, account._id, 'warn', 'facebook_post_launch_retry', `ADB ${target} chưa sẵn sàng, tự mở LDPlayer trước khi đăng.`);
+    await writeLog(userId, account._id, 'warn', 'facebook_post_adb_wait', `ADB ${target} chưa sẵn sàng, đợi LDPlayer ổn định trước khi đăng.`);
+    const refreshedTarget = await getLdPlayerDeviceTarget(account.instanceName);
+    target = await resolveStableDeviceTarget(refreshedTarget || getDeviceTarget(account) || target);
+    device = await ensureDeviceReady(account, userId, target, 18);
+  }
+  if (!device.ok || String(device.stdout || '').trim() !== 'device') {
+    await writeLog(userId, account._id, 'warn', 'facebook_post_launch_retry', `ADB ${target} vẫn chưa sẵn sàng, tự mở LDPlayer trước khi đăng.`);
     await openLdPlayer(account, userId);
     const launchedTarget = await getLdPlayerDeviceTarget(account.instanceName);
     target = await resolveStableDeviceTarget(launchedTarget || getDeviceTarget(account) || target);
@@ -982,18 +1021,29 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
   }
   steps.push(device);
   if (!device.ok || String(device.stdout || '').trim() !== 'device') throw new Error(device.error || device.stderr || 'Device is not ready.');
+  perf.mark('adb_ready', { target });
 
   const orientation = await ensurePortraitOrientation(account, userId, target);
   steps.push(orientation);
+  perf.mark('orientation_ready');
 
   let preparedImages = [];
+  let preparedVideos = [];
   try {
     let openHome = null;
-    if (images.length > 1) {
+    if (videos.length) {
+      preparedVideos = await prepareFacebookVideos(account, userId, target, videos);
+      perf.mark('video_prepared', { videoCount: preparedVideos.length });
+      openHome = await openFacebookComposer(account, userId, target, config, text, preparedVideos, 'video');
+      perf.mark('composer_opened', { method: openHome.method || '' });
+      if (openHome.method !== 'video_share_intent') {
+        throw new Error('Không mở được composer video Facebook bằng Android share intent.');
+      }
+    } else if (images.length > 1) {
       const pipelineStartedAt = Date.now();
       [preparedImages, openHome] = await Promise.all([
-        prepareFacebookImages(account, userId, target, images),
-        openFacebookComposer(account, userId, target, config, text, [])
+        prepareFacebookImages(account, userId, target, images, { cleanup: true }),
+        openFacebookComposer(account, userId, target, config, text, [], 'image')
       ]);
       await writeLog(
         userId,
@@ -1007,13 +1057,18 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
           attachMode: 'single_gallery_batch'
         }
       );
+      perf.mark('images_prepared_and_composer_opened', { imageCount: preparedImages.length, method: openHome.method || '' });
     } else if (images.length === 1) {
-      preparedImages = await prepareFacebookImages(account, userId, target, images);
-      openHome = await openFacebookComposer(account, userId, target, config, text, preparedImages);
+      preparedImages = await prepareFacebookImages(account, userId, target, images, { cleanup: false });
+      perf.mark('image_prepared', { imageCount: preparedImages.length });
+      openHome = await openFacebookComposer(account, userId, target, config, text, preparedImages, 'image');
+      perf.mark('composer_opened', { method: openHome.method || '' });
     } else {
-      openHome = await openFacebookComposer(account, userId, target, config, text, []);
+      openHome = await openFacebookComposer(account, userId, target, config, text, [], 'image');
+      perf.mark('composer_opened', { method: openHome.method || '' });
     }
     for (const preparedImage of preparedImages) steps.push(...preparedImage.steps);
+    for (const preparedVideo of preparedVideos) steps.push(...preparedVideo.steps);
     steps.push(openHome);
     await delay(postStepDelay());
 
@@ -1023,10 +1078,14 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
       target,
       config,
       text,
-      preparedImages,
-      { imageSharedByIntent: openHome.method === 'image_share_intent' }
+      preparedVideos.length ? preparedVideos : preparedImages,
+      { imageSharedByIntent: ['image_share_intent', 'video_share_intent'].includes(openHome.method) }
     );
     steps.push(...stateMachine.steps);
+    perf.mark('state_machine_finished', {
+      finalState: stateMachine.finalState,
+      submitVerified: stateMachine.submitVerified ?? false
+    });
 
     const submitVerified = stateMachine.submitVerified ?? false;
     const finishedLevel = config.autoSubmit && !submitVerified ? 'warn' : 'info';
@@ -1035,7 +1094,9 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
       finalState: stateMachine.finalState,
       submitVerified,
       submitReason: stateMachine.submitReason || '',
-      imageCount: preparedImages.length
+      imageCount: preparedImages.length,
+      videoCount: preparedVideos.length,
+      perf: perf.snapshot()
     });
 
     return {
@@ -1050,8 +1111,10 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
       stepCount: steps.length
     };
   } finally {
-    if (images.length > 0 && config.autoSubmit) {
-      await cleanupFacebookMediaLibrary(account, userId, target, 'after_publish').catch(() => null);
+    if ((images.length > 0 || videos.length > 0) && config.autoSubmit) {
+      cleanupFacebookMediaLibrary(account, userId, target, 'after_publish').catch((error) => {
+        writeLog(userId, account._id, 'warn', 'facebook_post_media_cleanup_deferred_failed', error.message, { target }).catch(() => null);
+      });
     }
   }
 }
@@ -1102,7 +1165,7 @@ export async function publishInstagramPostViaMobile(account, userId, payload = {
   const permissions = await grantInstagramRuntimePermissions(account, userId, target, config.appPackage);
   steps.push(...permissions);
 
-  const preparedImages = await prepareFacebookImages(account, userId, target, images);
+  const preparedImages = await prepareFacebookImages(account, userId, target, images, { cleanup: false });
   for (const preparedImage of preparedImages) steps.push(...preparedImage.steps);
 
   const openComposer = await openInstagramComposer(account, userId, target, config, text, preparedImages[0]);
@@ -1339,7 +1402,7 @@ async function resolveStableDeviceTarget(target) {
   return target;
 }
 
-async function openFacebookComposer(account, userId, target, config, text, images = []) {
+async function openFacebookComposer(account, userId, target, config, text, media = [], mediaKind = 'image') {
   const stop = await runCommand(env.mobileAutomation.adbPath, [
     '-s',
     target,
@@ -1354,8 +1417,8 @@ async function openFacebookComposer(account, userId, target, config, text, image
   // Facebook hides the gallery action after receiving an image through a share
   // intent. Use that fast path only for one image; multi-image posts must start
   // from a clean text composer and select all media from Facebook's gallery.
-  const primaryImage = images.length === 1 ? images[0] : null;
-  const intentType = primaryImage?.mimeType || 'text/plain';
+  const primaryMedia = media.length === 1 ? media[0] : null;
+  const intentType = primaryMedia?.mimeType || 'text/plain';
   const intentArgs = [
     '-s',
     target,
@@ -1370,12 +1433,12 @@ async function openFacebookComposer(account, userId, target, config, text, image
     'android.intent.extra.TEXT',
     quoteAdbShellArg(text)
   ];
-  if (primaryImage?.remotePath) {
+  if (primaryMedia?.remotePath) {
     intentArgs.push(
       '--grant-read-uri-permission',
       '--eu',
       'android.intent.extra.STREAM',
-      primaryImage.contentUri || `file://${primaryImage.remotePath}`
+      primaryMedia.contentUri || `file://${primaryMedia.remotePath}`
     );
   }
   intentArgs.push(
@@ -1387,6 +1450,10 @@ async function openFacebookComposer(account, userId, target, config, text, image
 
   if (shareIntent.ok) {
     if (shareIntent.stderr && /error:/i.test(shareIntent.stderr)) {
+      if (mediaKind === 'video' && primaryMedia?.remotePath) {
+        const genericShare = await openFacebookGenericShareComposer(account, userId, target, config, intentArgs, 'video');
+        if (genericShare.ok) return genericShare;
+      }
       return openFacebookHome(account, userId, target, config, shareIntent);
     }
 
@@ -1394,50 +1461,87 @@ async function openFacebookComposer(account, userId, target, config, text, image
       ...shareIntent,
       args: maskShareIntentArgs(intentArgs)
     });
-    return { ...shareIntent, method: primaryImage ? 'image_share_intent' : 'text_share_intent' };
+    return { ...shareIntent, method: primaryMedia ? `${mediaKind}_share_intent` : 'text_share_intent' };
+  }
+
+  if (mediaKind === 'video' && primaryMedia?.remotePath) {
+    const genericShare = await openFacebookGenericShareComposer(account, userId, target, config, intentArgs, 'video');
+    if (genericShare.ok) return genericShare;
   }
 
   return openFacebookHome(account, userId, target, config, shareIntent);
 }
 
+async function openFacebookGenericShareComposer(account, userId, target, config, baseIntentArgs, mediaKind) {
+  const genericArgs = baseIntentArgs
+    .slice(0, -2)
+    .concat(['-p', config.appPackage]);
+  const genericShare = await runCommand(env.mobileAutomation.adbPath, genericArgs);
+  await writeLog(
+    userId,
+    account._id,
+    genericShare.ok ? 'info' : 'warn',
+    'facebook_post_open_generic_share_composer',
+    genericShare.ok
+      ? 'Đã mở Facebook composer bằng Android share intent tổng quát.'
+      : 'Không mở được Facebook composer bằng share intent tổng quát.',
+    {
+      ...genericShare,
+      args: maskShareIntentArgs(genericArgs),
+      mediaKind
+    }
+  );
+  return genericShare.ok
+    ? { ...genericShare, method: `${mediaKind}_share_intent`, generic: true }
+    : genericShare;
+}
+
 async function cleanupFacebookMediaLibrary(account, userId, target, reason) {
   const steps = [];
-  const query = await runCommand(env.mobileAutomation.adbPath, [
-    '-s',
-    target,
-    'shell',
-    'content',
-    'query',
-    '--uri',
-    'content://media/external/images/media',
-    '--projection',
-    '_id:_data'
-  ], { timeoutMs: 20_000 });
-  steps.push(query);
+  const mediaUris = ['content://media/external/images/media', 'content://media/external/video/media'];
+  let deletedMediaRows = 0;
+  const mediaDeletes = [];
 
-  const mediaIds = query.ok
-    ? String(query.stdout || '')
-      .split(/\r?\n/)
-      .filter((row) => row.includes(`${facebookMediaRoot}/`))
-      .map((row) => row.match(/_id=(\d+)/)?.[1])
-      .filter(Boolean)
-    : [];
-
-  const mediaDeletes = await Promise.all(mediaIds.map((mediaId) => runCommand(
-    env.mobileAutomation.adbPath,
-    [
+  for (const mediaUri of mediaUris) {
+    const query = await runCommand(env.mobileAutomation.adbPath, [
       '-s',
       target,
       'shell',
       'content',
-      'delete',
+      'query',
       '--uri',
-      'content://media/external/images/media',
-      '--where',
-      `_id=${mediaId}`
-    ],
-    { timeoutMs: 10_000 }
-  )));
+      mediaUri,
+      '--projection',
+      '_id:_data'
+    ], { timeoutMs: 20_000 });
+    steps.push(query);
+
+    const mediaIds = query.ok
+      ? String(query.stdout || '')
+        .split(/\r?\n/)
+        .filter((row) => row.includes(`${facebookMediaRoot}/`))
+        .map((row) => row.match(/_id=(\d+)/)?.[1])
+        .filter(Boolean)
+      : [];
+    deletedMediaRows += mediaIds.length;
+
+    const deletes = await Promise.all(mediaIds.map((mediaId) => runCommand(
+      env.mobileAutomation.adbPath,
+      [
+        '-s',
+        target,
+        'shell',
+        'content',
+        'delete',
+        '--uri',
+        mediaUri,
+        '--where',
+        `_id=${mediaId}`
+      ],
+      { timeoutMs: 10_000 }
+    )));
+    mediaDeletes.push(...deletes);
+  }
   steps.push(...mediaDeletes);
 
   const removeFiles = await runCommand(env.mobileAutomation.adbPath, [
@@ -1450,7 +1554,7 @@ async function cleanupFacebookMediaLibrary(account, userId, target, reason) {
   ], { timeoutMs: 20_000 });
   steps.push(removeFiles);
 
-  const mediaStoreOk = !query.ok || mediaDeletes.every((result) => result.ok);
+  const mediaStoreOk = mediaDeletes.every((result) => result.ok);
   const ok = removeFiles.ok;
   await writeLog(
     userId,
@@ -1459,10 +1563,10 @@ async function cleanupFacebookMediaLibrary(account, userId, target, reason) {
     'facebook_post_media_cleanup',
     ok
       ? 'Đã dọn ảnh tạm của phiên đăng khỏi LDPlayer.'
-      : 'Không xóa được thư mục ảnh tạm; tool sẽ thử lại trước phiên đăng tiếp theo.',
+      : 'Không xóa được thư mục media tạm; tool sẽ thử lại trước phiên đăng tiếp theo.',
     {
       reason,
-      deletedMediaRows: mediaIds.length,
+      deletedMediaRows,
       mediaStoreOk,
       removeFiles: {
         ok: removeFiles.ok,
@@ -1472,17 +1576,20 @@ async function cleanupFacebookMediaLibrary(account, userId, target, reason) {
     }
   );
 
-  return { ok, steps, deletedMediaRows: mediaIds.length };
+  return { ok, steps, deletedMediaRows };
 }
 
-async function prepareFacebookMediaSession(account, userId, target) {
+async function prepareFacebookMediaSession(account, userId, target, options = {}) {
+  const cleanupBeforePublish = options.cleanup !== false;
   const steps = [];
   const storageReady = await ensureAndroidStorageReady(account, userId, target);
   steps.push(storageReady);
   if (!storageReady.ok) throw new Error(storageReady.error);
 
-  const cleanup = await cleanupFacebookMediaLibrary(account, userId, target, 'before_publish');
-  steps.push(...cleanup.steps);
+  if (cleanupBeforePublish) {
+    const cleanup = await cleanupFacebookMediaLibrary(account, userId, target, 'before_publish');
+    steps.push(...cleanup.steps);
+  }
   const sessionId = `${Date.now()}-${randomUUID().slice(0, 8)}`;
   const remoteDir = `${facebookMediaRoot}/${sessionId}`;
 
@@ -1518,8 +1625,8 @@ async function prepareFacebookMediaSession(account, userId, target) {
   return { remoteDir, steps };
 }
 
-async function prepareFacebookImages(account, userId, target, images) {
-  const mediaSession = await prepareFacebookMediaSession(account, userId, target);
+async function prepareFacebookImages(account, userId, target, images, options = {}) {
+  const mediaSession = await prepareFacebookMediaSession(account, userId, target, options);
   const baseTimestamp = Date.now() - images.length * 2000;
   const descriptors = images.map((image, index) => createFacebookImageDescriptor(
     image,
@@ -1552,6 +1659,26 @@ async function prepareFacebookImages(account, userId, target, images) {
   return preparedImages;
 }
 
+async function prepareFacebookVideos(account, userId, target, videos, options = {}) {
+  const mediaSession = await prepareFacebookMediaSession(account, userId, target, { cleanup: false, ...options });
+  const mediaTimestamp = Date.now();
+  const descriptors = videos.map((video, index) => createFacebookVideoDescriptor(
+    video,
+    mediaSession,
+    index + 1,
+    mediaTimestamp
+  ));
+  const preparedVideos = [];
+  for (const descriptor of descriptors) {
+    const pushedVideo = await pushFacebookVideoFile(account, userId, target, descriptor);
+    preparedVideos.push(await registerFacebookVideoMedia(account, userId, target, pushedVideo));
+  }
+  if (preparedVideos[0]) {
+    preparedVideos[0].steps = [...mediaSession.steps, ...preparedVideos[0].steps];
+  }
+  return preparedVideos;
+}
+
 function createFacebookImageDescriptor(image, mediaSession, displayOrder, mediaTimestamp) {
   const localPath = getLocalUploadPath(image.url);
   if (!localPath || !existsSync(localPath)) {
@@ -1571,6 +1698,28 @@ function createFacebookImageDescriptor(image, mediaSession, displayOrder, mediaT
     remotePath,
     mediaTimestamp,
     mimeType: image.mimeType || mimeTypeFromExtension(extension)
+  };
+}
+
+function createFacebookVideoDescriptor(video, mediaSession, displayOrder, mediaTimestamp) {
+  const localPath = getLocalUploadPath(video.url);
+  if (!localPath || !existsSync(localPath)) {
+    throw new Error('Video chưa được upload vào server hoặc không còn tồn tại.');
+  }
+
+  const extension = path.extname(localPath).toLowerCase() || '.mp4';
+  const videoHash = getLocalImageHash(localPath);
+  const filename = `socialpilot-video-${String(displayOrder).padStart(2, '0')}-${videoHash.slice(0, 20)}${extension}`;
+  const remoteDir = mediaSession.remoteDir;
+  const remotePath = `${remoteDir}/${filename}`;
+
+  return {
+    localPath,
+    videoHash,
+    filename,
+    remotePath,
+    mediaTimestamp,
+    mimeType: video.mimeType || videoMimeTypeFromExtension(extension)
   };
 }
 
@@ -1599,6 +1748,37 @@ async function pushFacebookImageFile(account, userId, target, descriptor) {
       filename,
       remotePath,
       imageHash
+    });
+  }
+
+  return { ...descriptor, steps, cacheHit };
+}
+
+async function pushFacebookVideoFile(account, userId, target, descriptor) {
+  const {
+    localPath,
+    filename,
+    remotePath,
+    videoHash
+  } = descriptor;
+  const steps = [];
+
+  const remoteExists = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'test', '-f', remotePath], { timeoutMs: 10_000 });
+  steps.push(remoteExists);
+  const cacheHit = remoteExists.ok;
+  if (!cacheHit) {
+    const push = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'push', localPath, remotePath], { timeoutMs: 240_000 });
+    steps.push(push);
+    await writeLog(userId, account._id, push.ok ? 'info' : 'error', 'facebook_post_push_video', push.ok ? `Đã chép video ${filename} vào LDPlayer.` : 'Không chép được video vào LDPlayer.', {
+      ...push,
+      args: ['-s', target, 'push', path.basename(localPath), remotePath]
+    });
+    if (!push.ok) throw new Error(push.error || push.stderr || 'ADB push video thất bại.');
+  } else {
+    await writeLog(userId, account._id, 'info', 'facebook_post_video_cache_hit', 'Video đã có trong LDPlayer, bỏ qua bước sao chép.', {
+      filename,
+      remotePath,
+      videoHash
     });
   }
 
@@ -1722,6 +1902,112 @@ async function registerFacebookImageMedia(account, userId, target, preparedImage
   };
 }
 
+async function registerFacebookVideoMedia(account, userId, target, preparedVideo) {
+  const {
+    filename,
+    remotePath,
+    mediaTimestamp,
+    mimeType,
+    cacheHit
+  } = preparedVideo;
+  const steps = [...preparedVideo.steps];
+  const existingMedia = await findAndroidMediaByPath(target, remotePath, 'video');
+  steps.push(existingMedia.query);
+  let contentUri = existingMedia.contentUri;
+  let mediaInsert = null;
+  if (contentUri) {
+    const mediaUpdate = await runCommand(env.mobileAutomation.adbPath, [
+      '-s',
+      target,
+      'shell',
+      'content',
+      'update',
+      '--uri',
+      contentUri,
+      '--bind',
+      `date_added:l:${Math.floor(mediaTimestamp / 1000)}`,
+      '--bind',
+      `date_modified:l:${Math.floor(mediaTimestamp / 1000)}`
+    ]);
+    steps.push(mediaUpdate);
+  } else {
+    mediaInsert = await runCommand(env.mobileAutomation.adbPath, [
+      '-s',
+      target,
+      'shell',
+      'content',
+      'insert',
+      '--uri',
+      'content://media/external/video/media',
+      '--bind',
+      `_data:s:${remotePath}`,
+      '--bind',
+      `mime_type:s:${mimeType}`,
+      '--bind',
+      `_display_name:s:${filename}`,
+      '--bind',
+      `title:s:${path.parse(filename).name}`,
+      '--bind',
+      `date_added:l:${Math.floor(mediaTimestamp / 1000)}`,
+      '--bind',
+      `date_modified:l:${Math.floor(mediaTimestamp / 1000)}`
+    ]);
+    steps.push(mediaInsert);
+    contentUri = String(mediaInsert.stdout || '').match(/content:\/\/media\/external\/video\/media\/\d+/)?.[0] || '';
+  }
+  if (!contentUri) {
+    const scan = await runCommand(env.mobileAutomation.adbPath, [
+      '-s',
+      target,
+      'shell',
+      'am',
+      'broadcast',
+      '-a',
+      'android.intent.action.MEDIA_SCANNER_SCAN_FILE',
+      '-d',
+      `file://${remotePath}`
+    ]);
+    steps.push(scan);
+    await delay(postStepDelay());
+    const mediaQuery = await runCommand(env.mobileAutomation.adbPath, [
+      '-s',
+      target,
+      'shell',
+      'content',
+      'query',
+      '--uri',
+      'content://media/external/video/media',
+      '--projection',
+      '_id:_data'
+    ]);
+    steps.push(mediaQuery);
+    const mediaRow = mediaQuery.ok
+      ? String(mediaQuery.stdout || '').split(/\r?\n/).find((row) => row.includes(remotePath))
+      : '';
+    const mediaId = mediaRow?.match(/_id=(\d+)/)?.[1] || null;
+    contentUri = mediaId ? `content://media/external/video/media/${mediaId}` : '';
+  }
+  await writeLog(
+    userId,
+    account._id,
+    contentUri ? 'info' : 'warn',
+    'facebook_post_video_ready',
+    contentUri ? 'Video đã sẵn sàng trong thư viện Android.' : 'Chưa lấy được video URI, sẽ dùng đường dẫn video dự phòng.',
+    {
+      remotePath,
+      contentUri,
+      cacheHit
+    }
+  );
+
+  return {
+    mimeType,
+    remotePath,
+    contentUri,
+    steps
+  };
+}
+
 function getLocalImageHash(localPath) {
   const stats = statSync(localPath);
   const cacheKey = `${localPath}:${stats.size}:${stats.mtimeMs}`;
@@ -1736,7 +2022,10 @@ function getLocalImageHash(localPath) {
   return hash;
 }
 
-async function findAndroidMediaByPath(target, remotePath) {
+async function findAndroidMediaByPath(target, remotePath, mediaKind = 'image') {
+  const mediaUri = mediaKind === 'video'
+    ? 'content://media/external/video/media'
+    : 'content://media/external/images/media';
   const query = await runCommand(env.mobileAutomation.adbPath, [
     '-s',
     target,
@@ -1744,7 +2033,7 @@ async function findAndroidMediaByPath(target, remotePath) {
     'content',
     'query',
     '--uri',
-    'content://media/external/images/media',
+    mediaUri,
     '--projection',
     '_id:_data'
   ]);
@@ -1754,7 +2043,7 @@ async function findAndroidMediaByPath(target, remotePath) {
   const mediaId = mediaRow?.match(/_id=(\d+)/)?.[1] || null;
   return {
     query,
-    contentUri: mediaId ? `content://media/external/images/media/${mediaId}` : ''
+    contentUri: mediaId ? `${mediaUri}/${mediaId}` : ''
   };
 }
 
@@ -1778,6 +2067,17 @@ function mimeTypeFromExtension(extension) {
     '.tiff': 'image/tiff'
   };
   return types[extension] || 'image/jpeg';
+}
+
+function videoMimeTypeFromExtension(extension) {
+  const types = {
+    '.mp4': 'video/mp4',
+    '.mov': 'video/quicktime',
+    '.webm': 'video/webm',
+    '.3gp': 'video/3gpp',
+    '.3gpp': 'video/3gpp'
+  };
+  return types[extension] || 'video/mp4';
 }
 
 async function openFacebookHome(account, userId, target, config, shareIntent) {

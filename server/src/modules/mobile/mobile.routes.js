@@ -106,13 +106,19 @@ const facebookPostSchema = z.object({
   text: z.string().min(1).max(5000),
   appPackage: z.string().optional().or(z.literal('')),
   autoSubmit: z.boolean().default(false),
-  waitAfterSubmitMs: z.number().int().min(0).max(60_000).default(0),
+  waitAfterSubmitMs: z.number().int().min(0).max(180_000).default(0),
   images: z.array(z.object({
     url: z.string().url(),
     name: z.string().optional(),
     mimeType: z.string().startsWith('image/').optional(),
     size: z.number().int().positive().max(5 * 1024 * 1024).optional()
   })).max(4).default([]),
+  videos: z.array(z.object({
+    url: z.string().url(),
+    name: z.string().optional(),
+    mimeType: z.string().startsWith('video/').optional(),
+    size: z.number().int().positive().max(100 * 1024 * 1024).optional()
+  })).max(1).default([]),
   composerTap: z.object({ x: z.number(), y: z.number() }).optional(),
   submitTap: z.object({ x: z.number(), y: z.number() }).optional()
 });
@@ -279,7 +285,8 @@ mobileRoutes.post('/accounts/:id/facebook/post', requireAuth, asyncHandler(async
     await writeLog(req.user._id, account._id, 'error', 'facebook_post_failed', error.message, {
       autoSubmit: platformInput.autoSubmit,
       appPackage: platformInput.appPackage,
-      imageCount: platformInput.images?.length || 0
+      imageCount: platformInput.images?.length || 0,
+      videoCount: platformInput.videos?.length || 0
     });
     throw new ApiError(400, error.message);
   }

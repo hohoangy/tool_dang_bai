@@ -1,6 +1,7 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
-import { AlertTriangle, BarChart3, CalendarClock, CheckCircle2, ChevronLeft, ChevronRight, Clock3, Eye, FileText, Gauge, GripVertical, Home, Image, Keyboard, ListChecks, Loader2, MousePointer2, Play, RefreshCcw, Save, Send, ShieldCheck, Smartphone, Sparkles, Terminal, Timer, Trash2, Undo2, Users, Wifi, XCircle, Zap } from 'lucide-vue-next';
+import { useRouter } from 'vue-router';
+import { AlertTriangle, BarChart3, CalendarClock, CheckCircle2, ChevronLeft, ChevronRight, Clock3, Eye, FileText, Gauge, GripVertical, Home, Image, Keyboard, ListChecks, Loader2, LogOut, Moon, MousePointer2, Play, RefreshCcw, Save, Send, ShieldCheck, Smartphone, Sparkles, Sun, Terminal, Timer, Trash2, Undo2, Users, Video, Wifi, XCircle, Zap } from 'lucide-vue-next';
 import { http } from '../api/http';
 import BaseCard from '../components/BaseCard.vue';
 import { useAuthStore } from '../stores/auth';
@@ -8,6 +9,7 @@ import { useUiStore } from '../stores/ui';
 
 const ui = useUiStore();
 const auth = useAuthStore();
+const router = useRouter();
 
 const accounts = ref([]);
 const logs = ref([]);
@@ -31,6 +33,7 @@ const runtimeStatusChecking = ref(false);
 const technicalLogsOpen = ref(false);
 const workflowStage = ref('idle');
 const publishMode = ref('direct');
+const facebookPostType = ref('imageText');
 const composerTab = ref('compose');
 const selectedQueueAccountIds = ref([]);
 const queueItems = ref([]);
@@ -41,8 +44,9 @@ const drafts = ref([]);
 const draggedPreviewPhotoId = ref('');
 
 const maxPhotos = 4;
+const maxVideoSizeMb = 100;
 const draftStorageKey = 'socialpilot-platform-composer-drafts';
-const runtimeStatusIntervalMs = 4_000;
+const runtimeStatusIntervalMs = 8_000;
 let runtimeStatusTimer = null;
 
 const platforms = [
@@ -155,7 +159,18 @@ const facebookAccounts = computed(() => accounts.value.filter((account) => accou
 const selectedQueueAccounts = computed(() => facebookAccounts.value.filter((account) => selectedQueueAccountIds.value.includes(account._id)));
 const platformMaxPhotos = computed(() => selectedPlatformId.value === 'instagram' ? 1 : maxPhotos);
 const platformRequiresPhoto = computed(() => selectedPlatformId.value === 'instagram');
+const isFacebookVideoMode = computed(() => selectedPlatformId.value === 'facebook' && facebookPostType.value === 'video');
 const uploadedPhotoCount = computed(() => post.media.filter((item) => item.type === 'photo' && item.uploadedUrl).length);
+const uploadedVideoCount = computed(() => post.media.filter((item) => item.type === 'video' && item.uploadedUrl).length);
+const selectedVideo = computed(() => post.media.find((item) => item.type === 'video') || null);
+const uploadedMediaCount = computed(() => isFacebookVideoMode.value ? uploadedVideoCount.value : uploadedPhotoCount.value);
+const mediaReady = computed(() => {
+  if (isFacebookVideoMode.value) return uploadedVideoCount.value === 1;
+  return (!post.media.length || uploadedPhotoCount.value === Math.min(post.media.length, platformMaxPhotos.value))
+    && (!platformRequiresPhoto.value || uploadedPhotoCount.value > 0);
+});
+const mediaInputAccept = computed(() => isFacebookVideoMode.value ? 'video/mp4,video/quicktime,video/webm,video/3gpp' : 'image/*');
+const mediaInputMultiple = computed(() => !isFacebookVideoMode.value);
 const previewPhotos = computed(() => post.media.filter((item) => item.type === 'photo').slice(0, platformMaxPhotos.value));
 const facebookPreviewPhotos = computed(() => previewPhotos.value);
 const previewGalleryClass = computed(() => {
@@ -227,7 +242,7 @@ const canRunWorkflow = computed(() => selectedPlatform.value.status === 'ready'
   && (!requiresFacebookSession.value || facebookAppReady.value)
   && queueReady.value
   && scheduleReady.value
-  && (!platformRequiresPhoto.value || uploadedPhotoCount.value > 0)
+  && mediaReady.value
   && Boolean(finalPostText.value.trim())
   && !posting.value
   && !queueRunning.value
@@ -297,9 +312,13 @@ const preflightItems = computed(() => [
   },
   {
     label: 'Media',
-    detail: uploadedPhotoCount.value ? `${uploadedPhotoCount.value}/${platformMaxPhotos.value} ảnh đã sẵn sàng` : (platformRequiresPhoto.value ? 'Instagram bắt buộc có ảnh' : 'Không dùng ảnh'),
-    ok: (!post.media.length || uploadedPhotoCount.value === Math.min(post.media.length, platformMaxPhotos.value)) && (!platformRequiresPhoto.value || uploadedPhotoCount.value > 0),
-    blocking: platformRequiresPhoto.value
+    detail: isFacebookVideoMode.value
+      ? (uploadedVideoCount.value ? 'Video đã sẵn sàng' : 'Facebook video cần 1 tệp video')
+      : uploadedPhotoCount.value
+        ? `${uploadedPhotoCount.value}/${platformMaxPhotos.value} ảnh đã sẵn sàng`
+        : (platformRequiresPhoto.value ? 'Instagram bắt buộc có ảnh' : 'Không dùng ảnh'),
+    ok: mediaReady.value,
+    blocking: platformRequiresPhoto.value || isFacebookVideoMode.value
   },
   {
     label: 'Lịch đăng',
@@ -323,7 +342,7 @@ const contentQualityScore = computed(() => {
   if (textLength >= 20) score += 35;
   else if (textLength > 0) score += 18;
   if (hashtagItems.value.length >= 1 && hashtagItems.value.length <= 6) score += 25;
-  if (post.media.length) score += 25;
+  if (uploadedMediaCount.value) score += 25;
   if (!duplicateDraft.value && textLength > 0) score += 15;
   return Math.min(score, 100);
 });
@@ -514,10 +533,14 @@ const professionalKpis = computed(() => [
     tone: contentQualityScore.value >= 70 ? 'ok' : contentQualityScore.value > 0 ? 'run' : 'idle'
   },
   {
-    label: 'Ảnh',
-    value: post.media.length ? `${uploadedPhotoCount.value}/${post.media.length}` : 'Không dùng',
-    detail: post.media.length ? 'Ảnh đã sẵn sàng để gắn vào bài' : 'Bài đăng dạng text',
-    tone: post.media.length && uploadedPhotoCount.value !== post.media.length ? 'warn' : 'ok'
+    label: 'Media',
+    value: isFacebookVideoMode.value
+      ? (uploadedVideoCount.value ? 'Video' : 'Chưa chọn')
+      : post.media.length ? `${uploadedPhotoCount.value}/${post.media.length}` : 'Text',
+    detail: isFacebookVideoMode.value
+      ? 'Đăng video Facebook'
+      : post.media.length ? 'Ảnh đã sẵn sàng để gắn vào bài' : 'Bài đăng dạng text',
+    tone: mediaReady.value ? 'ok' : 'warn'
   },
   {
     label: 'Chế độ',
@@ -567,10 +590,17 @@ const professionalActions = computed(() => {
       tone: 'required'
     });
   }
-  if (post.media.length && uploadedPhotoCount.value !== post.media.length) {
+  if (post.media.length && !mediaReady.value) {
     actions.push({
       title: 'Chờ media sẵn sàng',
-      detail: 'Ảnh cần upload xong trước khi chạy automation.',
+      detail: 'Media cần upload xong trước khi chạy automation.',
+      tone: 'required'
+    });
+  }
+  if (isFacebookVideoMode.value && !uploadedVideoCount.value) {
+    actions.push({
+      title: 'Thêm video Facebook',
+      detail: 'Chọn 1 video trước khi chạy luồng đăng video.',
       tone: 'required'
     });
   }
@@ -815,6 +845,12 @@ async function runPostWorkflow() {
     workflowStage.value = 'failed';
     return;
   }
+  await syncSelectedAccountRuntimeStatus();
+  if (requiresFacebookSession.value && !facebookAppReady.value) {
+    ui.notify(`ADB hoặc ${selectedPlatform.value.label} chưa sẵn sàng. Bấm Mở ${selectedPlatform.value.label} rồi thử lại.`, 'error');
+    workflowStage.value = 'failed';
+    return;
+  }
   if (selectedPlatform.value.status !== 'ready') {
     ui.notify(`Workflow ${selectedPlatform.value.label} se duoc them sau.`, 'error');
     workflowStage.value = 'failed';
@@ -847,7 +883,7 @@ async function runPostWorkflow() {
     workflowStage.value = 'posting';
     const submitWaitMs = isReviewMode.value
       ? 0
-      : 8_000 + (uploadedPhotoCount.value * 5_000);
+      : isFacebookVideoMode.value ? 90_000 : 8_000 + (uploadedPhotoCount.value * 5_000);
     const { data } = await submitFacebookForAccount(
       selectedAccount.value,
       !isReviewMode.value,
@@ -863,7 +899,9 @@ async function runPostWorkflow() {
       ui.notify(`Đã bấm đăng nhưng chưa xác nhận ${selectedPlatform.value.label} đã nhận bài. Hãy xem screenshot/log.`, 'error');
     } else {
       workflowStage.value = 'verified';
-      ui.notify(uploadedPhotoCount.value
+      ui.notify(isFacebookVideoMode.value
+        ? `Đã đăng video ${selectedPlatform.value.label}.`
+        : uploadedPhotoCount.value
         ? `Đã tải xong ${uploadedPhotoCount.value} ảnh và đăng bài ${selectedPlatform.value.label}.`
         : `Đã đăng và xác minh bài ${selectedPlatform.value.label}.`);
     }
@@ -911,10 +949,12 @@ async function runQueueWorkflow() {
 
       try {
         updateQueueItem(account._id, { status: 'running', message: 'Đang kiểm tra LDPlayer và ADB' });
-        const queueSubmitWaitMs = 8_000 + (uploadedPhotoCount.value * 5_000);
+        const queueSubmitWaitMs = isFacebookVideoMode.value ? 90_000 : 8_000 + (uploadedPhotoCount.value * 5_000);
         updateQueueItem(account._id, {
           status: 'running',
-          message: uploadedPhotoCount.value
+          message: isFacebookVideoMode.value
+            ? 'Đang đăng và chờ xử lý video'
+            : uploadedPhotoCount.value
             ? `Đang đăng và chờ tải ${uploadedPhotoCount.value} ảnh`
             : 'Đang đăng bài'
         });
@@ -930,7 +970,9 @@ async function runQueueWorkflow() {
           });
           stopQueue = true;
         } else {
-          const successMessage = uploadedPhotoCount.value
+          const successMessage = isFacebookVideoMode.value
+            ? 'Đã đăng video và xác minh'
+            : uploadedPhotoCount.value
             ? `Đã tải xong ${uploadedPhotoCount.value} ảnh và đăng bài`
             : 'Đã đăng và xác minh';
           updateQueueItem(account._id, {
@@ -991,19 +1033,30 @@ function submitFacebookForAccount(account, autoSubmit, waitAfterSubmitMs = 0) {
         .map((item) => [item.uploadedUrl, item])
     ).values()
   ).slice(0, platformMaxPhotos.value);
+  const uniqueVideos = post.media
+    .filter((item) => item.type === 'video' && item.uploadedUrl)
+    .slice(0, 1);
 
   return http.post(`/mobile/accounts/${account._id}/${selectedPlatformId.value}/post`, {
     text: finalPostText.value.trim(),
     appPackage: selectedPlatform.value.packageName,
     autoSubmit,
     waitAfterSubmitMs,
-    images: uniqueImages
+    images: isFacebookVideoMode.value ? [] : uniqueImages
+      .map((item) => ({
+        url: item.uploadedUrl,
+        name: item.name,
+        mimeType: item.mimeType,
+        size: item.size
+      })),
+    videos: isFacebookVideoMode.value ? uniqueVideos
       .map((item) => ({
         url: item.uploadedUrl,
         name: item.name,
         mimeType: item.mimeType,
         size: item.size
       }))
+      : []
   });
 }
 
@@ -1159,9 +1212,58 @@ function duplicateComposer() {
   saveDraft('draft');
 }
 
+function setFacebookPostType(type) {
+  if (!['imageText', 'video'].includes(type) || facebookPostType.value === type) return;
+  post.media.forEach((item) => URL.revokeObjectURL(item.url));
+  post.media = [];
+  facebookPostType.value = type;
+}
+
 async function addMedia(event) {
   const files = Array.from(event.target.files || []);
   event.target.value = '';
+  if (isFacebookVideoMode.value) {
+    const file = files[0];
+    if (!file) return;
+    if (!file.type.startsWith('video/')) {
+      ui.notify('Chỉ nhận tệp video cho chế độ đăng video.', 'error');
+      return;
+    }
+    if (file.size > maxVideoSizeMb * 1024 * 1024) {
+      ui.notify(`Video phải nhỏ hơn hoặc bằng ${maxVideoSizeMb} MB.`, 'error');
+      return;
+    }
+    post.media.forEach((item) => URL.revokeObjectURL(item.url));
+    post.media = [];
+
+    mediaUploading.value = true;
+    const previewUrl = URL.createObjectURL(file);
+    try {
+      const { data } = await http.post('/media/videos', file, {
+        headers: {
+          'Content-Type': file.type,
+          'X-File-Name': encodeURIComponent(file.name)
+        }
+      });
+      post.media.push({
+        id: `${Date.now()}-${file.name}-${Math.random().toString(16).slice(2)}`,
+        name: file.name,
+        type: 'video',
+        url: previewUrl,
+        uploadedUrl: data.video.url,
+        mimeType: data.video.mimeType,
+        size: data.video.size
+      });
+      ui.notify('Đã tải video lên server.');
+    } catch (error) {
+      URL.revokeObjectURL(previewUrl);
+      ui.notify(error.message, 'error');
+    } finally {
+      mediaUploading.value = false;
+    }
+    return;
+  }
+
   const remaining = platformMaxPhotos.value - post.media.filter((item) => item.type === 'photo').length;
   const selectedFiles = files.slice(0, remaining);
   if (!selectedFiles.length) return;
@@ -1323,6 +1425,11 @@ function formatLog(log) {
   return target?.displayName || log.accountId;
 }
 
+function logout() {
+  auth.logout();
+  router.push('/login');
+}
+
 onMounted(async () => {
   loadDrafts();
   await load();
@@ -1342,6 +1449,14 @@ watch(selectedAccountId, () => {
 });
 
 watch(selectedPlatformId, async () => {
+  if (selectedPlatformId.value !== 'facebook') {
+    facebookPostType.value = 'imageText';
+    post.media = post.media.filter((item) => {
+      if (item.type === 'photo') return true;
+      URL.revokeObjectURL(item.url);
+      return false;
+    });
+  }
   const preferred = findPreferredAccount(accounts.value);
   selectedAccountId.value = preferred?._id || '';
   selectedQueueAccountIds.value = accounts.value.filter((account) => account.platform === selectedPlatformId.value).slice(0, 1).map((account) => account._id);
@@ -1352,67 +1467,85 @@ watch(selectedPlatformId, async () => {
 </script>
 
 <template>
-  <div class="space-y-5">
-    <BaseCard>
-      <div class="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <p class="text-xs font-extrabold uppercase tracking-wide text-zinc-500">Nền tảng đăng bài</p>
-          <h2 class="mt-1 text-xl font-extrabold">Chọn kênh vận hành</h2>
+  <div class="grid min-h-[calc(100vh-73px)] lg:grid-cols-[248px_1fr]">
+    <aside class="border-r border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
+      <div class="sticky top-[73px] flex max-h-[calc(100vh-73px)] min-h-[calc(100vh-73px)] flex-col">
+        <div class="border-b border-zinc-200 px-4 py-3 dark:border-zinc-800">
+          <p class="text-xs font-extrabold uppercase tracking-[0.18em] text-zinc-500">Nền tảng</p>
+          <h2 class="mt-1 text-lg font-black">Kênh đăng</h2>
         </div>
-        <div class="inline-flex rounded-2xl border border-zinc-200 bg-zinc-100 p-1 dark:border-zinc-800 dark:bg-zinc-900">
+
+        <div class="flex-1 overflow-auto">
+          <div class="border-b border-zinc-200 dark:border-zinc-800">
           <button
-            v-for="platform in platforms"
+            v-for="(platform, index) in platforms"
             :key="platform.id"
             :class="[
-              'rounded-xl px-4 py-2 text-sm font-extrabold transition',
-              selectedPlatformId === platform.id ? 'bg-white text-zinc-950 shadow-sm dark:bg-zinc-800 dark:text-white' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-white'
+              'group flex w-full items-center py-3 text-left text-sm font-black transition',
+              selectedPlatformId === platform.id
+                ? 'border-l-4 border-emerald-400 bg-emerald-500/10 pl-3 pr-4 text-zinc-950 dark:text-white'
+                : 'px-4 text-zinc-500 hover:bg-white hover:text-zinc-950 dark:hover:bg-zinc-900 dark:hover:text-white',
+              index + 1 < platforms.length ? 'border-b border-zinc-200 dark:border-zinc-800' : ''
             ]"
             type="button"
             :disabled="posting || queueRunning"
             @click="selectedPlatformId = platform.id"
           >
-            {{ platform.label }}
+            <span>{{ platform.label }}</span>
+          </button>
+          </div>
+        </div>
+
+        <div class="grid gap-1.5 border-t border-zinc-200 p-3 dark:border-zinc-800">
+          <button class="btn-soft h-9 justify-start px-3 text-sm" title="Đổi giao diện" type="button" @click="ui.toggleDark">
+            <component :is="ui.dark ? Sun : Moon" class="h-4 w-4" />
+            <span>{{ ui.dark ? 'Chế độ sáng' : 'Chế độ tối' }}</span>
+          </button>
+          <button class="btn-soft h-9 justify-start px-3 text-sm" type="button" @click="logout">
+            <LogOut class="h-4 w-4" />
+            <span>Đăng xuất</span>
           </button>
         </div>
       </div>
-    </BaseCard>
+    </aside>
 
-    <BaseCard>
-      <div class="flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <p class="text-xs font-extrabold uppercase tracking-wide text-zinc-500">Thiết bị đăng bài</p>
-          <h2 class="mt-1 text-xl font-extrabold">{{ selectedAccount?.displayName || 'Chưa chọn profile' }}</h2>
-          <p class="mt-1 text-sm text-zinc-500">
-            {{ selectedAccount ? formatInstanceLabel(selectedAccount) : 'LDPlayer' }} · {{ selectedAccount?.deviceId || selectedAccount?.adbHost || 'ADB chưa cấu hình' }}
-          </p>
-        </div>
+    <div class="space-y-5 p-4 sm:p-8">
+      <BaseCard>
+        <div class="flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <p class="text-xs font-extrabold uppercase tracking-wide text-zinc-500">Thiết bị đăng bài</p>
+            <h2 class="mt-1 text-xl font-extrabold">{{ selectedAccount?.displayName || 'Chưa chọn profile' }}</h2>
+            <p class="mt-1 text-sm text-zinc-500">
+              {{ selectedAccount ? formatInstanceLabel(selectedAccount) : 'LDPlayer' }} · {{ selectedAccount?.deviceId || selectedAccount?.adbHost || 'ADB chưa cấu hình' }}
+            </p>
+          </div>
 
-        <div class="flex flex-wrap items-center gap-2">
-          <label class="min-w-[240px] text-xs font-extrabold uppercase tracking-wide text-zinc-500">
-            Profile {{ selectedPlatform.label }}
-            <select v-model="selectedAccountId" class="field mt-2 h-10 text-sm normal-case tracking-normal">
-              <option v-for="account in facebookAccounts" :key="account._id" :value="account._id">
-                {{ formatAccountLabel(account) }}
-              </option>
-            </select>
-          </label>
-          <button
-            class="btn-soft mt-5 h-10"
-            :class="facebookAppReady ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-200' : ''"
-            :disabled="running || facebookOpening || !canUseRemote || facebookAppReady"
-            @click="remoteOpenApp"
-          >
-            <Loader2 v-if="facebookOpening" class="h-4 w-4 animate-spin" />
-            <CheckCircle2 v-else-if="facebookAppReady" class="h-4 w-4" />
-            <Play v-else class="h-4 w-4" />
-            {{ facebookOpenButtonLabel }}
-          </button>
-          <button class="btn-soft mt-5 h-10" type="button" @click="showDeviceTools = !showDeviceTools">
-            <Terminal class="h-4 w-4" />
-            {{ showDeviceTools ? 'Ẩn công cụ' : 'Công cụ thiết bị' }}
-          </button>
+          <div class="flex flex-wrap items-center gap-2">
+            <label class="min-w-[240px] text-xs font-extrabold uppercase tracking-wide text-zinc-500">
+              Profile {{ selectedPlatform.label }}
+              <select v-model="selectedAccountId" class="field mt-2 h-10 text-sm normal-case tracking-normal">
+                <option v-for="account in facebookAccounts" :key="account._id" :value="account._id">
+                  {{ formatAccountLabel(account) }}
+                </option>
+              </select>
+            </label>
+            <button
+              class="btn-soft mt-5 h-10"
+              :class="facebookAppReady ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-200' : ''"
+              :disabled="running || facebookOpening || !canUseRemote || facebookAppReady"
+              @click="remoteOpenApp"
+            >
+              <Loader2 v-if="facebookOpening" class="h-4 w-4 animate-spin" />
+              <CheckCircle2 v-else-if="facebookAppReady" class="h-4 w-4" />
+              <Play v-else class="h-4 w-4" />
+              {{ facebookOpenButtonLabel }}
+            </button>
+            <button class="btn-soft mt-5 h-10" type="button" @click="showDeviceTools = !showDeviceTools">
+              <Terminal class="h-4 w-4" />
+              {{ showDeviceTools ? 'Ẩn công cụ' : 'Công cụ thiết bị' }}
+            </button>
+          </div>
         </div>
-      </div>
 
       <div v-if="showDeviceTools" class="mt-4 border-t border-zinc-200 pt-4 dark:border-zinc-800">
         <div class="mb-3 flex flex-wrap items-center justify-between gap-3">
@@ -1945,8 +2078,37 @@ watch(selectedPlatformId, async () => {
                 </div>
               </div>
 
-              <div v-if="composerTab === 'compose'" class="space-y-3">
-                <div class="relative">
+              <div v-if="composerTab === 'compose'" class="space-y-4">
+                <div v-if="selectedPlatformId === 'facebook'" class="flex flex-wrap items-center border-b border-zinc-200 pb-3 dark:border-zinc-700">
+                  <div class="inline-flex rounded-full border border-zinc-200 bg-zinc-100 p-1 dark:border-zinc-700 dark:bg-zinc-950">
+                    <button
+                      :class="[
+                        'inline-flex h-8 items-center gap-2 rounded-full px-3 text-xs font-extrabold transition',
+                        facebookPostType === 'imageText' ? 'bg-white text-zinc-950 shadow-sm dark:bg-zinc-800 dark:text-white' : 'text-zinc-500 hover:text-zinc-950 dark:hover:text-white'
+                      ]"
+                      type="button"
+                      :disabled="posting || queueRunning"
+                      @click="setFacebookPostType('imageText')"
+                    >
+                      <Image class="h-3.5 w-3.5" />
+                      Ảnh/Text
+                    </button>
+                    <button
+                      :class="[
+                        'inline-flex h-8 items-center gap-2 rounded-full px-3 text-xs font-extrabold transition',
+                        facebookPostType === 'video' ? 'bg-white text-zinc-950 shadow-sm dark:bg-zinc-800 dark:text-white' : 'text-zinc-500 hover:text-zinc-950 dark:hover:text-white'
+                      ]"
+                      type="button"
+                      :disabled="posting || queueRunning"
+                      @click="setFacebookPostType('video')"
+                    >
+                      <Video class="h-3.5 w-3.5" />
+                      Video
+                    </button>
+                  </div>
+                </div>
+
+                <div class="relative border-b border-zinc-200 pb-3 dark:border-zinc-700">
                 <textarea
                   ref="composerTextarea"
                   v-model="post.text"
@@ -1979,14 +2141,15 @@ watch(selectedPlatformId, async () => {
                 </div>
               </div>
 
-                <div v-if="post.media.length" class="px-1">
-                  <div class="grid max-w-3xl gap-2 sm:grid-cols-2">
+                <div v-if="post.media.length">
+                  <div class="grid gap-3 sm:grid-cols-2">
                     <div
                       v-for="item in post.media"
                       :key="item.id"
-                      class="group relative overflow-hidden rounded-xl border border-zinc-300 bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900"
+                      class="group relative overflow-hidden rounded-2xl border border-zinc-300 bg-zinc-100 shadow-sm dark:border-zinc-700 dark:bg-zinc-900"
                     >
-                      <img v-if="item.type === 'photo'" :src="item.url" :alt="item.name" class="h-44 w-full object-cover" />
+                      <img v-if="item.type === 'photo'" :src="item.url" :alt="item.name" class="h-52 w-full object-cover" />
+                      <video v-else-if="item.type === 'video'" :src="item.url" class="h-64 w-full bg-black object-contain" controls playsinline></video>
                       <button
                         class="absolute right-2 top-2 grid h-8 w-8 place-items-center rounded-full bg-black/70 text-white transition hover:bg-black"
                         title="Xóa tệp"
@@ -2001,32 +2164,73 @@ watch(selectedPlatformId, async () => {
                     </div>
                   </div>
                 </div>
-
-                <div class="flex items-center justify-end gap-1 rounded-xl border border-zinc-200 bg-zinc-50 p-1 shadow-sm dark:border-zinc-700 dark:bg-zinc-900">
-                  <div class="inline-flex items-center gap-1">
+                <div class="rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900">
+                  <div class="flex flex-wrap items-center justify-between gap-3">
+                    <p class="text-sm font-extrabold text-zinc-700 dark:text-zinc-200">Thêm vào bài viết</p>
+                    <div class="inline-flex items-center gap-1">
                     <button
-                      class="grid h-8 w-8 place-items-center rounded-lg text-emerald-500 transition hover:bg-white hover:text-emerald-600 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-zinc-800"
+                      v-if="!isFacebookVideoMode"
+                      :class="[
+                        'inline-flex h-9 items-center gap-2 rounded-lg px-3 text-xs font-extrabold transition disabled:cursor-not-allowed disabled:opacity-40',
+                        'text-emerald-500 hover:bg-white dark:hover:bg-zinc-800'
+                      ]"
                       title="Thêm ảnh"
                       type="button"
                       :disabled="mediaUploading || post.media.length >= platformMaxPhotos"
-                      @click="mediaInput?.click()"
+                      @click="setFacebookPostType('imageText'); mediaInput?.click()"
                     >
                       <Loader2 v-if="mediaUploading" class="h-4 w-4 animate-spin" />
                       <Image v-else class="h-4 w-4" />
+                      Ảnh
                     </button>
                     <button
-                      class="grid h-8 w-8 place-items-center rounded-lg text-orange-500 transition hover:bg-white hover:text-orange-600 dark:hover:bg-zinc-800"
+                      v-if="isFacebookVideoMode"
+                      :class="[
+                        'inline-flex h-9 items-center gap-2 rounded-lg px-3 text-xs font-extrabold transition disabled:cursor-not-allowed disabled:opacity-40',
+                        'text-emerald-500 hover:bg-white dark:hover:bg-zinc-800'
+                      ]"
+                      title="Thêm video"
+                      type="button"
+                      :disabled="mediaUploading || uploadedVideoCount >= 1"
+                      @click="setFacebookPostType('video'); mediaInput?.click()"
+                    >
+                      <Video class="h-4 w-4" />
+                      Video
+                    </button>
+                    <button
+                      class="inline-flex h-9 items-center gap-2 rounded-lg px-3 text-xs font-extrabold text-orange-500 transition hover:bg-white hover:text-orange-600 dark:hover:bg-zinc-800"
                       title="Chọn icon cảm xúc"
                       type="button"
                       @click="showEmojiPicker = !showEmojiPicker"
                     >
                       ☺
+                      Cảm xúc
                     </button>
+                    </div>
                   </div>
-                </div>
+                  <button
+                    v-if="!post.media.length && (isFacebookVideoMode || selectedPlatformId === 'instagram')"
+                    class="mt-3 flex w-full items-center justify-center gap-3 rounded-xl border border-dashed border-zinc-300 px-4 py-5 text-left transition hover:border-emerald-400 hover:bg-emerald-500/5 dark:border-zinc-700"
+                    type="button"
+                    :disabled="mediaUploading"
+                    @click="mediaInput?.click()"
+                  >
+                    <span class="grid h-10 w-10 place-items-center rounded-xl bg-emerald-500/10 text-emerald-500">
+                      <Loader2 v-if="mediaUploading" class="h-5 w-5 animate-spin" />
+                      <Video v-else-if="isFacebookVideoMode" class="h-5 w-5" />
+                      <Image v-else class="h-5 w-5" />
+                    </span>
+                    <span>
+                      <span class="block font-black">{{ isFacebookVideoMode ? 'Chọn video' : 'Chọn ảnh' }}</span>
+                      <span class="mt-1 block text-xs text-zinc-500">
+                        {{ isFacebookVideoMode ? 'MP4, MOV, WebM hoặc 3GP · tối đa 100MB' : `Tối đa ${platformMaxPhotos} ảnh` }}
+                      </span>
+                    </span>
+                  </button>
+                  </div>
               </div>
 
-              <input ref="mediaInput" class="hidden" type="file" accept="image/*" multiple @change="addMedia" />
+              <input ref="mediaInput" class="hidden" type="file" :accept="mediaInputAccept" :multiple="mediaInputMultiple" @change="addMedia" />
 
               <div v-if="composerTab === 'preview'" class="space-y-4 rounded-xl border border-zinc-200 bg-zinc-50 p-4 dark:border-zinc-700 dark:bg-zinc-900">
                 <div class="flex items-center gap-3">
@@ -2042,61 +2246,17 @@ watch(selectedPlatformId, async () => {
                   <p v-if="previewCaption" class="whitespace-pre-wrap">{{ previewCaption }}</p>
                 </div>
                 <p v-else class="text-lg leading-8 text-zinc-500">Chưa có nội dung preview.</p>
-                <div
-                  v-if="previewPhotos.length"
-                  class="w-full overflow-hidden rounded-lg bg-zinc-200 dark:bg-zinc-800"
-                >
-                  <div :class="previewGalleryClass">
-                    <div
-                      v-for="(item, index) in facebookPreviewPhotos"
-                      :key="`preview-${item.id}`"
-                      :class="[
-                        'group relative min-h-0 overflow-hidden bg-zinc-950',
-                        previewPhotoClass(index),
-                        draggedPreviewPhotoId === item.id ? 'opacity-50' : ''
-                      ]"
-                      draggable="true"
-                      @dragstart="startPreviewPhotoDrag(item, $event)"
-                      @dragend="draggedPreviewPhotoId = ''"
-                      @dragover.prevent
-                      @drop.prevent="dropPreviewPhoto(item, $event)"
-                    >
-                      <img
-                        :src="item.url"
-                        :alt="item.name"
-                        :class="previewImageClass()"
-                        draggable="false"
-                      />
-                      <div class="absolute inset-x-0 top-0 flex items-start justify-between gap-2 p-2 text-white">
-                        <span class="inline-flex h-7 min-w-7 items-center justify-center rounded-full bg-black/70 px-2 text-xs font-extrabold">
-                          {{ previewPhotoOrder(item) + 1 }}
-                        </span>
-                        <div class="flex items-center gap-1 rounded-lg bg-black/70 p-1">
-                          <button
-                            class="grid h-7 w-7 place-items-center rounded-md transition hover:bg-white/20 disabled:cursor-not-allowed disabled:opacity-35"
-                            title="Đưa ảnh sang trái"
-                            type="button"
-                            :disabled="previewPhotoOrder(item) === 0"
-                            @click.stop="movePreviewPhoto(item, -1)"
-                          >
-                            <ChevronLeft class="h-4 w-4" />
-                          </button>
-                          <span class="grid h-7 w-7 cursor-grab place-items-center" title="Kéo để đổi vị trí">
-                            <GripVertical class="h-4 w-4" />
-                          </span>
-                          <button
-                            class="grid h-7 w-7 place-items-center rounded-md transition hover:bg-white/20 disabled:cursor-not-allowed disabled:opacity-35"
-                            title="Đưa ảnh sang phải"
-                            type="button"
-                            :disabled="previewPhotoOrder(item) === previewPhotos.length - 1"
-                            @click.stop="movePreviewPhoto(item, 1)"
-                          >
-                            <ChevronRight class="h-4 w-4" />
-                          </button>
-                        </div>
-                      </div>
-                    </div>
+                <div v-if="previewPhotos.length" class="grid gap-2 sm:grid-cols-2">
+                  <div
+                    v-for="item in facebookPreviewPhotos"
+                    :key="`preview-${item.id}`"
+                    class="overflow-hidden rounded-lg bg-zinc-950"
+                  >
+                    <img :src="item.url" :alt="item.name" class="h-64 w-full object-cover" />
                   </div>
+                </div>
+                <div v-if="selectedVideo" class="overflow-hidden rounded-lg bg-black">
+                  <video :src="selectedVideo.url" class="max-h-[34rem] w-full object-contain" controls playsinline></video>
                 </div>
                 <div v-if="hashtagItems.length" class="flex flex-wrap gap-2">
                   <span
@@ -2380,5 +2540,6 @@ watch(selectedPlatformId, async () => {
         </div>
       </div>
     </BaseCard>
+    </div>
   </div>
 </template>
