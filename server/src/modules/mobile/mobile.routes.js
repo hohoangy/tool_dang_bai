@@ -20,6 +20,9 @@ import {
   publishFacebookPostViaMobile
 } from '../../services/mobile/facebook-automation.service.js';
 import {
+  publishInstagramPostViaMobile
+} from '../../services/mobile/instagram-automation.service.js';
+import {
   cancelMobileLoginJob,
   createMobileLoginJob,
   encryptSecret,
@@ -31,7 +34,7 @@ import {
 export const mobileRoutes = Router();
 
 const accountSchema = z.object({
-  platform: z.enum(['facebook', 'x', 'youtube', 'tiktok', 'other']).default('other'),
+  platform: z.enum(['facebook', 'instagram', 'x', 'youtube', 'tiktok', 'other']).default('other'),
   displayName: z.string().min(2),
   accountHandle: z.string().optional().or(z.literal('')),
   instanceName: z.string().min(1),
@@ -112,6 +115,18 @@ const facebookPostSchema = z.object({
   })).max(4).default([]),
   composerTap: z.object({ x: z.number(), y: z.number() }).optional(),
   submitTap: z.object({ x: z.number(), y: z.number() }).optional()
+});
+const instagramPostSchema = z.object({
+  text: z.string().max(2200).default(''),
+  appPackage: z.string().optional().or(z.literal('')),
+  autoSubmit: z.boolean().default(false),
+  waitAfterSubmitMs: z.number().int().min(0).max(60_000).default(0),
+  images: z.array(z.object({
+    url: z.string().url(),
+    name: z.string().optional(),
+    mimeType: z.string().startsWith('image/').optional(),
+    size: z.number().int().positive().max(5 * 1024 * 1024).optional()
+  })).min(1).max(1)
 });
 
 mobileRoutes.get('/accounts', requireAuth, asyncHandler(async (req, res) => {
@@ -253,14 +268,38 @@ mobileRoutes.post('/accounts/:id/remote/key', requireAuth, asyncHandler(async (r
 mobileRoutes.post('/accounts/:id/facebook/post', requireAuth, asyncHandler(async (req, res) => {
   const input = facebookPostSchema.parse(req.body || {});
   const account = await findAccount(req.params.id, req.user._id);
+  if (account.platform !== 'facebook') {
+    throw new ApiError(400, 'Profile này không phải Facebook. Hãy chọn đúng profile Facebook.');
+  }
+  const platformInput = { ...input, appPackage: 'com.facebook.katana' };
   try {
-    const result = await publishFacebookPostViaMobile(account, req.user._id, input);
+    const result = await publishFacebookPostViaMobile(account, req.user._id, platformInput);
     res.json({ result });
   } catch (error) {
     await writeLog(req.user._id, account._id, 'error', 'facebook_post_failed', error.message, {
-      autoSubmit: input.autoSubmit,
-      appPackage: input.appPackage || account.metadata?.appPackage || '',
-      imageCount: input.images?.length || 0
+      autoSubmit: platformInput.autoSubmit,
+      appPackage: platformInput.appPackage,
+      imageCount: platformInput.images?.length || 0
+    });
+    throw new ApiError(400, error.message);
+  }
+}));
+
+mobileRoutes.post('/accounts/:id/instagram/post', requireAuth, asyncHandler(async (req, res) => {
+  const input = instagramPostSchema.parse(req.body || {});
+  const account = await findAccount(req.params.id, req.user._id);
+  if (account.platform !== 'instagram') {
+    throw new ApiError(400, 'Profile này không phải Instagram. Hãy chọn đúng profile Instagram.');
+  }
+  const platformInput = { ...input, appPackage: 'com.instagram.android' };
+  try {
+    const result = await publishInstagramPostViaMobile(account, req.user._id, platformInput);
+    res.json({ result });
+  } catch (error) {
+    await writeLog(req.user._id, account._id, 'error', 'instagram_post_failed', error.message, {
+      autoSubmit: platformInput.autoSubmit,
+      appPackage: platformInput.appPackage,
+      imageCount: platformInput.images?.length || 0
     });
     throw new ApiError(400, error.message);
   }

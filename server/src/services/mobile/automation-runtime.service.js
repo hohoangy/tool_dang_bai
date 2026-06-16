@@ -14,6 +14,7 @@ const facebookMediaRoot = '/sdcard/Pictures/SocialPilot';
 
 const defaultPackages = {
   facebook: 'com.facebook.katana',
+  instagram: 'com.instagram.android',
   x: 'com.twitter.android',
   youtube: 'com.google.android.youtube',
   tiktok: 'com.zhiliaoapp.musically',
@@ -95,6 +96,15 @@ const postTitleLabels = ['Bài viết mới', 'Bai viet moi', 'Create post'];
 const textEditorLabels = ['Thêm văn bản', 'Them van ban', 'Add text'];
 const loginBlockLabels = ['Log in', 'Đăng nhập', 'Dang nhap', 'Choose a way to confirm your account', 'Confirm your account', 'Session Expired'];
 const facebookHomeLabels = ['Trang chủ', 'Trang chu', 'Home'];
+const instagramNextLabels = ['Next', 'Tiếp', 'Tiep'];
+const instagramShareLabels = ['Share', 'Chia sẻ', 'Chia se'];
+const instagramCaptionLabels = ['Write a caption', 'Viết chú thích', 'Viet chu thich'];
+const instagramDoneLabels = ['Done', 'Xong'];
+const instagramBlockedLabels = ['Log in', 'Đăng nhập', 'Dang nhap', 'Sign up', 'Session Expired'];
+const instagramHomeLabels = ['Instagram Home Feed', 'Home', 'Create'];
+const instagramInfoDialogLabels = ['Sharing posts'];
+const instagramDismissLabels = ['OK'];
+const instagramFeedShareActivity = 'com.instagram.share.handleractivity.ShareHandlerActivity';
 
 const defaultAdbHost = '127.0.0.1:5555';
 
@@ -1044,6 +1054,265 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
       await cleanupFacebookMediaLibrary(account, userId, target, 'after_publish').catch(() => null);
     }
   }
+}
+
+export async function publishInstagramPostViaMobile(account, userId, payload = {}) {
+  let target = getDeviceTarget(account);
+  const config = buildPostConfig(account, {
+    appPackage: payload.appPackage || defaultPackages.instagram,
+    autoSubmit: payload.autoSubmit,
+    waitAfterSubmitMs: payload.waitAfterSubmitMs
+  });
+  const text = cleanIntentText(payload.text);
+  const images = Array.isArray(payload.images) ? payload.images.slice(0, 1) : [];
+
+  if (!target) throw new Error('Thiếu deviceId hoặc adbHost.');
+  if (!images.length) throw new Error('Instagram cần ít nhất 1 ảnh để đăng.');
+  if (!config.appPackage) throw new Error('Thiếu Android package name của Instagram.');
+
+  await writeLog(userId, account._id, 'info', 'instagram_post_started', `Bắt đầu mở composer Instagram cho ${account.displayName}.`, {
+    target,
+    appPackage: config.appPackage,
+    autoSubmit: config.autoSubmit,
+    imageCount: images.length
+  });
+
+  const steps = [];
+  if (account.adbHost) {
+    const connect = await runCommand(env.mobileAutomation.adbPath, ['connect', account.adbHost]);
+    steps.push(connect);
+    await writeLog(userId, account._id, connect.ok ? 'info' : 'error', 'instagram_post_adb_connect', connect.ok ? `ADB connected: ${account.adbHost}.` : `ADB connect lỗi: ${account.adbHost}.`, connect);
+    if (!connect.ok) throw new Error(connect.error || connect.stderr || 'ADB connect failed.');
+  }
+
+  target = await resolveStableDeviceTarget(target);
+  let device = await ensureDeviceReady(account, userId, target, 2);
+  if (!device.ok || String(device.stdout || '').trim() !== 'device') {
+    await writeLog(userId, account._id, 'warn', 'instagram_post_launch_retry', `ADB ${target} chưa sẵn sàng, tự mở LDPlayer trước khi đăng Instagram.`);
+    await openLdPlayer(account, userId);
+    const launchedTarget = await getLdPlayerDeviceTarget(account.instanceName);
+    target = await resolveStableDeviceTarget(launchedTarget || getDeviceTarget(account) || target);
+    device = await ensureDeviceReady(account, userId, target, 28);
+  }
+  steps.push(device);
+  if (!device.ok || String(device.stdout || '').trim() !== 'device') throw new Error(device.error || device.stderr || 'Device is not ready.');
+
+  const orientation = await ensurePortraitOrientation(account, userId, target);
+  steps.push(orientation);
+  const permissions = await grantInstagramRuntimePermissions(account, userId, target, config.appPackage);
+  steps.push(...permissions);
+
+  const preparedImages = await prepareFacebookImages(account, userId, target, images);
+  for (const preparedImage of preparedImages) steps.push(...preparedImage.steps);
+
+  const openComposer = await openInstagramComposer(account, userId, target, config, text, preparedImages[0]);
+  steps.push(openComposer);
+  await delay(postStepDelay(1.5));
+
+  const stateMachine = await runInstagramPostStateMachine(account, userId, target, config, text, steps);
+  const submitVerified = stateMachine.submitVerified ?? false;
+  const finishedLevel = config.autoSubmit && !submitVerified ? 'warn' : 'info';
+  await writeLog(userId, account._id, finishedLevel, 'instagram_post_finished', config.autoSubmit && !submitVerified ? 'Đã bấm Share Instagram nhưng chưa xác nhận app nhận bài.' : (config.autoSubmit ? 'Đã chạy luồng tự đăng Instagram.' : 'Đã mở composer Instagram, chờ kiểm tra/tự bấm share.'), {
+    autoSubmit: config.autoSubmit,
+    finalState: stateMachine.finalState,
+    submitVerified,
+    submitReason: stateMachine.submitReason || '',
+    imageCount: preparedImages.length
+  });
+
+  return {
+    ok: true,
+    autoSubmit: config.autoSubmit,
+    composerPending: stateMachine.composerPending,
+    finalState: stateMachine.finalState,
+    submitVerified,
+    submitReason: stateMachine.submitReason || '',
+    screenshot: stateMachine.screenshot,
+    stepCount: steps.length
+  };
+}
+
+async function openInstagramComposer(account, userId, target, config, text, image) {
+  const stop = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'am', 'force-stop', config.appPackage]);
+  await writeLog(userId, account._id, stop.ok ? 'info' : 'warn', 'instagram_post_reset_app_task', stop.ok ? 'Đã đóng task Instagram cũ trước khi mở composer mới.' : 'Không đóng được task Instagram cũ.', stop);
+  await delay(postStepDelay());
+
+  const baseIntentArgs = [
+    '-s',
+    target,
+    'shell',
+    'am',
+    'start',
+    '-a',
+    'android.intent.action.SEND',
+    '-t',
+    image.mimeType || 'image/*',
+    '--grant-read-uri-permission',
+    '--eu',
+    'android.intent.extra.STREAM',
+    image.contentUri || `file://${image.remotePath}`,
+    '--es',
+    'android.intent.extra.TEXT',
+    quoteAdbShellArg(text)
+  ];
+  const intentAttempts = [
+    [...baseIntentArgs, '-n', `${config.appPackage}/${instagramFeedShareActivity}`]
+  ];
+  let shareIntent = null;
+  let intentArgs = intentAttempts[0];
+
+  for (let index = 0; index < intentAttempts.length; index += 1) {
+    intentArgs = intentAttempts[index];
+    shareIntent = await runCommand(env.mobileAutomation.adbPath, intentArgs, { timeoutMs: 20_000 });
+    await writeLog(
+      userId,
+      account._id,
+      shareIntent.ok ? 'info' : 'warn',
+      'instagram_post_open_feed_share_composer',
+      shareIntent.ok ? 'Đã mở Instagram Feed/Profile composer bằng Android share intent.' : 'Không mở được Instagram Feed/Profile share intent.',
+      {
+        ...shareIntent,
+        args: maskShareIntentArgs(intentArgs)
+      }
+    );
+    if (shareIntent.ok) break;
+  }
+
+  await writeLog(userId, account._id, shareIntent.ok ? 'info' : 'error', 'instagram_post_open_share_composer', shareIntent.ok ? 'Đã mở Instagram Feed/Profile composer bằng Android share intent.' : 'Không mở được Instagram Feed/Profile share intent.', {
+    ...shareIntent,
+    args: maskShareIntentArgs(intentArgs)
+  });
+  if (!shareIntent.ok) throw new Error(shareIntent.error || shareIntent.stderr || 'Không mở được Instagram Feed/Profile composer.');
+  return { ...shareIntent, method: 'image_share_intent' };
+}
+
+async function runInstagramPostStateMachine(account, userId, target, config, text, steps) {
+  let screenshot = null;
+  let finalState = 'unknown';
+  let captionEntered = false;
+
+  for (let attempt = 1; attempt <= 18; attempt += 1) {
+    const nodes = await dumpVisibleNodes(target);
+    let state = detectInstagramState(nodes, text);
+    if (['unknown', 'home'].includes(state.name)) {
+      const active = await getForegroundAndroidPackage(target);
+      if (active.packageName === config.appPackage && /MediaCaptureActivity/i.test(active.activityName || '')) {
+        state = { ...state, name: 'next', reason: `activity:${active.activityName}`, active };
+      }
+    }
+    finalState = state.name;
+    await writeLog(userId, account._id, 'info', 'instagram_post_state', `Instagram state: ${state.name}.`, {
+      attempt,
+      reason: state.reason,
+      hasTargetText: state.hasTargetText
+    });
+
+    if (state.name === 'info_dialog') {
+      const ok = await tapTextOrPoint(account, userId, target, instagramDismissLabels, { x: 800, y: 716 }, 'instagram_post_dismiss_info_dialog', { exact: true });
+      steps.push(ok);
+      await delay(postStepDelay());
+      continue;
+    }
+
+    if (state.name === 'blocked') {
+      screenshot = await captureScreenshot(account, userId, 'instagram_post_blocked');
+      throw new Error('Instagram đang ở màn đăng nhập/checkpoint/session expired. Cần xử lý thủ công trước khi tự đăng.');
+    }
+
+    if (state.name === 'next') {
+      const next = await tapTextOrPoint(account, userId, target, instagramNextLabels, { x: 1530, y: 868 }, 'instagram_post_tap_next', { exact: true, preferBottomRight: true });
+      steps.push(next);
+      await delay(postStepDelay(1.5));
+      continue;
+    }
+
+    if (state.name === 'caption') {
+      if (text.trim() && !captionEntered && !state.hasTargetText) {
+        const captionTap = await tapTextOrPoint(account, userId, target, instagramCaptionLabels, { x: 450, y: 360 }, 'instagram_post_tap_caption');
+        steps.push(captionTap);
+        await delay(postStepDelay());
+        const input = await inputAndLog(userId, account._id, target, 'instagram_post_input_caption', text);
+        steps.push(input);
+        captionEntered = true;
+        await delay(postStepDelay(1.25));
+        continue;
+      }
+
+      if (!config.autoSubmit) {
+        screenshot = await captureScreenshot(account, userId, 'instagram_post_ready_to_share');
+        return { finalState, screenshot, steps, composerPending: false, submitVerified: false, submitReason: 'review_mode' };
+      }
+
+      const share = await tapTextOrPoint(account, userId, target, instagramShareLabels, { x: 800, y: 868 }, 'instagram_post_tap_share', { exact: true, preferBottomRight: true });
+      steps.push(share);
+      const verification = await verifyInstagramPostSubmit(account, userId, target, config.waitAfterSubmitMs);
+      return { finalState: verification.ok ? 'submitted' : verification.finalState, screenshot: verification.screenshot, steps, composerPending: verification.composerPending, submitVerified: verification.ok, submitReason: verification.reason };
+    }
+
+    await delay(postStepDelay(attempt <= 4 ? 1.75 : 1.25));
+  }
+
+  screenshot = await captureScreenshot(account, userId, 'instagram_post_state_machine_pending');
+  await writeLog(userId, account._id, 'warn', 'instagram_post_state_machine_pending', 'Không đưa được Instagram tới trạng thái share sau nhiều bước.', {
+    finalState
+  });
+  return { finalState, screenshot, steps, composerPending: true, submitVerified: false, submitReason: 'state_machine_pending' };
+}
+
+function detectInstagramState(nodes, text) {
+  if (!nodes.length) return { name: 'unknown', reason: 'no_uiautomator_nodes', hasTargetText: false };
+  const hasTargetText = screenHasText(nodes, text);
+  if (findNodeInNodes(nodes, instagramBlockedLabels)) return { name: 'blocked', reason: 'login_or_checkpoint', hasTargetText };
+  if (findNodeInNodes(nodes, instagramInfoDialogLabels)) return { name: 'info_dialog', reason: 'instagram_info_dialog', hasTargetText };
+  if (findNodeInNodes(nodes, instagramShareLabels, { exact: true })) return { name: 'caption', reason: 'share_visible', hasTargetText };
+  if (findNodeInNodes(nodes, instagramCaptionLabels)) return { name: 'caption', reason: 'caption_field_visible', hasTargetText };
+  if (findNodeInNodes(nodes, instagramNextLabels, { exact: true })) return { name: 'next', reason: 'next_visible', hasTargetText };
+  if (findNodeInNodes(nodes, instagramDoneLabels, { exact: true })) return { name: 'caption', reason: 'done_visible', hasTargetText };
+  if (findNodeInNodes(nodes, instagramHomeLabels, { exact: true })) return { name: 'home', reason: 'instagram_home_visible', hasTargetText };
+  return { name: 'unknown', reason: 'no_known_labels', hasTargetText };
+}
+
+async function grantInstagramRuntimePermissions(account, userId, target, packageName) {
+  const permissions = [
+    'android.permission.CAMERA',
+    'android.permission.READ_EXTERNAL_STORAGE',
+    'android.permission.WRITE_EXTERNAL_STORAGE'
+  ];
+  const steps = [];
+  for (const permission of permissions) {
+    const result = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'pm', 'grant', packageName, permission], { timeoutMs: 10_000 });
+    steps.push(result);
+    await writeLog(userId, account._id, result.ok ? 'info' : 'warn', 'instagram_post_grant_permission', result.ok ? `Đã cấp quyền ${permission} cho Instagram.` : `Không cấp được quyền ${permission}.`, {
+      permission,
+      ...result
+    });
+  }
+  return steps;
+}
+
+async function verifyInstagramPostSubmit(account, userId, target, waitAfterSubmitMs = 0) {
+  const startedAt = Date.now();
+  const verificationWindowMs = Math.max(6_000, waitAfterSubmitMs || 0);
+  const deadline = startedAt + verificationWindowMs;
+  while (Date.now() < deadline) {
+    await delay(1_000);
+    const nodes = await dumpVisibleNodes(target);
+    const state = detectInstagramState(nodes, '');
+    if (!['caption', 'next'].includes(state.name)) {
+      const screenshot = await captureScreenshot(account, userId, 'instagram_post_submit_verified');
+      await writeLog(userId, account._id, 'info', 'instagram_post_submit_verified', 'Instagram đã rời màn share sau khi bấm Share.', {
+        elapsedMs: Date.now() - startedAt,
+        state
+      });
+      return { ok: true, reason: 'composer_closed_after_share', screenshot, composerPending: false, finalState: 'submitted' };
+    }
+  }
+
+  const screenshot = await captureScreenshot(account, userId, 'instagram_post_submit_unverified');
+  await writeLog(userId, account._id, 'warn', 'instagram_post_submit_unverified', 'Đã bấm Share nhưng chưa thấy tín hiệu xác nhận Instagram nhận bài.', {
+    elapsedMs: Date.now() - startedAt
+  });
+  return { ok: false, reason: 'no_confirmation_after_share', screenshot, composerPending: true, finalState: 'submit_unverified' };
 }
 
 async function resolveStableDeviceTarget(target) {
@@ -2586,6 +2855,9 @@ async function inputDeviceText(target, text, options = {}) {
     if (unicodeResult.ok) return unicodeResult;
   }
 
+  const pasteResult = await inputWithClipboardPaste(target, value);
+  if (pasteResult.ok) return { ...pasteResult, method: 'clipboard_paste_ascii_first' };
+
   const fallback = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'input', 'text', cleanText(value)]);
   return {
     ...fallback,
@@ -2595,11 +2867,11 @@ async function inputDeviceText(target, text, options = {}) {
 }
 
 async function inputUnicodeText(target, text, options = {}) {
-  const adbKeyboard = await inputWithAdbKeyboard(target, text);
-  if (adbKeyboard.ok) return adbKeyboard;
-
   const clipboard = await inputWithClipboardPaste(target, text);
   if (clipboard.ok) return clipboard;
+
+  const adbKeyboard = await inputWithAdbKeyboard(target, text);
+  if (adbKeyboard.ok) return adbKeyboard;
 
   const clipper = await inputWithClipperBroadcast(target, text);
   if (clipper.ok) return clipper;

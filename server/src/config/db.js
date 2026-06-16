@@ -81,7 +81,7 @@ async function migrate() {
       title VARCHAR(255) NOT NULL,
       topic VARCHAR(255) NOT NULL,
       tone VARCHAR(80) NOT NULL,
-      platform ENUM('facebook', 'x', 'youtube', 'tiktok') NOT NULL,
+      platform ENUM('facebook', 'instagram', 'x', 'youtube', 'tiktok') NOT NULL,
       social_account_id CHAR(36) NULL,
       content JSON NOT NULL,
       status ENUM('draft', 'queued', 'scheduled', 'published', 'failed') NOT NULL DEFAULT 'draft',
@@ -102,12 +102,13 @@ async function migrate() {
   `);
   await addColumnIfMissing('posts', 'media', 'JSON NULL');
   await addColumnIfMissing('posts', 'social_account_id', 'CHAR(36) NULL');
+  await query("ALTER TABLE posts MODIFY platform ENUM('facebook', 'instagram', 'x', 'youtube', 'tiktok') NOT NULL");
 
   await query(`
     CREATE TABLE IF NOT EXISTS social_accounts (
       id CHAR(36) PRIMARY KEY,
       user_id CHAR(36) NOT NULL,
-      platform ENUM('facebook', 'x', 'youtube', 'tiktok') NOT NULL,
+      platform ENUM('facebook', 'instagram', 'x', 'youtube', 'tiktok') NOT NULL,
       account_name VARCHAR(255) NOT NULL,
       external_account_id VARCHAR(255) NULL,
       access_token TEXT NULL,
@@ -122,13 +123,14 @@ async function migrate() {
       CONSTRAINT fk_social_accounts_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     )
   `);
+  await query("ALTER TABLE social_accounts MODIFY platform ENUM('facebook', 'instagram', 'x', 'youtube', 'tiktok') NOT NULL");
 
   await query(`
     CREATE TABLE IF NOT EXISTS schedules (
       id CHAR(36) PRIMARY KEY,
       user_id CHAR(36) NOT NULL,
       post_id CHAR(36) NOT NULL,
-      platform ENUM('facebook', 'x', 'youtube', 'tiktok') NOT NULL,
+      platform ENUM('facebook', 'instagram', 'x', 'youtube', 'tiktok') NOT NULL,
       run_at DATETIME NOT NULL,
       status ENUM('queued', 'processing', 'done', 'failed') NOT NULL DEFAULT 'queued',
       attempts INT NOT NULL DEFAULT 0,
@@ -143,6 +145,7 @@ async function migrate() {
       CONSTRAINT fk_schedules_post FOREIGN KEY (post_id) REFERENCES posts(id) ON DELETE CASCADE
     )
   `);
+  await query("ALTER TABLE schedules MODIFY platform ENUM('facebook', 'instagram', 'x', 'youtube', 'tiktok') NOT NULL");
 
   await query(`
     CREATE TABLE IF NOT EXISTS logs (
@@ -166,7 +169,7 @@ async function migrate() {
     CREATE TABLE IF NOT EXISTS mobile_accounts (
       id CHAR(36) PRIMARY KEY,
       user_id CHAR(36) NOT NULL,
-      platform ENUM('facebook', 'x', 'youtube', 'tiktok', 'other') NOT NULL DEFAULT 'other',
+      platform ENUM('facebook', 'instagram', 'x', 'youtube', 'tiktok', 'other') NOT NULL DEFAULT 'other',
       display_name VARCHAR(180) NOT NULL,
       account_handle VARCHAR(180) NULL,
       instance_name VARCHAR(180) NOT NULL,
@@ -184,6 +187,7 @@ async function migrate() {
       CONSTRAINT fk_mobile_accounts_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     )
   `);
+  await query("ALTER TABLE mobile_accounts MODIFY platform ENUM('facebook', 'instagram', 'x', 'youtube', 'tiktok', 'other') NOT NULL DEFAULT 'other'");
 
   await query(`
     CREATE TABLE IF NOT EXISTS mobile_account_logs (

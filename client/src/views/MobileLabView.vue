@@ -41,7 +41,7 @@ const drafts = ref([]);
 const draggedPreviewPhotoId = ref('');
 
 const maxPhotos = 4;
-const draftStorageKey = 'socialpilot-facebook-composer-drafts';
+const draftStorageKey = 'socialpilot-platform-composer-drafts';
 const runtimeStatusIntervalMs = 4_000;
 let runtimeStatusTimer = null;
 
@@ -52,26 +52,55 @@ const platforms = [
     packageName: 'com.facebook.katana',
     status: 'ready',
     description: 'Mo composer, nhap text, gan anh va dang truc tiep bang Facebook app trong LDPlayer.'
+  },
+  {
+    id: 'instagram',
+    label: 'Instagram Feed',
+    packageName: 'com.instagram.android',
+    status: 'ready',
+    description: 'Dang anh va caption len trang ca nhan/feed qua Instagram app trong LDPlayer.'
   }
 ];
 
-const defaultMobileAccount = {
-  platform: 'facebook',
-  displayName: 'Facebook Account 01',
-  accountHandle: '',
-  instanceName: 'LDPlayer',
-  adbHost: '',
-  deviceId: 'emulator-5554',
-  status: 'ready',
-  notes: 'Default LDPlayer profile for direct Facebook posting tests.',
-  metadata: {
-    appPackage: 'com.facebook.katana',
-    username: '',
-    password: '',
-    loginSteps: {
-      usernameTap: { x: 540, y: 760 },
-      passwordTap: { x: 540, y: 900 },
-      submitTap: { x: 540, y: 1060 }
+const defaultMobileAccounts = {
+  facebook: {
+    platform: 'facebook',
+    displayName: 'Facebook Account 01',
+    accountHandle: '',
+    instanceName: 'LDPlayer',
+    adbHost: '',
+    deviceId: 'emulator-5554',
+    status: 'ready',
+    notes: 'Default LDPlayer profile for direct Facebook posting tests.',
+    metadata: {
+      appPackage: 'com.facebook.katana',
+      username: '',
+      password: '',
+      loginSteps: {
+        usernameTap: { x: 540, y: 760 },
+        passwordTap: { x: 540, y: 900 },
+        submitTap: { x: 540, y: 1060 }
+      }
+    }
+  },
+  instagram: {
+    platform: 'instagram',
+    displayName: 'Instagram Account 01',
+    accountHandle: '',
+    instanceName: 'LDPlayer',
+    adbHost: '',
+    deviceId: 'emulator-5554',
+    status: 'ready',
+    notes: 'Default LDPlayer profile for direct Instagram posting tests.',
+    metadata: {
+      appPackage: 'com.instagram.android',
+      username: '',
+      password: '',
+      loginSteps: {
+        usernameTap: { x: 540, y: 760 },
+        passwordTap: { x: 540, y: 900 },
+        submitTap: { x: 540, y: 1060 }
+      }
     }
   }
 };
@@ -106,10 +135,10 @@ const emojiGroups = [
 const selectedPlatform = computed(() => platforms.find((item) => item.id === selectedPlatformId.value) || platforms[0]);
 const selectedAccount = computed(() => {
   const exact = accounts.value.find((account) => account._id === selectedAccountId.value);
-  if (exact) return exact;
-  return accounts.value.find((account) => account.platform === selectedPlatformId.value) || accounts.value[0] || null;
+  if (exact?.platform === selectedPlatformId.value) return exact;
+  return accounts.value.find((account) => account.platform === selectedPlatformId.value) || null;
 });
-const selectedAccountLabel = computed(() => selectedAccount.value ? formatAccountLabel(selectedAccount.value) : 'Chưa có profile Facebook');
+const selectedAccountLabel = computed(() => selectedAccount.value ? formatAccountLabel(selectedAccount.value) : `Chưa có profile ${selectedPlatform.value.label}`);
 const accountInitial = computed(() => selectedAccount.value?.displayName?.slice(0, 1)?.toUpperCase() || 'F');
 const screenshotSrc = computed(() => screenshot.value?.imageBase64 ? `data:image/png;base64,${screenshot.value.imageBase64}` : '');
 const composerScreenshotSrc = computed(() => postResult.value?.screenshot?.imageBase64 ? `data:image/png;base64,${postResult.value.screenshot.imageBase64}` : '');
@@ -122,10 +151,12 @@ const technicalLogStats = computed(() => ({
   errors: latestLogs.value.filter((log) => log.level === 'error').length
 }));
 const canUseRemote = computed(() => Boolean(selectedAccount.value));
-const facebookAccounts = computed(() => accounts.value.filter((account) => account.platform === 'facebook'));
+const facebookAccounts = computed(() => accounts.value.filter((account) => account.platform === selectedPlatformId.value));
 const selectedQueueAccounts = computed(() => facebookAccounts.value.filter((account) => selectedQueueAccountIds.value.includes(account._id)));
+const platformMaxPhotos = computed(() => selectedPlatformId.value === 'instagram' ? 1 : maxPhotos);
+const platformRequiresPhoto = computed(() => selectedPlatformId.value === 'instagram');
 const uploadedPhotoCount = computed(() => post.media.filter((item) => item.type === 'photo' && item.uploadedUrl).length);
-const previewPhotos = computed(() => post.media.filter((item) => item.type === 'photo').slice(0, maxPhotos));
+const previewPhotos = computed(() => post.media.filter((item) => item.type === 'photo').slice(0, platformMaxPhotos.value));
 const facebookPreviewPhotos = computed(() => previewPhotos.value);
 const previewGalleryClass = computed(() => {
   if (previewPhotos.value.length === 1) return 'grid grid-cols-1';
@@ -144,7 +175,7 @@ const hashtagSummary = computed(() => {
 const finalPostText = computed(() => [normalizeTextFormatArtifacts(post.text).trim(), normalizedHashtags.value].filter(Boolean).join('\n\n'));
 const characterCount = computed(() => finalPostText.value.length);
 const previewCaption = computed(() => normalizeTextFormatArtifacts(post.text).trim());
-const facebookAppPackage = computed(() => selectedAccount.value?.metadata?.appPackage || selectedPlatform.value.packageName);
+const facebookAppPackage = computed(() => selectedPlatform.value.packageName);
 const currentPublishMode = computed(() => publishModes.find((mode) => mode.id === publishMode.value) || publishModes[0]);
 const currentPublishModeShortLabel = computed(() => ({
   direct: 'Đăng ngay',
@@ -158,10 +189,10 @@ const isScheduleMode = computed(() => publishMode.value === 'schedule');
 const requiresFacebookSession = computed(() => !isBulkMode.value && !isScheduleMode.value);
 const facebookAppReady = computed(() => Boolean(selectedAccount.value?._id) && facebookSessionAccountId.value === selectedAccount.value._id);
 const facebookOpenButtonLabel = computed(() => {
-  if (facebookOpening.value) return 'Đang mở Facebook';
-  return facebookAppReady.value ? 'Đã mở Facebook' : 'Mở Facebook';
+  if (facebookOpening.value) return `Đang mở ${selectedPlatform.value.label}`;
+  return facebookAppReady.value ? `Đã mở ${selectedPlatform.value.label}` : `Mở ${selectedPlatform.value.label}`;
 });
-const facebookSessionStatusLabel = computed(() => facebookAppReady.value ? 'Đã mở Facebook' : 'Chưa mở Facebook');
+const facebookSessionStatusLabel = computed(() => facebookAppReady.value ? `Đã mở ${selectedPlatform.value.label}` : `Chưa mở ${selectedPlatform.value.label}`);
 const minScheduleDateTime = computed(() => toDateTimeLocal(new Date(Date.now() + 60 * 1000)));
 const minScheduleDate = computed(() => minScheduleDateTime.value.slice(0, 10));
 const scheduleDate = computed({
@@ -196,6 +227,7 @@ const canRunWorkflow = computed(() => selectedPlatform.value.status === 'ready'
   && (!requiresFacebookSession.value || facebookAppReady.value)
   && queueReady.value
   && scheduleReady.value
+  && (!platformRequiresPhoto.value || uploadedPhotoCount.value > 0)
   && Boolean(finalPostText.value.trim())
   && !posting.value
   && !queueRunning.value
@@ -240,7 +272,7 @@ const workflowTone = computed(() => {
 });
 const preflightItems = computed(() => [
   {
-    label: 'Profile Facebook',
+    label: `Profile ${selectedPlatform.value.label}`,
     detail: selectedAccount.value ? `${selectedAccount.value.displayName} trên ${selectedAccount.value.instanceName}` : 'Chưa chọn profile',
     ok: Boolean(selectedAccount.value),
     blocking: true
@@ -252,8 +284,8 @@ const preflightItems = computed(() => [
     blocking: true
   },
   {
-    label: 'Facebook app',
-    detail: facebookAppReady.value ? 'Facebook đã sẵn sàng trong LDPlayer' : 'Mở Facebook trước khi đăng',
+    label: `${selectedPlatform.value.label} app`,
+    detail: facebookAppReady.value ? `${selectedPlatform.value.label} đã sẵn sàng trong LDPlayer` : `Mở ${selectedPlatform.value.label} trước khi đăng`,
     ok: Boolean(facebookAppPackage.value) && (!requiresFacebookSession.value || facebookAppReady.value),
     blocking: true
   },
@@ -265,9 +297,9 @@ const preflightItems = computed(() => [
   },
   {
     label: 'Media',
-    detail: uploadedPhotoCount.value ? `${uploadedPhotoCount.value}/${maxPhotos} ảnh đã sẵn sàng` : 'Không dùng ảnh',
-    ok: !post.media.length || uploadedPhotoCount.value === post.media.length,
-    blocking: false
+    detail: uploadedPhotoCount.value ? `${uploadedPhotoCount.value}/${platformMaxPhotos.value} ảnh đã sẵn sàng` : (platformRequiresPhoto.value ? 'Instagram bắt buộc có ảnh' : 'Không dùng ảnh'),
+    ok: (!post.media.length || uploadedPhotoCount.value === Math.min(post.media.length, platformMaxPhotos.value)) && (!platformRequiresPhoto.value || uploadedPhotoCount.value > 0),
+    blocking: platformRequiresPhoto.value
   },
   {
     label: 'Lịch đăng',
@@ -308,7 +340,13 @@ const operationalPostRunActions = new Set([
   'facebook_post_image_attached',
   'facebook_post_wait_for_ui',
   'facebook_post_state',
-  'facebook_post_failed'
+  'facebook_post_failed',
+  'instagram_post_finished',
+  'instagram_post_submit_verified',
+  'instagram_post_submit_unverified',
+  'instagram_post_state_machine_pending',
+  'instagram_post_state',
+  'instagram_post_failed'
 ]);
 const recentPostRuns = computed(() => latestLogs.value
   .filter((log) => operationalPostRunActions.has(String(log.action || '')))
@@ -365,6 +403,30 @@ const postRunActionLabels = {
   facebook_post_failed: {
     title: 'Đăng thất bại',
     detail: 'Workflow dừng vì Facebook hoặc LDPlayer trả lỗi trong quá trình đăng.'
+  },
+  instagram_post_finished: {
+    title: 'Đã hoàn tất thao tác Instagram',
+    detail: 'Tool đã đi hết workflow đăng Instagram.'
+  },
+  instagram_post_submit_verified: {
+    title: 'Đã xác minh Instagram nhận bài',
+    detail: 'Instagram đã rời màn share sau khi bấm Share.'
+  },
+  instagram_post_submit_unverified: {
+    title: 'Chưa xác minh được bài Instagram',
+    detail: 'Đã bấm Share nhưng chưa thấy tín hiệu xác nhận.'
+  },
+  instagram_post_state_machine_pending: {
+    title: 'Chưa tới được màn đăng Feed',
+    detail: 'Automation chưa đưa Instagram về đúng trạng thái đăng trang cá nhân/feed.'
+  },
+  instagram_post_state: {
+    title: 'Đang đọc trạng thái Instagram',
+    detail: 'Tool đang nhận diện màn hình hiện tại.'
+  },
+  instagram_post_failed: {
+    title: 'Đăng Instagram thất bại',
+    detail: 'Workflow dừng vì Instagram hoặc LDPlayer trả lỗi trong quá trình đăng.'
   }
 };
 const postResultSummary = computed(() => {
@@ -372,7 +434,7 @@ const postResultSummary = computed(() => {
   if (postResult.value.submitVerified) {
     return {
       title: 'Đã xác minh bài đăng',
-      detail: 'Facebook đã có tín hiệu nhận bài. Lưu lại screenshot/log để đối chiếu khi cần.',
+      detail: `${selectedPlatform.value.label} đã có tín hiệu nhận bài. Lưu lại screenshot/log để đối chiếu khi cần.`,
       tone: 'ok'
     };
   }
@@ -385,7 +447,7 @@ const postResultSummary = computed(() => {
   }
   return {
     title: 'Composer đã mở',
-    detail: 'Bài đang chờ thao tác trong Facebook app.',
+    detail: `Bài đang chờ thao tác trong ${selectedPlatform.value.label} app.`,
     tone: 'run'
   };
 });
@@ -394,13 +456,13 @@ const publishModes = [
     id: 'direct',
     title: 'Đăng ngay',
     icon: 'zap',
-    description: 'Kiểm tra thiết bị, mở Facebook và bấm Đăng tự động cho profile đang chọn.'
+    description: 'Kiểm tra thiết bị, mở app và bấm đăng tự động cho profile đang chọn.'
   },
   {
     id: 'review',
     title: 'Mở composer để kiểm tra',
     icon: 'shield',
-    description: 'Chỉ nhập nội dung/media vào Facebook, không tự bấm Đăng.'
+    description: 'Chỉ nhập nội dung/media vào composer, không tự bấm đăng.'
   },
   {
     id: 'bulk',
@@ -442,7 +504,7 @@ const professionalKpis = computed(() => [
     value: blockedPreflightItems.value.length ? 'Cần kiểm tra' : 'Đủ điều kiện',
     detail: blockedPreflightItems.value.length
       ? `Thiếu: ${blockedPreflightItems.value.map((item) => item.label).join(', ')}`
-      : 'Profile, ADB và Facebook đã sẵn sàng',
+      : `Profile, ADB và ${selectedPlatform.value.label} đã sẵn sàng`,
     tone: blockedPreflightItems.value.length ? 'warn' : 'ok'
   },
   {
@@ -512,10 +574,17 @@ const professionalActions = computed(() => {
       tone: 'required'
     });
   }
+  if (platformRequiresPhoto.value && !uploadedPhotoCount.value) {
+    actions.push({
+      title: 'Thêm ảnh Instagram',
+      detail: 'Instagram cần 1 ảnh đã upload trước khi mở composer.',
+      tone: 'required'
+    });
+  }
   if (requiresFacebookSession.value && !facebookAppReady.value) {
     actions.push({
-      title: 'Mở Facebook',
-      detail: 'Mở app Facebook trong đúng LDPlayer profile trước khi đăng.',
+      title: `Mở ${selectedPlatform.value.label}`,
+      detail: `Mở app ${selectedPlatform.value.label} trong đúng LDPlayer profile trước khi đăng.`,
       tone: 'required'
     });
   }
@@ -564,7 +633,7 @@ function applyMobileAccounts(data) {
     selectedAccountId.value = preferred._id;
   }
   if (!selectedQueueAccountIds.value.length) {
-    selectedQueueAccountIds.value = nextAccounts.filter((account) => account.platform === 'facebook').slice(0, 1).map((account) => account._id);
+    selectedQueueAccountIds.value = nextAccounts.filter((account) => account.platform === selectedPlatformId.value).slice(0, 1).map((account) => account._id);
   } else {
     const availableIds = new Set(nextAccounts.map((account) => account._id));
     selectedQueueAccountIds.value = selectedQueueAccountIds.value.filter((id) => availableIds.has(id));
@@ -598,9 +667,9 @@ function isAuthError(error) {
 }
 
 async function ensureDefaultProfile() {
-  if (accounts.value.length) return;
-  const { data } = await http.post('/mobile/accounts', defaultMobileAccount);
-  accounts.value = [data.account];
+  if (accounts.value.some((account) => account.platform === selectedPlatformId.value)) return;
+  const { data } = await http.post('/mobile/accounts', defaultMobileAccounts[selectedPlatformId.value] || defaultMobileAccounts.facebook);
+  accounts.value = [data.account, ...accounts.value];
   selectedAccountId.value = data.account._id;
   ui.notify('Da tao LDPlayer profile mac dinh.');
 }
@@ -724,9 +793,14 @@ async function clickScreenshot(event) {
 
 async function sendRemoteText() {
   if (!selectedAccount.value || !remoteTextInput.value.trim()) return;
-  await http.post(`/mobile/accounts/${selectedAccount.value._id}/remote/text`, { text: remoteTextInput.value });
-  remoteTextInput.value = '';
-  window.setTimeout(refreshScreenshot, 400);
+  try {
+    await http.post(`/mobile/accounts/${selectedAccount.value._id}/remote/text`, { text: remoteTextInput.value });
+    remoteTextInput.value = '';
+    ui.notify('Đã gửi text vào LDPlayer.');
+    window.setTimeout(refreshScreenshot, 400);
+  } catch (error) {
+    ui.notify(error.message, 'error');
+  }
 }
 
 async function sendRemoteKey(key) {
@@ -742,7 +816,7 @@ async function runPostWorkflow() {
     return;
   }
   if (selectedPlatform.value.status !== 'ready') {
-    ui.notify(`Workflow ${selectedPlatform.value.label} se duoc them sau. Hien tai Facebook da san sang.`, 'error');
+    ui.notify(`Workflow ${selectedPlatform.value.label} se duoc them sau.`, 'error');
     workflowStage.value = 'failed';
     return;
   }
@@ -786,12 +860,12 @@ async function runPostWorkflow() {
       ui.notify('Đã mở composer để bạn kiểm tra trước khi đăng.');
     } else if (data.result.submitVerified === false) {
       workflowStage.value = 'review';
-      ui.notify('Đã bấm Đăng nhưng chưa xác nhận Facebook đã nhận bài. Hãy xem screenshot/log.', 'error');
+      ui.notify(`Đã bấm đăng nhưng chưa xác nhận ${selectedPlatform.value.label} đã nhận bài. Hãy xem screenshot/log.`, 'error');
     } else {
       workflowStage.value = 'verified';
       ui.notify(uploadedPhotoCount.value
-        ? `Đã tải xong ${uploadedPhotoCount.value} ảnh và đăng bài Facebook.`
-        : 'Đã đăng và xác minh bài Facebook.');
+        ? `Đã tải xong ${uploadedPhotoCount.value} ảnh và đăng bài ${selectedPlatform.value.label}.`
+        : `Đã đăng và xác minh bài ${selectedPlatform.value.label}.`);
     }
     await load();
   } catch (error) {
@@ -916,11 +990,11 @@ function submitFacebookForAccount(account, autoSubmit, waitAfterSubmitMs = 0) {
         .filter((item) => item.type === 'photo' && item.uploadedUrl)
         .map((item) => [item.uploadedUrl, item])
     ).values()
-  ).slice(0, maxPhotos);
+  ).slice(0, platformMaxPhotos.value);
 
-  return http.post(`/mobile/accounts/${account._id}/facebook/post`, {
+  return http.post(`/mobile/accounts/${account._id}/${selectedPlatformId.value}/post`, {
     text: finalPostText.value.trim(),
-    appPackage: account.metadata?.appPackage || selectedPlatform.value.packageName,
+    appPackage: selectedPlatform.value.packageName,
     autoSubmit,
     waitAfterSubmitMs,
     images: uniqueImages
@@ -943,7 +1017,7 @@ async function closeQueueAccount(account, message = '') {
   updateQueueItem(account._id, { message: `${baseMessage} · Đang tắt LDPlayer` });
   try {
     await http.post(`/mobile/accounts/${account._id}/remote/close-session`, {
-      appPackage: account.metadata?.appPackage || selectedPlatform.value.packageName
+      appPackage: selectedPlatform.value.packageName
     });
     updateQueueItem(account._id, { message: `${baseMessage} · Đã tắt LDPlayer` });
   } catch {
@@ -1088,10 +1162,10 @@ function duplicateComposer() {
 async function addMedia(event) {
   const files = Array.from(event.target.files || []);
   event.target.value = '';
-  const remaining = maxPhotos - post.media.filter((item) => item.type === 'photo').length;
+  const remaining = platformMaxPhotos.value - post.media.filter((item) => item.type === 'photo').length;
   const selectedFiles = files.slice(0, remaining);
   if (!selectedFiles.length) return;
-  if (files.length > remaining) ui.notify(`Chi nhan them ${remaining} anh de giu gioi han ${maxPhotos} anh.`, 'error');
+  if (files.length > remaining) ui.notify(`Chi nhan them ${remaining} anh de giu gioi han ${platformMaxPhotos.value} anh.`, 'error');
   if (selectedFiles.some((file) => file.size > 5 * 1024 * 1024)) {
     ui.notify('Anh phai nho hon hoac bang 5 MB.', 'error');
     return;
@@ -1266,10 +1340,43 @@ watch(selectedAccountId, () => {
   facebookSessionAccountId.value = '';
   syncSelectedAccountRuntimeStatus();
 });
+
+watch(selectedPlatformId, async () => {
+  const preferred = findPreferredAccount(accounts.value);
+  selectedAccountId.value = preferred?._id || '';
+  selectedQueueAccountIds.value = accounts.value.filter((account) => account.platform === selectedPlatformId.value).slice(0, 1).map((account) => account._id);
+  facebookSessionAccountId.value = '';
+  await ensureDefaultProfile();
+  await syncSelectedAccountRuntimeStatus();
+});
 </script>
 
 <template>
   <div class="space-y-5">
+    <BaseCard>
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <p class="text-xs font-extrabold uppercase tracking-wide text-zinc-500">Nền tảng đăng bài</p>
+          <h2 class="mt-1 text-xl font-extrabold">Chọn kênh vận hành</h2>
+        </div>
+        <div class="inline-flex rounded-2xl border border-zinc-200 bg-zinc-100 p-1 dark:border-zinc-800 dark:bg-zinc-900">
+          <button
+            v-for="platform in platforms"
+            :key="platform.id"
+            :class="[
+              'rounded-xl px-4 py-2 text-sm font-extrabold transition',
+              selectedPlatformId === platform.id ? 'bg-white text-zinc-950 shadow-sm dark:bg-zinc-800 dark:text-white' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-white'
+            ]"
+            type="button"
+            :disabled="posting || queueRunning"
+            @click="selectedPlatformId = platform.id"
+          >
+            {{ platform.label }}
+          </button>
+        </div>
+      </div>
+    </BaseCard>
+
     <BaseCard>
       <div class="flex flex-wrap items-start justify-between gap-4">
         <div>
@@ -1282,7 +1389,7 @@ watch(selectedAccountId, () => {
 
         <div class="flex flex-wrap items-center gap-2">
           <label class="min-w-[240px] text-xs font-extrabold uppercase tracking-wide text-zinc-500">
-            Profile Facebook
+            Profile {{ selectedPlatform.label }}
             <select v-model="selectedAccountId" class="field mt-2 h-10 text-sm normal-case tracking-normal">
               <option v-for="account in facebookAccounts" :key="account._id" :value="account._id">
                 {{ formatAccountLabel(account) }}
@@ -1353,7 +1460,7 @@ watch(selectedAccountId, () => {
                 <p class="mt-1 truncate text-sm font-extrabold">{{ selectedAccount?.deviceId || selectedAccount?.adbHost || 'Chưa cấu hình' }}</p>
               </div>
               <div class="rounded-lg bg-white p-3 dark:bg-zinc-950">
-                <p class="text-xs font-extrabold uppercase tracking-wide text-zinc-500">Facebook</p>
+                <p class="text-xs font-extrabold uppercase tracking-wide text-zinc-500">{{ selectedPlatform.label }}</p>
                 <p class="mt-1 truncate text-sm font-extrabold">{{ facebookSessionStatusLabel }}</p>
               </div>
             </div>
@@ -1399,16 +1506,16 @@ watch(selectedAccountId, () => {
             <div class="mb-3 flex flex-wrap items-center gap-2">
               <span class="inline-flex items-center gap-2 rounded-full bg-emerald-400/10 px-3 py-1 text-xs font-extrabold uppercase tracking-wide text-emerald-300">
                 <Sparkles class="h-3.5 w-3.5" />
-                Facebook automation
+                {{ selectedPlatform.label }} automation
               </span>
               <span class="inline-flex items-center gap-2 rounded-full bg-white/10 px-3 py-1 text-xs font-bold text-zinc-300">
                 <Gauge class="h-3.5 w-3.5" />
                 {{ workflowLabel }}
               </span>
             </div>
-            <h2 class="text-2xl font-extrabold md:text-3xl">Đăng Facebook qua LDPlayer</h2>
+            <h2 class="text-2xl font-extrabold md:text-3xl">Đăng {{ selectedPlatform.label }} qua LDPlayer</h2>
             <p class="mt-2 max-w-3xl text-sm leading-6 text-zinc-400">
-              Soạn caption, kiểm tra profile, chạy automation qua app Facebook thật và theo dõi xác minh sau đăng trong cùng một màn hình.
+              Soạn caption, kiểm tra profile, chạy automation qua app {{ selectedPlatform.label }} thật và theo dõi xác minh sau đăng trong cùng một màn hình.
             </p>
           </div>
 
@@ -1529,7 +1636,7 @@ watch(selectedAccountId, () => {
                   </span>
                 </button>
                 <p v-if="!facebookAccounts.length" class="rounded-lg border border-dashed border-zinc-300 p-4 text-sm text-zinc-500 dark:border-zinc-700">
-                  Chưa có profile Facebook để chọn.
+                  Chưa có profile {{ selectedPlatform.label }} để chọn.
                 </p>
               </div>
             </div>
@@ -1703,7 +1810,7 @@ watch(selectedAccountId, () => {
             </div>
             <div class="rounded-xl border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-800 dark:bg-zinc-900">
               <p class="text-xs font-extrabold uppercase tracking-wide text-zinc-500">Ảnh</p>
-              <p class="mt-2 text-2xl font-black">{{ uploadedPhotoCount }}/{{ maxPhotos }}</p>
+              <p class="mt-2 text-2xl font-black">{{ uploadedPhotoCount }}/{{ platformMaxPhotos }}</p>
             </div>
           </div>
 
@@ -1784,7 +1891,7 @@ watch(selectedAccountId, () => {
                   class="inline-flex h-9 items-center gap-2 rounded-lg bg-white px-3 text-xs font-extrabold text-zinc-950 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-white"
                   type="button"
                   :disabled="!canRunWorkflow"
-                  :title="facebookAppReady || !requiresFacebookSession ? primaryActionLabel : 'Mở Facebook trước khi đăng'"
+                  :title="facebookAppReady || !requiresFacebookSession ? primaryActionLabel : `Mở ${selectedPlatform.label} trước khi đăng`"
                   @click="runPostWorkflow()"
                 >
                   <Loader2 v-if="posting || queueRunning" class="h-4 w-4 animate-spin" />
@@ -1814,7 +1921,7 @@ watch(selectedAccountId, () => {
                     {{ accountInitial }}
                   </div>
                   <div class="min-w-0">
-                    <p class="truncate font-extrabold">{{ selectedAccount?.displayName || 'Facebook profile' }}</p>
+                    <p class="truncate font-extrabold">{{ selectedAccount?.displayName || `${selectedPlatform.label} profile` }}</p>
                     <p class="truncate text-xs text-zinc-500 dark:text-zinc-400">{{ selectedAccount?.instanceName || 'LDPlayer' }} · {{ selectedAccount?.deviceId || selectedAccount?.adbHost || 'ADB chưa cấu hình' }}</p>
                   </div>
                 </div>
@@ -1901,7 +2008,7 @@ watch(selectedAccountId, () => {
                       class="grid h-8 w-8 place-items-center rounded-lg text-emerald-500 transition hover:bg-white hover:text-emerald-600 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-zinc-800"
                       title="Thêm ảnh"
                       type="button"
-                      :disabled="mediaUploading || post.media.length >= maxPhotos"
+                      :disabled="mediaUploading || post.media.length >= platformMaxPhotos"
                       @click="mediaInput?.click()"
                     >
                       <Loader2 v-if="mediaUploading" class="h-4 w-4 animate-spin" />
@@ -1927,7 +2034,7 @@ watch(selectedAccountId, () => {
                     {{ accountInitial }}
                   </div>
                   <div>
-                    <p class="font-extrabold">{{ selectedAccount?.displayName || 'Facebook profile' }}</p>
+                    <p class="font-extrabold">{{ selectedAccount?.displayName || `${selectedPlatform.label} profile` }}</p>
                     <p class="text-xs text-zinc-500">Preview bài đăng · {{ characterCount }}/5000 ký tự</p>
                   </div>
                 </div>
@@ -2201,7 +2308,7 @@ watch(selectedAccountId, () => {
                 <p class="mt-2 text-xs text-zinc-500">{{ formatDate(log.createdAt) }}</p>
               </article>
               <p v-if="!recentPostRuns.length" class="rounded-lg border border-dashed border-zinc-300 p-4 text-sm text-zinc-500 dark:border-zinc-700">
-                Chưa có kết quả đăng Facebook.
+                Chưa có kết quả đăng {{ selectedPlatform.label }}.
               </p>
             </div>
           </div>
@@ -2223,7 +2330,7 @@ watch(selectedAccountId, () => {
               </span>
             </div>
             <p class="mt-1 text-sm text-zinc-500">
-              Ẩn mặc định để không làm rối màn hình vận hành. Mở khi cần kiểm tra lỗi automation, ADB hoặc Facebook UI.
+              Ẩn mặc định để không làm rối màn hình vận hành. Mở khi cần kiểm tra lỗi automation, ADB hoặc {{ selectedPlatform.label }} UI.
             </p>
           </div>
         </div>
