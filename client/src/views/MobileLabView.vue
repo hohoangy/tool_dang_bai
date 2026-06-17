@@ -34,6 +34,7 @@ const technicalLogsOpen = ref(false);
 const workflowStage = ref('idle');
 const publishMode = ref('direct');
 const facebookPostType = ref('imageText');
+const instagramPostType = ref('feed');
 const composerTab = ref('compose');
 const selectedQueueAccountIds = ref([]);
 const queueItems = ref([]);
@@ -59,10 +60,10 @@ const platforms = [
   },
   {
     id: 'instagram',
-    label: 'Instagram Feed',
+    label: 'Instagram',
     packageName: 'com.instagram.android',
     status: 'ready',
-    description: 'Dang anh va caption len trang ca nhan/feed qua Instagram app trong LDPlayer.'
+    description: 'Dang Feed, Reels hoac Tin qua Instagram app trong LDPlayer.'
   }
 ];
 
@@ -121,6 +122,27 @@ const composerTabs = [
   { id: 'queue', label: 'Tiến trình' }
 ];
 
+const instagramPostModes = [
+  {
+    id: 'feed',
+    label: 'Feed',
+    description: 'Đăng ảnh và caption lên trang cá nhân',
+    disabled: false
+  },
+  {
+    id: 'reels',
+    label: 'Reels',
+    description: 'Đăng video dọc',
+    disabled: true
+  },
+  {
+    id: 'story',
+    label: 'Tin',
+    description: 'Đăng story 24 giờ',
+    disabled: true
+  }
+];
+
 const emojiGroups = [
   {
     label: 'Da dung gan day',
@@ -160,6 +182,7 @@ const selectedQueueAccounts = computed(() => facebookAccounts.value.filter((acco
 const platformMaxPhotos = computed(() => selectedPlatformId.value === 'instagram' ? 1 : maxPhotos);
 const platformRequiresPhoto = computed(() => selectedPlatformId.value === 'instagram');
 const isFacebookVideoMode = computed(() => selectedPlatformId.value === 'facebook' && facebookPostType.value === 'video');
+const selectedInstagramPostMode = computed(() => instagramPostModes.find((mode) => mode.id === instagramPostType.value) || instagramPostModes[0]);
 const uploadedPhotoCount = computed(() => post.media.filter((item) => item.type === 'photo' && item.uploadedUrl).length);
 const uploadedVideoCount = computed(() => post.media.filter((item) => item.type === 'video' && item.uploadedUrl).length);
 const selectedVideo = computed(() => post.media.find((item) => item.type === 'video') || null);
@@ -539,6 +562,8 @@ const professionalKpis = computed(() => [
       : post.media.length ? `${uploadedPhotoCount.value}/${post.media.length}` : 'Text',
     detail: isFacebookVideoMode.value
       ? 'Đăng video Facebook'
+      : selectedPlatformId.value === 'instagram'
+        ? `${selectedInstagramPostMode.value.label} Instagram`
       : post.media.length ? 'Ảnh đã sẵn sàng để gắn vào bài' : 'Bài đăng dạng text',
     tone: mediaReady.value ? 'ok' : 'warn'
   },
@@ -1219,6 +1244,12 @@ function setFacebookPostType(type) {
   facebookPostType.value = type;
 }
 
+function setInstagramPostType(type) {
+  const mode = instagramPostModes.find((item) => item.id === type);
+  if (!mode || mode.disabled || instagramPostType.value === type) return;
+  instagramPostType.value = type;
+}
+
 async function addMedia(event) {
   const files = Array.from(event.target.files || []);
   event.target.value = '';
@@ -1456,6 +1487,9 @@ watch(selectedPlatformId, async () => {
       URL.revokeObjectURL(item.url);
       return false;
     });
+  }
+  if (selectedPlatformId.value !== 'instagram') {
+    instagramPostType.value = 'feed';
   }
   const preferred = findPreferredAccount(accounts.value);
   selectedAccountId.value = preferred?._id || '';
@@ -2104,6 +2138,29 @@ watch(selectedPlatformId, async () => {
                     >
                       <Video class="h-3.5 w-3.5" />
                       Video
+                    </button>
+                  </div>
+                </div>
+                <div v-else-if="selectedPlatformId === 'instagram'" class="flex flex-wrap items-center border-b border-zinc-200 pb-3 dark:border-zinc-700">
+                  <div class="inline-flex rounded-full border border-zinc-200 bg-zinc-100 p-1 dark:border-zinc-700 dark:bg-zinc-950">
+                    <button
+                      v-for="mode in instagramPostModes"
+                      :key="mode.id"
+                      :class="[
+                        'inline-flex h-8 items-center gap-2 rounded-full px-3 text-xs font-extrabold transition',
+                        instagramPostType === mode.id ? 'bg-white text-zinc-950 shadow-sm dark:bg-zinc-800 dark:text-white' : 'text-zinc-500 hover:text-zinc-950 dark:hover:text-white',
+                        mode.disabled ? 'cursor-not-allowed opacity-45 hover:text-zinc-500 dark:hover:text-zinc-500' : ''
+                      ]"
+                      type="button"
+                      :disabled="posting || queueRunning || mode.disabled"
+                      :title="mode.disabled ? `${mode.label} chưa bật automation` : mode.description"
+                      @click="setInstagramPostType(mode.id)"
+                    >
+                      <Image v-if="mode.id === 'feed'" class="h-3.5 w-3.5" />
+                      <Video v-else-if="mode.id === 'reels'" class="h-3.5 w-3.5" />
+                      <Clock3 v-else class="h-3.5 w-3.5" />
+                      {{ mode.label }}
+                      <span v-if="mode.disabled" class="hidden text-[10px] font-black uppercase tracking-wide sm:inline">Sắp có</span>
                     </button>
                   </div>
                 </div>
