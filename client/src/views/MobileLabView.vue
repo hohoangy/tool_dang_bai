@@ -34,7 +34,7 @@ const technicalLogsOpen = ref(false);
 const workflowStage = ref('idle');
 const publishMode = ref('direct');
 const facebookPostType = ref('imageText');
-const instagramPostType = ref('feed');
+const instagramPostType = ref('singlePhoto');
 const composerTab = ref('compose');
 const selectedQueueAccountIds = ref([]);
 const queueItems = ref([]);
@@ -54,6 +54,8 @@ const platforms = [
   {
     id: 'facebook',
     label: 'Facebook',
+    iconLabel: 'f',
+    iconClass: 'bg-[#1877F2] text-white',
     packageName: 'com.facebook.katana',
     status: 'ready',
     description: 'Mo composer, nhap text, gan anh va dang truc tiep bang Facebook app trong LDPlayer.'
@@ -61,6 +63,8 @@ const platforms = [
   {
     id: 'instagram',
     label: 'Instagram',
+    iconLabel: '◎',
+    iconClass: 'bg-gradient-to-br from-[#833AB4] via-[#E1306C] to-[#FCAF45] text-white',
     packageName: 'com.instagram.android',
     status: 'ready',
     description: 'Dang Feed, Reels hoac Tin qua Instagram app trong LDPlayer.'
@@ -124,21 +128,21 @@ const composerTabs = [
 
 const instagramPostModes = [
   {
-    id: 'feed',
-    label: 'Feed',
-    description: 'Đăng ảnh và caption lên trang cá nhân',
+    id: 'singlePhoto',
+    label: 'Ảnh đơn',
+    description: 'Đăng 1 ảnh kèm caption lên Feed',
     disabled: false
   },
   {
-    id: 'reels',
-    label: 'Reels',
-    description: 'Đăng video dọc',
+    id: 'carousel',
+    label: 'Album',
+    description: 'Đăng nhiều ảnh dạng carousel',
     disabled: true
   },
   {
-    id: 'story',
-    label: 'Tin',
-    description: 'Đăng story 24 giờ',
+    id: 'feedVideo',
+    label: 'Video Feed',
+    description: 'Đăng video lên Feed/profile',
     disabled: true
   }
 ];
@@ -260,13 +264,21 @@ const scheduleQuickOptions = [
   { label: 'Sáng mai', preset: 'tomorrow-morning' }
 ];
 const queueReady = computed(() => !isBulkMode.value || selectedQueueAccounts.value.length > 0);
+const captionRequired = computed(() => selectedPlatformId.value !== 'instagram');
+const contentReady = computed(() => characterCount.value <= 5000 && (!captionRequired.value || characterCount.value > 0));
+const submitWaitMs = computed(() => {
+  if (isReviewMode.value) return 0;
+  if (isFacebookVideoMode.value) return 90_000;
+  if (selectedPlatformId.value === 'instagram') return 25_000;
+  return 8_000 + (uploadedPhotoCount.value * 5_000);
+});
 const canRunWorkflow = computed(() => selectedPlatform.value.status === 'ready'
   && canUseRemote.value
   && (!requiresFacebookSession.value || facebookAppReady.value)
   && queueReady.value
   && scheduleReady.value
   && mediaReady.value
-  && Boolean(finalPostText.value.trim())
+  && contentReady.value
   && !posting.value
   && !queueRunning.value
   && !mediaUploading.value);
@@ -329,9 +341,11 @@ const preflightItems = computed(() => [
   },
   {
     label: 'Nội dung',
-    detail: `${characterCount.value}/5000 ký tự`,
-    ok: characterCount.value > 0 && characterCount.value <= 5000,
-    blocking: true
+    detail: characterCount.value
+      ? `${characterCount.value}/5000 ký tự`
+      : (captionRequired.value ? 'Cần nhập caption' : 'Không có caption, vẫn có thể đăng'),
+    ok: contentReady.value,
+    blocking: captionRequired.value
   },
   {
     label: 'Media',
@@ -355,9 +369,20 @@ const blockedPreflightItems = computed(() => preflightItems.value.filter((item) 
 const readyPreflightCount = computed(() => preflightItems.value.filter((item) => item.ok).length);
 const readinessScore = computed(() => Math.round((readyPreflightCount.value / Math.max(preflightItems.value.length, 1)) * 100));
 const readinessSummary = computed(() => {
-  if (!blockedPreflightItems.value.length && characterCount.value > 0) return 'Đủ điều kiện chạy automation';
-  if (!characterCount.value) return 'Cần nhập nội dung trước khi đăng';
+  if (!blockedPreflightItems.value.length && contentReady.value) {
+    return characterCount.value ? 'Đủ điều kiện chạy automation' : 'Đủ điều kiện, caption đang trống';
+  }
+  if (!contentReady.value && captionRequired.value) return 'Cần nhập nội dung trước khi đăng';
   return `Cần xử lý: ${blockedPreflightItems.value.map((item) => item.label).join(', ')}`;
+});
+const readinessTone = computed(() => {
+  if (['preflight', 'posting'].includes(workflowStage.value)) return 'run';
+  return blockedPreflightItems.value.length || !contentReady.value ? 'warn' : 'ok';
+});
+const readinessLabel = computed(() => {
+  if (readinessTone.value === 'run') return workflowLabel.value;
+  if (blockedPreflightItems.value.length || !contentReady.value) return 'Cần chuẩn bị';
+  return 'Sẵn sàng đăng';
 });
 const contentQualityScore = computed(() => {
   let score = 0;
@@ -386,6 +411,8 @@ const operationalPostRunActions = new Set([
   'instagram_post_finished',
   'instagram_post_submit_verified',
   'instagram_post_submit_unverified',
+  'instagram_post_submit_waiting',
+  'instagram_post_caption_missing_before_submit',
   'instagram_post_state_machine_pending',
   'instagram_post_state',
   'instagram_post_failed'
@@ -456,7 +483,15 @@ const postRunActionLabels = {
   },
   instagram_post_submit_unverified: {
     title: 'Chưa xác minh được bài Instagram',
-    detail: 'Đã bấm Share nhưng chưa thấy tín hiệu xác nhận.'
+    detail: 'Đã bấm Share nhưng Instagram chưa rời màn đăng hoặc chưa trả tín hiệu đã chia sẻ.'
+  },
+  instagram_post_submit_waiting: {
+    title: 'Instagram đang xử lý',
+    detail: 'Instagram đang tải/chia sẻ bài sau khi bấm Share.'
+  },
+  instagram_post_caption_missing_before_submit: {
+    title: 'Chưa nhập được caption',
+    detail: 'Instagram đã rời màn soạn trước khi xác minh emoji/hashtag, tool đã dừng để tránh đăng thiếu nội dung.'
   },
   instagram_post_state_machine_pending: {
     title: 'Chưa tới được màn đăng Feed',
@@ -563,7 +598,7 @@ const professionalKpis = computed(() => [
     detail: isFacebookVideoMode.value
       ? 'Đăng video Facebook'
       : selectedPlatformId.value === 'instagram'
-        ? `${selectedInstagramPostMode.value.label} Instagram`
+        ? `Instagram Feed - ${selectedInstagramPostMode.value.label}`
       : post.media.length ? 'Ảnh đã sẵn sàng để gắn vào bài' : 'Bài đăng dạng text',
     tone: mediaReady.value ? 'ok' : 'warn'
   },
@@ -580,11 +615,18 @@ const professionalKpis = computed(() => [
 ]);
 const professionalActions = computed(() => {
   const actions = [];
-  if (!previewCaption.value) {
+  if (!previewCaption.value && captionRequired.value) {
     actions.push({
       title: 'Hoàn thiện nội dung',
       detail: 'Nhập caption chính để kích hoạt workflow đăng.',
       tone: 'required'
+    });
+  }
+  if (!previewCaption.value && !captionRequired.value) {
+    actions.push({
+      title: 'Caption đang trống',
+      detail: 'Instagram vẫn đăng được ảnh không caption, nhưng thêm caption sẽ tự nhiên hơn.',
+      tone: 'optional'
     });
   }
   if (previewCaption.value.length > 0 && previewCaption.value.length < 20) {
@@ -757,12 +799,16 @@ async function remoteOpenApp() {
       });
       facebookSessionAccountId.value = '';
     }
-    await http.post(`/mobile/accounts/${nextAccount._id}/remote/open-app`, {
+    const { data } = await http.post(`/mobile/accounts/${nextAccount._id}/remote/open-app`, {
       appPackage: nextAccount.metadata?.appPackage || selectedPlatform.value.packageName
     });
-    facebookSessionAccountId.value = nextAccount._id;
-    await syncSelectedAccountRuntimeStatus();
-    ui.notify(shouldClosePrevious ? `Đã chuyển sang ${nextAccount.displayName}.` : `Đã mở ${selectedPlatform.value.label}.`);
+    const runtimeReady = await syncSelectedAccountRuntimeStatus({ force: true });
+    if (runtimeReady) {
+      ui.notify(shouldClosePrevious ? `Đã chuyển sang ${nextAccount.displayName}.` : `Đã mở ${selectedPlatform.value.label}.`);
+    } else {
+      facebookSessionAccountId.value = '';
+      ui.notify(data.result?.readiness?.error || `${selectedPlatform.value.label} chưa ổn định, thử mở lại.`, 'error');
+    }
     if (showDeviceTools.value) await refreshScreenshot();
   } catch (error) {
     facebookSessionAccountId.value = '';
@@ -773,9 +819,9 @@ async function remoteOpenApp() {
   }
 }
 
-async function syncSelectedAccountRuntimeStatus() {
+async function syncSelectedAccountRuntimeStatus(options = {}) {
   const account = selectedAccount.value;
-  if (!account || runtimeStatusChecking.value || posting.value || queueRunning.value) return;
+  if (!account || (runtimeStatusChecking.value && !options.force) || posting.value || queueRunning.value) return false;
 
   runtimeStatusChecking.value = true;
   try {
@@ -784,12 +830,15 @@ async function syncSelectedAccountRuntimeStatus() {
         appPackage: account.metadata?.appPackage || selectedPlatform.value.packageName
       }
     });
-    if (selectedAccount.value?._id !== account._id) return;
-    facebookSessionAccountId.value = data.status?.deviceReady && data.status?.appReady
+    if (selectedAccount.value?._id !== account._id) return false;
+    const ready = Boolean(data.status?.deviceReady && data.status?.appReady);
+    facebookSessionAccountId.value = ready
       ? account._id
       : '';
+    return ready;
   } catch {
     // Lỗi mạng tạm thời không nên làm thay đổi trạng thái đang hiển thị.
+    return false;
   } finally {
     runtimeStatusChecking.value = false;
   }
@@ -881,7 +930,7 @@ async function runPostWorkflow() {
     workflowStage.value = 'failed';
     return;
   }
-  if (!finalPostText.value.trim()) {
+  if (captionRequired.value && !finalPostText.value.trim()) {
     ui.notify('Thieu noi dung bai dang.', 'error');
     workflowStage.value = 'failed';
     return;
@@ -906,13 +955,10 @@ async function runPostWorkflow() {
   try {
     workflowStage.value = 'preflight';
     workflowStage.value = 'posting';
-    const submitWaitMs = isReviewMode.value
-      ? 0
-      : isFacebookVideoMode.value ? 90_000 : 8_000 + (uploadedPhotoCount.value * 5_000);
     const { data } = await submitFacebookForAccount(
       selectedAccount.value,
       !isReviewMode.value,
-      submitWaitMs
+      submitWaitMs.value
     );
     postResult.value = data.result;
     screenshot.value = data.result.screenshot || screenshot.value;
@@ -974,7 +1020,7 @@ async function runQueueWorkflow() {
 
       try {
         updateQueueItem(account._id, { status: 'running', message: 'Đang kiểm tra LDPlayer và ADB' });
-        const queueSubmitWaitMs = isFacebookVideoMode.value ? 90_000 : 8_000 + (uploadedPhotoCount.value * 5_000);
+        const queueSubmitWaitMs = submitWaitMs.value;
         updateQueueItem(account._id, {
           status: 'running',
           message: isFacebookVideoMode.value
@@ -1489,7 +1535,7 @@ watch(selectedPlatformId, async () => {
     });
   }
   if (selectedPlatformId.value !== 'instagram') {
-    instagramPostType.value = 'feed';
+    instagramPostType.value = 'singlePhoto';
   }
   const preferred = findPreferredAccount(accounts.value);
   selectedAccountId.value = preferred?._id || '';
@@ -1525,6 +1571,14 @@ watch(selectedPlatformId, async () => {
             :disabled="posting || queueRunning"
             @click="selectedPlatformId = platform.id"
           >
+            <span
+              :class="[
+                'mr-3 grid h-7 w-7 shrink-0 place-items-center rounded-xl text-sm font-black shadow-sm ring-1 ring-white/10',
+                platform.iconClass
+              ]"
+            >
+              {{ platform.iconLabel }}
+            </span>
             <span>{{ platform.label }}</span>
           </button>
           </div>
@@ -2156,9 +2210,9 @@ watch(selectedPlatformId, async () => {
                       :title="mode.disabled ? `${mode.label} chưa bật automation` : mode.description"
                       @click="setInstagramPostType(mode.id)"
                     >
-                      <Image v-if="mode.id === 'feed'" class="h-3.5 w-3.5" />
-                      <Video v-else-if="mode.id === 'reels'" class="h-3.5 w-3.5" />
-                      <Clock3 v-else class="h-3.5 w-3.5" />
+                      <Image v-if="mode.id === 'singlePhoto'" class="h-3.5 w-3.5" />
+                      <GripVertical v-else-if="mode.id === 'carousel'" class="h-3.5 w-3.5" />
+                      <Video v-else class="h-3.5 w-3.5" />
                       {{ mode.label }}
                       <span v-if="mode.disabled" class="hidden text-[10px] font-black uppercase tracking-wide sm:inline">Sắp có</span>
                     </button>
@@ -2266,7 +2320,7 @@ watch(selectedPlatformId, async () => {
                     </div>
                   </div>
                   <button
-                    v-if="!post.media.length && (isFacebookVideoMode || selectedPlatformId === 'instagram')"
+                    v-if="!post.media.length && isFacebookVideoMode"
                     class="mt-3 flex w-full items-center justify-center gap-3 rounded-xl border border-dashed border-zinc-300 px-4 py-5 text-left transition hover:border-emerald-400 hover:bg-emerald-500/5 dark:border-zinc-700"
                     type="button"
                     :disabled="mediaUploading"
@@ -2377,19 +2431,19 @@ watch(selectedPlatformId, async () => {
           <div
             :class="[
               'overflow-hidden rounded-2xl border shadow-sm',
-              workflowTone === 'ok' ? 'border-emerald-200 bg-emerald-50/70 dark:border-emerald-900/60 dark:bg-emerald-950/10' : workflowTone === 'warn' ? 'border-amber-200 bg-amber-50/70 dark:border-amber-900/60 dark:bg-amber-950/10' : workflowTone === 'run' ? 'border-sky-200 bg-sky-50/70 dark:border-sky-900/60 dark:bg-sky-950/10' : 'border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950/20'
+              readinessTone === 'ok' ? 'border-emerald-200 bg-emerald-50/70 dark:border-emerald-900/60 dark:bg-emerald-950/10' : readinessTone === 'warn' ? 'border-amber-200 bg-amber-50/70 dark:border-amber-900/60 dark:bg-amber-950/10' : readinessTone === 'run' ? 'border-sky-200 bg-sky-50/70 dark:border-sky-900/60 dark:bg-sky-950/10' : 'border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950/20'
             ]"
           >
             <div class="border-b border-black/5 p-4 dark:border-white/10">
               <div class="flex items-center justify-between gap-3">
                 <div>
                   <p class="text-xs font-extrabold uppercase tracking-wide text-zinc-500">Publish readiness</p>
-                  <h3 class="mt-1 text-xl font-black">{{ workflowLabel }}</h3>
+                  <h3 class="mt-1 text-xl font-black">{{ readinessLabel }}</h3>
                 </div>
                 <span
                   :class="[
                     'shrink-0 rounded-full px-3 py-1 text-xs font-extrabold uppercase',
-                    workflowTone === 'ok' ? 'bg-emerald-100 text-emerald-700' : workflowTone === 'warn' ? 'bg-amber-100 text-amber-700' : workflowTone === 'run' ? 'bg-sky-100 text-sky-700' : 'bg-zinc-100 text-zinc-700'
+                    readinessTone === 'ok' ? 'bg-emerald-100 text-emerald-700' : readinessTone === 'warn' ? 'bg-amber-100 text-amber-700' : readinessTone === 'run' ? 'bg-sky-100 text-sky-700' : 'bg-zinc-100 text-zinc-700'
                   ]"
                 >
                   {{ readinessScore }}%
