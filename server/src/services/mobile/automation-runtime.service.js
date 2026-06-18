@@ -10,7 +10,10 @@ import { getLocalUploadPath } from '../../utils/media-file.js';
 
 const execFileAsync = promisify(execFile);
 const localImageHashCache = new Map();
+const instagramPermissionCache = new Map();
+const directUiDumpSupport = new Map();
 const facebookMediaRoot = '/sdcard/Pictures/SocialPilot';
+const instagramPermissionCacheTtlMs = 10 * 60 * 1000;
 
 const defaultPackages = {
   facebook: 'com.facebook.katana',
@@ -127,8 +130,11 @@ const instagramHomeLabels = ['Instagram Home Feed', 'Home', 'Create'];
 const instagramPreviewLabels = ['Preview'];
 const instagramInfoDialogLabels = ['Sharing posts'];
 const instagramDismissLabels = ['OK'];
+const instagramResolverFeedLabels = ['Feed'];
+const instagramResolverAlwaysLabels = ['ALWAYS', 'Always', 'LUÔN LUÔN', 'Luôn luôn', 'Luon luon'];
+const instagramResolverOnceLabels = ['JUST ONCE', 'Just once', 'CHỈ MỘT LẦN', 'Chỉ một lần', 'Chi mot lan'];
+const instagramResolverDialogLabels = ['Use a different app', 'Sử dụng ứng dụng khác', 'Su dung ung dung khac'];
 const instagramFeedShareActivity = 'com.instagram.share.handleractivity.ShareHandlerActivity';
-const instagramReelShareActivity = 'com.instagram.share.handleractivity.ReelShareHandlerActivity';
 
 const defaultAdbHost = '127.0.0.1:5555';
 
@@ -138,6 +144,12 @@ function delay(ms) {
 
 function postStepDelay(multiplier = 1) {
   return Math.round(Math.max(140, Math.min(env.mobileAutomation.stepDelayMs, 260)) * multiplier);
+}
+
+function actionDelay(action = '') {
+  return /(?:facebook|instagram)_post/.test(action)
+    ? postStepDelay()
+    : env.mobileAutomation.stepDelayMs;
 }
 
 function createPerfTimer() {
@@ -212,7 +224,7 @@ async function runCommand(command, args, metadata = {}) {
     const result = await execFileAsync(executable, args, {
       windowsHide: true,
       timeout: metadata.timeoutMs || 60_000,
-      maxBuffer: 1024 * 1024
+      maxBuffer: metadata.maxBuffer || 1024 * 1024
     });
     return {
       ok: true,
@@ -1253,6 +1265,7 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
 }
 
 export async function publishInstagramPostViaMobile(account, userId, payload = {}) {
+  const perf = createPerfTimer();
   let target = getDeviceTarget(account);
   const config = buildPostConfig(account, {
     appPackage: payload.appPackage || defaultPackages.instagram,
@@ -1292,11 +1305,15 @@ export async function publishInstagramPostViaMobile(account, userId, payload = {
   }
   steps.push(device);
   if (!device.ok || String(device.stdout || '').trim() !== 'device') throw new Error(device.error || device.stderr || 'Device is not ready.');
+  perf.mark('adb_ready', { target });
 
-  const orientation = await ensurePortraitOrientation(account, userId, target);
+  const [orientation, permissions] = await Promise.all([
+    ensurePortraitOrientation(account, userId, target),
+    grantInstagramRuntimePermissions(account, userId, target, config.appPackage)
+  ]);
   steps.push(orientation);
-  const permissions = await grantInstagramRuntimePermissions(account, userId, target, config.appPackage);
   steps.push(...permissions);
+  perf.mark('device_prepared', { permissionStepCount: permissions.length });
 
   const preparedImages = await prepareFacebookImages(account, userId, target, images, {
     cleanup: false,
@@ -1304,12 +1321,21 @@ export async function publishInstagramPostViaMobile(account, userId, payload = {
     skipPermissionGrant: true
   });
   for (const preparedImage of preparedImages) steps.push(...preparedImage.steps);
+  perf.mark('image_prepared', {
+    imageCount: preparedImages.length,
+    cacheHit: preparedImages.every((image) => image.cacheHit)
+  });
 
   const openComposer = await openInstagramComposer(account, userId, target, config, text, preparedImages[0]);
   steps.push(openComposer);
+  perf.mark('composer_opened', { method: openComposer.method || '' });
   await delay(postStepDelay(0.75));
 
   const stateMachine = await runInstagramPostStateMachine(account, userId, target, config, text, steps);
+  perf.mark('state_machine_finished', {
+    finalState: stateMachine.finalState,
+    submitVerified: stateMachine.submitVerified ?? false
+  });
   const submitVerified = stateMachine.submitVerified ?? false;
   const finishedLevel = config.autoSubmit && !submitVerified ? 'warn' : 'info';
   await writeLog(userId, account._id, finishedLevel, 'instagram_post_finished', config.autoSubmit && !submitVerified ? 'Đã bấm Share Instagram nhưng chưa xác nhận app nhận bài.' : (config.autoSubmit ? 'Đã chạy luồng tự đăng Instagram.' : 'Đã mở composer Instagram, chờ kiểm tra/tự bấm share.'), {
@@ -1317,7 +1343,8 @@ export async function publishInstagramPostViaMobile(account, userId, payload = {
     finalState: stateMachine.finalState,
     submitVerified,
     submitReason: stateMachine.submitReason || '',
-    imageCount: preparedImages.length
+    imageCount: preparedImages.length,
+    perf: perf.snapshot()
   });
 
   return {
@@ -1328,7 +1355,8 @@ export async function publishInstagramPostViaMobile(account, userId, payload = {
     submitVerified,
     submitReason: stateMachine.submitReason || '',
     screenshot: stateMachine.screenshot,
-    stepCount: steps.length
+    stepCount: steps.length,
+    perf: perf.snapshot()
   };
 }
 
@@ -1352,23 +1380,12 @@ async function openInstagramComposer(account, userId, target, config, text, imag
     'android.intent.extra.STREAM',
     image.contentUri || `file://${image.remotePath}`
   ];
-  const withText = (args) => text ? [...args, '--es', 'android.intent.extra.TEXT', text] : args;
+  // Instagram xử lý EXTRA_TEXT không ổn định: có phiên bản chỉ giữ emoji
+  // hoặc bỏ hashtag. Chỉ mở media ở đây và nhập caption sau bằng ADB Keyboard.
   const intentAttempts = [
-    {
-      args: [...withText(baseIntentArgs), '-n', `${config.appPackage}/${instagramFeedShareActivity}`],
-      method: 'feed_share_activity_with_text'
-    },
-    {
-      args: [...withText(baseIntentArgs), '-p', config.appPackage],
-      method: 'package_share_with_text'
-    },
     {
       args: [...baseIntentArgs, '-n', `${config.appPackage}/${instagramFeedShareActivity}`],
       method: 'feed_share_activity_media_only'
-    },
-    {
-      args: [...baseIntentArgs, '-n', `${config.appPackage}/${instagramReelShareActivity}`],
-      method: 'reel_share_activity_media_only'
     },
     {
       args: [...baseIntentArgs, '-p', config.appPackage],
@@ -1404,6 +1421,9 @@ async function openInstagramComposer(account, userId, target, config, text, imag
 
     bootstrap = await waitForInstagramComposerBootstrap(account, userId, target, config, text, method);
     if (bootstrap.ok) break;
+    // Activity đã nhận intent thì không mở lại bằng phương thức khác. Việc
+    // relaunch khi UI chỉ đang chậm có thể tạo nhiều composer cho cùng một bài.
+    break;
   }
 
   const opened = Boolean(shareIntent?.ok && bootstrap?.ok);
@@ -1422,12 +1442,30 @@ async function waitForInstagramComposerBootstrap(account, userId, target, config
   let lastState = null;
   let lastForeground = null;
   while (Date.now() - startedAt < timeoutMs) {
-    await delay(900);
-    const nodes = await dumpVisibleNodes(target);
+    await delay(550);
+    const [nodes, foreground] = await Promise.all([
+      dumpVisibleNodes(target),
+      getForegroundAndroidPackage(target)
+    ]);
     let state = detectInstagramState(nodes, text);
-    const foreground = await getForegroundAndroidPackage(target);
     lastState = state;
     lastForeground = foreground;
+
+    if (state.name === 'share_resolver') {
+      const resolved = await selectInstagramFeedAlways(account, userId, target, nodes);
+      if (!resolved.ok) {
+        return {
+          ok: false,
+          method,
+          error: resolved.error,
+          state,
+          foreground,
+          elapsedMs: Date.now() - startedAt
+        };
+      }
+      await delay(postStepDelay(1.5));
+      continue;
+    }
 
     if (['unknown', 'home'].includes(state.name) && foreground.packageName === config.appPackage && /MediaCaptureActivity/i.test(foreground.activityName || '')) {
       state = { ...state, name: 'next', reason: `activity:${foreground.activityName}`, active: foreground };
@@ -1462,6 +1500,7 @@ async function runInstagramPostStateMachine(account, userId, target, config, tex
   let finalState = 'unknown';
   let captionEntered = false;
   let captionAttempts = 0;
+  let lastLoggedState = '';
   const requiresCaption = Boolean(text.trim());
 
   for (let attempt = 1; attempt <= 18; attempt += 1) {
@@ -1474,16 +1513,28 @@ async function runInstagramPostStateMachine(account, userId, target, config, tex
       }
     }
     finalState = state.name;
-    await writeLog(userId, account._id, 'info', 'instagram_post_state', `Instagram state: ${state.name}.`, {
-      attempt,
-      reason: state.reason,
-      hasTargetText: state.hasTargetText
-    });
+    const stateSignature = `${state.name}:${state.reason}:${state.hasTargetText}`;
+    if (stateSignature !== lastLoggedState) {
+      await writeLog(userId, account._id, 'info', 'instagram_post_state', `Instagram state: ${state.name}.`, {
+        attempt,
+        reason: state.reason,
+        hasTargetText: state.hasTargetText
+      });
+      lastLoggedState = stateSignature;
+    }
 
     if (state.name === 'info_dialog') {
-      const ok = await tapTextOrPoint(account, userId, target, instagramDismissLabels, { x: 800, y: 716 }, 'instagram_post_dismiss_info_dialog', { exact: true });
+      const ok = await tapTextOrPoint(account, userId, target, instagramDismissLabels, { x: 800, y: 716 }, 'instagram_post_dismiss_info_dialog', { exact: true, nodes });
       steps.push(ok);
       await delay(postStepDelay());
+      continue;
+    }
+
+    if (state.name === 'share_resolver') {
+      const resolved = await selectInstagramFeedAlways(account, userId, target, nodes);
+      steps.push(...resolved.steps);
+      if (!resolved.ok) throw new Error(resolved.error);
+      await delay(postStepDelay(1.5));
       continue;
     }
 
@@ -1514,7 +1565,7 @@ async function runInstagramPostStateMachine(account, userId, target, config, tex
     }
 
     if (state.name === 'next') {
-      const nextMatch = await findVisibleTextBounds(target, instagramNextLabels, { exact: true, preferBottomRight: true });
+      const nextMatch = findNodeInNodes(nodes, instagramNextLabels, { exact: true, preferBottomRight: true });
       if (!nextMatch && requiresCaption) {
         await writeLog(userId, account._id, 'warn', 'instagram_post_next_text_missing', 'Instagram đang ở màn tạo nội dung nhưng không thấy nút Next; không bấm tọa độ để tránh đăng thiếu caption.', {
           state,
@@ -1523,9 +1574,9 @@ async function runInstagramPostStateMachine(account, userId, target, config, tex
         await delay(postStepDelay(1.25));
         continue;
       }
-      const next = await tapTextOrPoint(account, userId, target, instagramNextLabels, getInstagramBottomRightFallbackPoint(nodes), 'instagram_post_tap_next', { exact: true, preferBottomRight: true });
+      const next = await tapTextOrPoint(account, userId, target, instagramNextLabels, getInstagramBottomRightFallbackPoint(nodes), 'instagram_post_tap_next', { exact: true, preferBottomRight: true, nodes });
       steps.push(next);
-      await delay(postStepDelay(0.8));
+      await waitForInstagramState(target, text, ['caption', 'info_dialog', 'blocked'], 6_000);
       continue;
     }
 
@@ -1653,15 +1704,16 @@ async function enterInstagramCaption(account, userId, target, text, nodes = []) 
       point
     });
   } else {
-    const captionTap = await tapTextOrPoint(account, userId, target, instagramCaptionLabels, getInstagramCaptionFallbackPoint(nodes), 'instagram_post_tap_caption');
+    const captionTap = await tapTextOrPoint(account, userId, target, instagramCaptionLabels, getInstagramCaptionFallbackPoint(nodes), 'instagram_post_tap_caption', { nodes });
     steps.push(captionTap);
   }
   await delay(postStepDelay(0.7));
 
-  let input = await replaceFocusedText(target, text);
+  const inputText = prepareInstagramCaptionInput(text);
+  let input = await replaceFocusedText(target, inputText);
   if (!input.ok) {
     await writeLog(userId, account._id, 'warn', 'instagram_post_replace_caption_unavailable', 'Không replace được caption bằng ADB Keyboard, chuyển sang paste/input.', input);
-    input = await inputDeviceText(target, text);
+    input = await inputDeviceText(target, inputText);
   }
   steps.push(input);
   await writeLog(userId, account._id, input.ok ? 'info' : 'error', 'instagram_post_input_caption', input.ok ? 'Đã nhập caption Instagram.' : 'Không nhập được caption Instagram.', input);
@@ -1669,12 +1721,21 @@ async function enterInstagramCaption(account, userId, target, text, nodes = []) 
 
   await delay(postStepDelay(0.75));
   const verifyNodes = await dumpVisibleNodes(target);
-  const hasTargetText = screenHasText(verifyNodes, text);
+  const captionVerification = verifyCompleteCaption(verifyNodes, text);
+  const hasTargetText = captionVerification.ok;
   await writeLog(userId, account._id, hasTargetText ? 'info' : 'warn', 'instagram_post_verify_caption', hasTargetText ? 'Đã xác nhận caption xuất hiện trong Instagram.' : 'Chưa xác nhận được caption trong Instagram sau khi nhập.', {
     method: input.method,
-    textLength: text.length
+    textLength: text.length,
+    verification: captionVerification
   });
   return { steps, hasTargetText };
+}
+
+function prepareInstagramCaptionInput(text) {
+  const value = cleanClipboardText(text).trimEnd();
+  // Một delimiter sau hashtag cuối sẽ đóng gợi ý autocomplete của Instagram.
+  // Instagram tự bỏ khoảng trắng cuối khi lưu caption.
+  return /#[\p{L}\p{N}_]+$/u.test(value) ? `${value} ` : value;
 }
 
 function getInstagramCaptionFallbackPoint(nodes = []) {
@@ -1734,11 +1795,60 @@ function findInstagramShareButton(nodes = []) {
   return findNodeInNodes(nodes, instagramShareLabels, { exact: true, preferBottomRight: true });
 }
 
+async function selectInstagramFeedAlways(account, userId, target, nodes = []) {
+  const steps = [];
+  let currentNodes = nodes;
+  let alwaysNode = findNodeInNodes(currentNodes, instagramResolverAlwaysLabels, { exact: true, preferBottomRight: true });
+
+  if (!alwaysNode) {
+    const feedNode = findNodeInNodes(currentNodes, instagramResolverFeedLabels, { exact: true });
+    if (feedNode) {
+      const feedPoint = {
+        x: Math.round((feedNode.left + feedNode.right) / 2),
+        y: Math.round((feedNode.top + feedNode.bottom) / 2)
+      };
+      const feed = await tapAndLog(userId, account._id, target, 'instagram_post_choose_feed', feedPoint);
+      steps.push(feed);
+      await delay(postStepDelay());
+      currentNodes = await dumpVisibleNodes(target);
+      alwaysNode = findNodeInNodes(currentNodes, instagramResolverAlwaysLabels, { exact: true, preferBottomRight: true });
+    }
+  }
+
+  if (!alwaysNode) {
+    await writeLog(userId, account._id, 'error', 'instagram_post_share_resolver_always_missing', 'Hộp chọn ứng dụng xuất hiện nhưng không tìm thấy nút ALWAYS.', {
+      labels: currentNodes.map((node) => node.text || node.desc).filter(Boolean)
+    });
+    return {
+      ok: false,
+      error: 'Không tìm thấy nút ALWAYS trong hộp chọn Instagram.',
+      steps
+    };
+  }
+
+  const point = {
+    x: Math.round((alwaysNode.left + alwaysNode.right) / 2),
+    y: Math.round((alwaysNode.top + alwaysNode.bottom) / 2)
+  };
+  const always = await tapAndLog(userId, account._id, target, 'instagram_post_choose_feed_always', point);
+  steps.push(always);
+  await writeLog(userId, account._id, 'info', 'instagram_post_share_resolver_saved', 'Đã chọn Instagram Feed và ALWAYS để Android không hỏi lại.', {
+    bounds: alwaysNode,
+    point
+  });
+  return { ok: true, steps };
+}
+
 function detectInstagramState(nodes, text) {
   if (!nodes.length) return { name: 'unknown', reason: 'no_uiautomator_nodes', hasTargetText: false };
-  const hasTargetText = screenHasText(nodes, text);
+  const hasTargetText = verifyCompleteCaption(nodes, text).ok;
   if (hasVisibleProgressOnly(nodes)) return { name: 'loading', reason: 'progress_only', hasTargetText };
   if (findNodeInNodes(nodes, instagramBlockedLabels)) return { name: 'blocked', reason: 'login_or_checkpoint', hasTargetText };
+  const hasResolverAction = findNodeInNodes(nodes, instagramResolverAlwaysLabels, { exact: true })
+    || findNodeInNodes(nodes, instagramResolverOnceLabels, { exact: true });
+  const hasResolverContext = findNodeInNodes(nodes, instagramResolverDialogLabels)
+    || findNodeInNodes(nodes, instagramResolverFeedLabels, { exact: true });
+  if (hasResolverAction && hasResolverContext) return { name: 'share_resolver', reason: 'android_share_target_resolver', hasTargetText };
   if (findNodeInNodes(nodes, instagramInfoDialogLabels)) return { name: 'info_dialog', reason: 'instagram_info_dialog', hasTargetText };
   if (findNodeInNodes(nodes, instagramPreviewLabels, { exact: true }) && !findInstagramShareButton(nodes)) return { name: 'preview', reason: 'preview_visible', hasTargetText };
   if (findNodeInNodes(nodes, instagramSharedConfirmationLabels)) return { name: 'submitted', reason: 'share_confirmation_visible', hasTargetText };
@@ -1752,26 +1862,48 @@ function detectInstagramState(nodes, text) {
   return { name: 'unknown', reason: 'no_known_labels', hasTargetText };
 }
 
+async function waitForInstagramState(target, text, expectedStates, timeoutMs = 5_000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    await delay(450);
+    const nodes = await dumpVisibleNodes(target);
+    const state = detectInstagramState(nodes, text);
+    if (expectedStates.includes(state.name)) return { state, nodes };
+  }
+  return null;
+}
+
 function hasVisibleProgressOnly(nodes = []) {
   const actionableNodes = nodes.filter((node) => normalizeSearchText(`${node.text} ${node.desc}`));
   return nodes.some((node) => /ProgressBar/i.test(node.className || '')) && actionableNodes.length === 0;
 }
 
 async function grantInstagramRuntimePermissions(account, userId, target, packageName) {
+  const cacheKey = `${target}:${packageName}`;
+  const cachedAt = instagramPermissionCache.get(cacheKey) || 0;
+  if (Date.now() - cachedAt < instagramPermissionCacheTtlMs) {
+    await writeLog(userId, account._id, 'info', 'instagram_post_permissions_cached', 'Quyền Instagram đã được kiểm tra gần đây, bỏ qua bước cấp lại.', {
+      target,
+      packageName,
+      cacheAgeMs: Date.now() - cachedAt
+    });
+    return [];
+  }
+
   const permissions = [
     'android.permission.CAMERA',
     'android.permission.READ_EXTERNAL_STORAGE',
     'android.permission.WRITE_EXTERNAL_STORAGE'
   ];
-  const steps = [];
-  for (const permission of permissions) {
+  const steps = await Promise.all(permissions.map(async (permission) => {
     const result = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'pm', 'grant', packageName, permission], { timeoutMs: 10_000 });
-    steps.push(result);
     await writeLog(userId, account._id, result.ok ? 'info' : 'warn', 'instagram_post_grant_permission', result.ok ? `Đã cấp quyền ${permission} cho Instagram.` : `Không cấp được quyền ${permission}.`, {
       permission,
       ...result
     });
-  }
+    return result;
+  }));
+  instagramPermissionCache.set(cacheKey, Date.now());
   return steps;
 }
 
@@ -1780,9 +1912,15 @@ async function verifyInstagramPostSubmit(account, userId, target, waitAfterSubmi
   const verificationWindowMs = Math.max(18_000, waitAfterSubmitMs || 0);
   const deadline = startedAt + verificationWindowMs;
   const packageName = account.metadata?.appPackage || defaultPackages.instagram;
+  let lastLoggedState = '';
+  let lastStateLoggedAt = 0;
+  let consecutiveCaptionStates = 0;
   while (Date.now() < deadline) {
-    await delay(1_000);
-    const foreground = await getForegroundAndroidPackage(target);
+    await delay(650);
+    const [foreground, nodes] = await Promise.all([
+      getForegroundAndroidPackage(target),
+      dumpVisibleNodes(target)
+    ]);
     if (foreground.packageName && foreground.packageName !== packageName) {
       const screenshot = await captureScreenshot(account, userId, 'instagram_post_submit_verified');
       await writeLog(userId, account._id, 'info', 'instagram_post_submit_verified', 'Instagram đã rời foreground sau khi bấm Share.', {
@@ -1792,15 +1930,24 @@ async function verifyInstagramPostSubmit(account, userId, target, waitAfterSubmi
       return { ok: true, reason: 'instagram_left_foreground_after_share', screenshot, composerPending: false, finalState: 'submitted' };
     }
 
-    const nodes = await dumpVisibleNodes(target);
     const state = detectInstagramState(nodes, '');
     if (state.name === 'caption') {
-      await writeLog(userId, account._id, 'info', 'instagram_post_submit_still_on_share_screen', 'Instagram vẫn còn ở màn Share sau khi bấm.', {
-        elapsedMs: Date.now() - startedAt,
-        state
-      });
+      consecutiveCaptionStates += 1;
+      const elapsedMs = Date.now() - startedAt;
+      if (lastLoggedState !== state.name || elapsedMs - lastStateLoggedAt >= 5_000) {
+        await writeLog(userId, account._id, 'info', 'instagram_post_submit_still_on_share_screen', 'Instagram vẫn còn ở màn Share sau khi bấm.', {
+          elapsedMs,
+          state
+        });
+        lastLoggedState = state.name;
+        lastStateLoggedAt = elapsedMs;
+      }
+      if (consecutiveCaptionStates >= 4 && elapsedMs >= 3_000) {
+        return { ok: false, reason: 'still_on_share_screen', screenshot: null, composerPending: true, finalState: 'caption' };
+      }
       continue;
     }
+    consecutiveCaptionStates = 0;
     if (state.name === 'submitted') {
       const screenshot = await captureScreenshot(account, userId, 'instagram_post_submit_verified');
       await writeLog(userId, account._id, 'info', 'instagram_post_submit_verified', 'Instagram hiển thị tín hiệu đã chia sẻ bài.', {
@@ -1810,10 +1957,15 @@ async function verifyInstagramPostSubmit(account, userId, target, waitAfterSubmi
       return { ok: true, reason: 'share_confirmation_visible', screenshot, composerPending: false, finalState: 'submitted' };
     }
     if (state.name === 'submitting') {
-      await writeLog(userId, account._id, 'info', 'instagram_post_submit_waiting', 'Instagram đang xử lý sau khi bấm Share.', {
-        elapsedMs: Date.now() - startedAt,
-        state
-      });
+      const elapsedMs = Date.now() - startedAt;
+      if (lastLoggedState !== state.name || elapsedMs - lastStateLoggedAt >= 5_000) {
+        await writeLog(userId, account._id, 'info', 'instagram_post_submit_waiting', 'Instagram đang xử lý sau khi bấm Share.', {
+          elapsedMs,
+          state
+        });
+        lastLoggedState = state.name;
+        lastStateLoggedAt = elapsedMs;
+      }
       continue;
     }
     if (state.name === 'home') {
@@ -1826,9 +1978,11 @@ async function verifyInstagramPostSubmit(account, userId, target, waitAfterSubmi
     }
   }
 
-  await delay(2_500);
-  const finalForeground = await getForegroundAndroidPackage(target);
-  const finalNodes = await dumpVisibleNodes(target);
+  await delay(700);
+  const [finalForeground, finalNodes] = await Promise.all([
+    getForegroundAndroidPackage(target),
+    dumpVisibleNodes(target)
+  ]);
   const finalState = detectInstagramState(finalNodes, '');
   if (finalState.name === 'caption') {
     const screenshot = await captureScreenshot(account, userId, 'instagram_post_submit_unverified');
@@ -3450,7 +3604,7 @@ async function tapAndLog(userId, accountId, target, action, point = {}) {
   }
   await writeLog(userId, accountId, result.ok ? 'info' : 'error', action, result.ok ? `Tap ${point.x},${point.y}.` : `Tap lỗi ${point.x},${point.y}.`, result);
   if (!result.ok) throw new Error(result.error || result.stderr || `${action} failed.`);
-  await delay(action.startsWith('facebook_post') ? postStepDelay() : env.mobileAutomation.stepDelayMs);
+  await delay(actionDelay(action));
   return result;
 }
 
@@ -3459,7 +3613,10 @@ function isTransientAdbFailure(message = '') {
 }
 
 async function tapTextOrPoint(account, userId, target, labels, fallbackPoint, action, options = {}) {
-  const match = await findVisibleTextBounds(target, labels, options);
+  const { nodes, ...matchOptions } = options;
+  const match = Array.isArray(nodes)
+    ? findNodeInNodes(nodes, labels, matchOptions)
+    : await findVisibleTextBounds(target, labels, matchOptions);
   if (match) {
     const point = {
       x: Math.round((match.left + match.right) / 2),
@@ -3516,6 +3673,20 @@ async function findVisibleTextBounds(target, labels, options = {}) {
 }
 
 async function dumpVisibleNodes(target) {
+  if (directUiDumpSupport.get(target) !== false) {
+    const direct = await runCommand(
+      env.mobileAutomation.adbPath,
+      ['-s', target, 'exec-out', 'uiautomator', 'dump', '/dev/tty'],
+      { timeoutMs: 4_000, maxBuffer: 2 * 1024 * 1024 }
+    );
+    const directNodes = direct.ok ? parseVisibleNodes(`${direct.stdout}\n${direct.stderr}`) : [];
+    if (directNodes.length) {
+      directUiDumpSupport.set(target, true);
+      return directNodes;
+    }
+    directUiDumpSupport.set(target, false);
+  }
+
   const dumpArgs = ['-s', target, 'shell', 'uiautomator', 'dump', '/sdcard/window.xml'];
   let dump = await runCommand(env.mobileAutomation.adbPath, dumpArgs, {
     timeoutMs: 10_000
@@ -3542,7 +3713,11 @@ async function dumpVisibleNodes(target) {
   }
   if (!xml.ok || !xml.stdout) return [];
 
-  return (xml.stdout.match(/<node\b[^>]*>/g) || [])
+  return parseVisibleNodes(xml.stdout);
+}
+
+function parseVisibleNodes(xml = '') {
+  return (String(xml).match(/<node\b[^>]*>/g) || [])
     .map((node) => ({
       raw: node,
       text: readXmlAttr(node, 'text'),
@@ -3604,6 +3779,63 @@ function screenHasText(nodes, text) {
   return snippets.some((snippet) => haystack.includes(snippet) || compactHaystack.includes(snippet.replace(/\s+/g, '')));
 }
 
+function verifyCompleteCaption(nodes, text) {
+  const expected = cleanClipboardText(text).trim();
+  if (!expected) return { ok: true, missingText: [], missingHashtags: [], missingEmoji: [] };
+
+  const rawHaystack = nodes
+    .map((node) => `${node.text || ''} ${node.desc || ''}`)
+    .join(' ')
+    .normalize('NFC');
+  const normalizedHaystack = normalizeSearchText(rawHaystack);
+  const compactHaystack = normalizedHaystack.replace(/\s+/g, '');
+
+  const hashtags = Array.from(new Set(expected.match(/#[\p{L}\p{N}_]+/gu) || []));
+  const emoji = Array.from(new Set(expected.match(/\p{Extended_Pictographic}\uFE0F?/gu) || []));
+  const plainText = expected
+    .replace(/#[\p{L}\p{N}_]+/gu, ' ')
+    .replace(/\p{Extended_Pictographic}\uFE0F?/gu, ' ')
+    .replace(/\uFE0F/g, ' ');
+  const textParts = normalizeSearchText(plainText)
+    .split(/\s*\n+\s*| {2,}/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  const actualHashtags = Array.from(new Set(
+    (rawHaystack.match(/#[\p{L}\p{N}_]+/gu) || [])
+      .map((hashtag) => normalizeSearchText(hashtag).replace(/\s+/g, ''))
+      .filter(Boolean)
+  ));
+  const missingHashtags = hashtags.filter((hashtag) => {
+    const normalized = normalizeSearchText(hashtag).replace(/\s+/g, '');
+    return normalized && !actualHashtags.includes(normalized);
+  });
+  const conflictingHashtags = hashtags.flatMap((hashtag) => {
+    const normalized = normalizeSearchText(hashtag).replace(/\s+/g, '');
+    return actualHashtags.filter((actual) => actual !== normalized && actual.startsWith(normalized));
+  });
+  const haystackWithoutVariationSelectors = rawHaystack.replace(/\uFE0F/g, '');
+  const missingEmoji = emoji.filter((item) => !haystackWithoutVariationSelectors.includes(item.replace(/\uFE0F/g, '')));
+  const missingText = textParts.filter((part) => {
+    const compactPart = part.replace(/\s+/g, '');
+    return !normalizedHaystack.includes(part) && !compactHaystack.includes(compactPart);
+  });
+
+  return {
+    ok: missingText.length === 0
+      && missingHashtags.length === 0
+      && missingEmoji.length === 0
+      && conflictingHashtags.length === 0,
+    missingText,
+    missingHashtags,
+    missingEmoji,
+    conflictingHashtags,
+    actualHashtags,
+    expectedHashtagCount: hashtags.length,
+    expectedEmojiCount: emoji.length
+  };
+}
+
 async function waitForAnyText(target, labels, timeoutMs = 5000, options = {}) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
@@ -3616,7 +3848,18 @@ async function waitForAnyText(target, labels, timeoutMs = 5000, options = {}) {
 
 function readXmlAttr(node, attr) {
   const match = node.match(new RegExp(`${attr}="([^"]*)"`, 'i'));
-  return match?.[1] || '';
+  return decodeXmlEntities(match?.[1] || '');
+}
+
+function decodeXmlEntities(value = '') {
+  return String(value)
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(Number.parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, decimal) => String.fromCodePoint(Number.parseInt(decimal, 10)))
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
 }
 
 function readBounds(node) {
@@ -3641,7 +3884,7 @@ async function inputAndLog(userId, accountId, target, action, text, sensitive = 
     args: sensitive ? ['-s', target, 'shell', result.method || 'input_text', '***'] : result.args
   });
   if (!result.ok) throw new Error(result.error || result.stderr || `${action} failed.`);
-  await delay(action.startsWith('facebook_post') ? postStepDelay() : env.mobileAutomation.stepDelayMs);
+  await delay(actionDelay(action));
   return result;
 }
 

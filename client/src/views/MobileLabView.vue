@@ -508,23 +508,27 @@ const postRunActionLabels = {
 };
 const postResultSummary = computed(() => {
   if (!postResult.value) return null;
+  const elapsedMs = Number(postResult.value.perf?.totalMs) || 0;
+  const elapsedDetail = elapsedMs > 0
+    ? ` Hoàn tất trong ${(elapsedMs / 1000).toFixed(1)} giây.`
+    : '';
   if (postResult.value.submitVerified) {
     return {
       title: 'Đã xác minh bài đăng',
-      detail: `${selectedPlatform.value.label} đã có tín hiệu nhận bài. Lưu lại screenshot/log để đối chiếu khi cần.`,
+      detail: `${selectedPlatform.value.label} đã có tín hiệu nhận bài.${elapsedDetail} Lưu lại screenshot/log để đối chiếu khi cần.`,
       tone: 'ok'
     };
   }
   if (postResult.value.autoSubmit) {
     return {
       title: 'Đã bấm Đăng nhưng cần kiểm tra',
-      detail: 'Automation chưa xác nhận được bài đã lên feed. Hãy xem screenshot và log mới nhất.',
+      detail: `Automation chưa xác nhận được bài đã lên feed.${elapsedDetail} Hãy xem screenshot và log mới nhất.`,
       tone: 'warn'
     };
   }
   return {
     title: 'Composer đã mở',
-    detail: `Bài đang chờ thao tác trong ${selectedPlatform.value.label} app.`,
+    detail: `Bài đang chờ thao tác trong ${selectedPlatform.value.label} app.${elapsedDetail}`,
     tone: 'run'
   };
 });
@@ -1209,13 +1213,12 @@ function applySchedulePreset(option) {
 function parseHashtags(value = '') {
   const raw = String(value || '').trim();
   if (!raw) return [];
-  return raw
-    .split(/[,;\n]+/)
-    .map((tag) => tag.trim())
-    .filter(Boolean)
-    .map((tag) => tag.replace(/^#+/, '').replace(/\s+/g, ''))
+  const normalized = raw
+    .split(/[\s,;]+/)
+    .map((tag) => tag.replace(/^#+/, '').replace(/[^\p{L}\p{N}_]/gu, ''))
     .filter(Boolean)
     .map((tag) => `#${tag}`);
+  return Array.from(new Map(normalized.map((tag) => [tag.toLocaleLowerCase(), tag])).values());
 }
 
 function saveDraft(status = 'draft', options = {}) {
