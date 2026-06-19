@@ -134,6 +134,15 @@ const instagramResolverFeedLabels = ['Feed'];
 const instagramResolverAlwaysLabels = ['ALWAYS', 'Always', 'LUÔN LUÔN', 'Luôn luôn', 'Luon luon'];
 const instagramResolverOnceLabels = ['JUST ONCE', 'Just once', 'CHỈ MỘT LẦN', 'Chỉ một lần', 'Chi mot lan'];
 const instagramResolverDialogLabels = ['Use a different app', 'Sử dụng ứng dụng khác', 'Su dung ung dung khac'];
+const instagramCreateLabels = ['Create'];
+const instagramPostDestinationLabels = ['Post', 'POST', 'Bài viết', 'Bai viet'];
+const instagramNewPostLabels = ['New post', 'Bài viết mới', 'Bai viet moi'];
+const instagramSelectMultipleLabels = ['Select multiple button', 'Select'];
+const instagramAddMoreMediaLabels = [
+  'Add More Photos and Videos',
+  'Add more photos and videos',
+  'Thêm ảnh và video'
+];
 const instagramFeedShareActivity = 'com.instagram.share.handleractivity.ShareHandlerActivity';
 
 const defaultAdbHost = '127.0.0.1:5555';
@@ -501,7 +510,9 @@ async function getDeviceScreenSize(target) {
     'wm',
     'size'
   ], { timeoutMs: 10_000 });
-  const match = String(result.stdout || '').match(/(?:Override|Physical) size:\s*(\d+)x(\d+)/i);
+  const output = String(result.stdout || '');
+  const match = output.match(/Override size:\s*(\d+)x(\d+)/i)
+    || output.match(/Physical size:\s*(\d+)x(\d+)/i);
   if (!match) return null;
   return {
     width: Number(match[1]),
@@ -545,15 +556,80 @@ async function ensurePortraitOrientation(account, userId, target) {
     if (after?.height >= after?.width) break;
   }
 
+  let displayOverride = null;
+  if (!after || after.width > after.height) {
+    const portraitWidth = Math.min(before.width, before.height);
+    const portraitHeight = Math.max(before.width, before.height);
+    displayOverride = await runCommand(env.mobileAutomation.adbPath, [
+      '-s',
+      target,
+      'shell',
+      'wm',
+      'size',
+      `${portraitWidth}x${portraitHeight}`
+    ], { timeoutMs: 10_000 });
+    if (displayOverride.ok) {
+      rotate = await runCommand(env.mobileAutomation.adbPath, [
+        '-s',
+        target,
+        'shell',
+        'settings',
+        'put',
+        'system',
+        'user_rotation',
+        '0'
+      ], { timeoutMs: 10_000 });
+      await delay(1800);
+      after = await getDeviceScreenSize(target);
+      attempts.push({
+        rotation: '0',
+        displayOverride,
+        rotate,
+        size: after,
+        fallback: 'wm_size'
+      });
+    }
+  }
+
   const portrait = Boolean(after?.height >= after?.width);
-  await writeLog(userId, account._id, portrait ? 'info' : 'warn', 'facebook_post_portrait_orientation', portrait ? 'Đã chuẩn hóa LDPlayer về màn hình dọc.' : 'LDPlayer vẫn đang ở màn hình ngang sau khi thử khóa xoay.', {
+  await writeLog(userId, account._id, portrait ? 'info' : 'warn', 'mobile_post_portrait_orientation', portrait ? 'Đã chuẩn hóa LDPlayer về màn hình dọc.' : 'LDPlayer vẫn đang ở màn hình ngang sau khi thử khóa xoay và đổi kích thước hiển thị.', {
     before,
     after,
     lock,
     rotate,
+    displayOverride,
     attempts
   });
-  return { ok: Boolean(lock.ok && rotate?.ok && portrait), changed: true, before, after, attempts };
+  return {
+    ok: Boolean(lock.ok && rotate?.ok && portrait),
+    changed: true,
+    before,
+    after,
+    displayOverride,
+    attempts
+  };
+}
+
+async function resetInstagramDisplaySize(account, userId, target) {
+  const before = await getDeviceScreenSize(target);
+  const reset = await runCommand(env.mobileAutomation.adbPath, [
+    '-s',
+    target,
+    'shell',
+    'wm',
+    'size',
+    'reset'
+  ], { timeoutMs: 10_000 });
+  await delay(1200);
+  const after = await getDeviceScreenSize(target);
+  await writeLog(userId, account._id, reset.ok ? 'info' : 'warn', 'instagram_post_display_size', reset.ok
+    ? 'Đã dùng kích thước màn hình gốc của LDPlayer cho Instagram.'
+    : 'Không khôi phục được kích thước màn hình gốc của LDPlayer.', {
+    before,
+    after,
+    reset
+  });
+  return { ok: reset.ok, before, after, reset };
 }
 
 export async function openAccountApp(account, userId, appPackage) {
@@ -1267,13 +1343,15 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
 export async function publishInstagramPostViaMobile(account, userId, payload = {}) {
   const perf = createPerfTimer();
   let target = getDeviceTarget(account);
+  const requestedImages = Array.isArray(payload.images) ? payload.images.slice(0, 10) : [];
+  const postType = requestedImages.length > 1 ? 'carousel' : 'singlePhoto';
   const config = buildPostConfig(account, {
     appPackage: payload.appPackage || defaultPackages.instagram,
     autoSubmit: payload.autoSubmit,
     waitAfterSubmitMs: payload.waitAfterSubmitMs
   });
   const text = cleanIntentText(payload.text);
-  const images = Array.isArray(payload.images) ? payload.images.slice(0, 1) : [];
+  const images = requestedImages;
 
   if (!target) throw new Error('Thiếu deviceId hoặc adbHost.');
   if (!images.length) throw new Error('Instagram cần ít nhất 1 ảnh để đăng.');
@@ -1283,6 +1361,7 @@ export async function publishInstagramPostViaMobile(account, userId, payload = {
     target,
     appPackage: config.appPackage,
     autoSubmit: config.autoSubmit,
+    postType,
     imageCount: images.length
   });
 
@@ -1307,11 +1386,11 @@ export async function publishInstagramPostViaMobile(account, userId, payload = {
   if (!device.ok || String(device.stdout || '').trim() !== 'device') throw new Error(device.error || device.stderr || 'Device is not ready.');
   perf.mark('adb_ready', { target });
 
-  const [orientation, permissions] = await Promise.all([
-    ensurePortraitOrientation(account, userId, target),
+  const [display, permissions] = await Promise.all([
+    resetInstagramDisplaySize(account, userId, target),
     grantInstagramRuntimePermissions(account, userId, target, config.appPackage)
   ]);
-  steps.push(orientation);
+  steps.push(display);
   steps.push(...permissions);
   perf.mark('device_prepared', { permissionStepCount: permissions.length });
 
@@ -1326,7 +1405,7 @@ export async function publishInstagramPostViaMobile(account, userId, payload = {
     cacheHit: preparedImages.every((image) => image.cacheHit)
   });
 
-  const openComposer = await openInstagramComposer(account, userId, target, config, text, preparedImages[0]);
+  const openComposer = await openInstagramComposer(account, userId, target, config, text, preparedImages);
   steps.push(openComposer);
   perf.mark('composer_opened', { method: openComposer.method || '' });
   await delay(postStepDelay(0.75));
@@ -1343,6 +1422,7 @@ export async function publishInstagramPostViaMobile(account, userId, payload = {
     finalState: stateMachine.finalState,
     submitVerified,
     submitReason: stateMachine.submitReason || '',
+    postType,
     imageCount: preparedImages.length,
     perf: perf.snapshot()
   });
@@ -1350,6 +1430,7 @@ export async function publishInstagramPostViaMobile(account, userId, payload = {
   return {
     ok: true,
     autoSubmit: config.autoSubmit,
+    postType,
     composerPending: stateMachine.composerPending,
     finalState: stateMachine.finalState,
     submitVerified,
@@ -1360,11 +1441,18 @@ export async function publishInstagramPostViaMobile(account, userId, payload = {
   };
 }
 
-async function openInstagramComposer(account, userId, target, config, text, image) {
+async function openInstagramComposer(account, userId, target, config, text, images) {
+  const media = Array.isArray(images) ? images : [];
+  if (media.length > 1) {
+    return openInstagramCarouselComposer(account, userId, target, config, text, media);
+  }
+
   const stop = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'am', 'force-stop', config.appPackage]);
   await writeLog(userId, account._id, stop.ok ? 'info' : 'warn', 'instagram_post_reset_app_task', stop.ok ? 'Đã đóng task Instagram cũ trước khi mở composer mới.' : 'Không đóng được task Instagram cũ.', stop);
   await delay(postStepDelay());
 
+  const imageUris = media.map((image) => image.contentUri || `file://${image.remotePath}`);
+  if (!imageUris.length) throw new Error('Không có media URI để mở Instagram composer.');
   const baseIntentArgs = [
     '-s',
     target,
@@ -1374,11 +1462,11 @@ async function openInstagramComposer(account, userId, target, config, text, imag
     '-a',
     'android.intent.action.SEND',
     '-t',
-    image.mimeType || 'image/*',
+    media[0].mimeType || 'image/*',
     '--grant-read-uri-permission',
     '--eu',
     'android.intent.extra.STREAM',
-    image.contentUri || `file://${image.remotePath}`
+    imageUris[0]
   ];
   // Instagram xử lý EXTRA_TEXT không ổn định: có phiên bản chỉ giữ emoji
   // hoặc bỏ hashtag. Chỉ mở media ở đây và nhập caption sau bằng ADB Keyboard.
@@ -1414,7 +1502,8 @@ async function openInstagramComposer(account, userId, target, config, text, imag
       {
         ...shareIntent,
         args: maskShareIntentArgs(intentArgs),
-        method
+        method,
+        imageCount: imageUris.length
       }
     );
     if (!shareIntent.ok) continue;
@@ -1423,7 +1512,7 @@ async function openInstagramComposer(account, userId, target, config, text, imag
     if (bootstrap.ok) break;
     // Activity đã nhận intent thì không mở lại bằng phương thức khác. Việc
     // relaunch khi UI chỉ đang chậm có thể tạo nhiều composer cho cùng một bài.
-    break;
+    if (bootstrap.foreground?.packageName === config.appPackage) break;
   }
 
   const opened = Boolean(shareIntent?.ok && bootstrap?.ok);
@@ -1431,10 +1520,288 @@ async function openInstagramComposer(account, userId, target, config, text, imag
     ...shareIntent,
     args: maskShareIntentArgs(intentArgs),
     method,
+    imageCount: imageUris.length,
     bootstrap
   });
   if (!opened) throw new Error(shareIntent?.error || shareIntent?.stderr || bootstrap?.error || 'Không mở được Instagram Feed/Profile composer.');
   return { ...shareIntent, method, bootstrap };
+}
+
+async function openInstagramCarouselComposer(account, userId, target, config, text, images) {
+  const firstImageComposer = await openInstagramComposer(account, userId, target, config, text, [images[0]]);
+  let nodes = await dumpVisibleNodes(target);
+  let addMoreNode = findInstagramAddMoreMediaButton(nodes);
+  if (!addMoreNode) {
+    const ready = await waitForInstagramAddMoreButton(target, 25_000);
+    nodes = ready?.nodes || nodes;
+    addMoreNode = ready?.node || null;
+  }
+  if (!addMoreNode) throw new Error('Instagram đã mở ảnh đầu tiên nhưng không tìm thấy nút thêm ảnh vào Album.');
+
+  await delay(postStepDelay(3));
+  let gallery = null;
+  for (let attempt = 1; attempt <= 3 && !gallery; attempt += 1) {
+    const currentNodes = await dumpVisibleNodes(target);
+    const currentAddMoreNode = findInstagramAddMoreMediaButton(currentNodes) || addMoreNode;
+    const addMorePoint = {
+      x: Math.round((currentAddMoreNode.left + currentAddMoreNode.right) / 2),
+      y: Math.round((currentAddMoreNode.top + currentAddMoreNode.bottom) / 2)
+    };
+    await tapAndLog(userId, account._id, target, 'instagram_post_open_add_more_gallery', addMorePoint);
+    gallery = await waitForInstagramAddMoreGallery(target, attempt === 1 ? 10_000 : 7_000);
+    if (!gallery) {
+      await writeLog(userId, account._id, 'warn', 'instagram_post_add_more_retry', 'Nút Add More chưa mở gallery, đang thử lại.', {
+        attempt,
+        point: addMorePoint
+      });
+      await delay(postStepDelay(1.5));
+    }
+  }
+  if (!gallery) throw new Error('Instagram không mở thư viện từ nút Add More Photos and Videos.');
+
+  const selection = await selectInstagramRecentAlbumPhotos(account, userId, target, images.length, {
+    skipFirstCandidate: true
+  });
+  if (!selection.ok) throw new Error(selection.error);
+
+  const finalNodes = await dumpVisibleNodes(target);
+  const finalState = detectInstagramState(finalNodes, text);
+  await writeLog(userId, account._id, 'info', 'instagram_post_album_ready', `Đã chọn ${images.length} ảnh cho Album Instagram.`, {
+    imageCount: images.length,
+    selectedCount: selection.selectedCount,
+    state: finalState
+  });
+  return {
+    ok: true,
+    method: 'instagram_share_add_more_carousel',
+    imageCount: images.length,
+    firstImageComposer,
+    selection,
+    bootstrap: {
+      ok: finalState.name === 'next',
+      method: 'instagram_share_add_more_carousel',
+      state: finalState
+    }
+  };
+}
+
+async function waitForInstagramAddMoreButton(target, timeoutMs = 8_000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    await delay(450);
+    const nodes = await dumpVisibleNodes(target);
+    const node = findInstagramAddMoreMediaButton(nodes);
+    if (node) return { node, nodes };
+  }
+  return null;
+}
+
+function findInstagramAddMoreMediaButton(nodes = []) {
+  return findNodeInNodes(nodes, instagramAddMoreMediaLabels, { exact: true })
+    || nodes.find((node) => /add more photos? and videos?/i.test(node.desc || node.text || ''))
+    || null;
+}
+
+async function waitForInstagramAddMoreGallery(target, timeoutMs = 12_000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    await delay(450);
+    const nodes = await dumpVisibleNodes(target);
+    const hasPhotos = nodes.some((node) => /gallery_grid_item_thumbnail/i.test(node.raw || ''));
+    const hasNext = findNodeInNodes(nodes, instagramNextLabels, { exact: true });
+    if (hasPhotos && hasNext) return { nodes };
+  }
+  return null;
+}
+
+async function openInstagramHomeForAlbum(account, userId, target, packageName) {
+  let launch = await runCommand(env.mobileAutomation.adbPath, [
+    '-s',
+    target,
+    'shell',
+    'monkey',
+    '-p',
+    packageName,
+    '-c',
+    'android.intent.category.LAUNCHER',
+    '1'
+  ], { timeoutMs: 20_000 });
+  let ready = await waitForInstagramAlbumEntry(target, packageName, 15_000);
+  if (ready) return { ok: true, launch, ...ready };
+
+  await writeLog(userId, account._id, 'warn', 'instagram_post_album_home_restart', 'Instagram chưa render Home/Create, đang khởi động lại app để thoát màn trắng.', {
+    launch
+  });
+  launch = await launchAppFresh(target, packageName);
+  if (!launch.ok) return { ok: false, launch, error: launch.error || launch.stderr || 'Không mở được Instagram.' };
+
+  ready = await waitForInstagramAlbumEntry(target, packageName, 30_000);
+  if (ready) return { ok: true, launch, restarted: true, ...ready };
+  return {
+    ok: false,
+    launch,
+    error: 'Instagram vẫn ở màn trắng hoặc chưa hiển thị nút Create sau khi khởi động lại.'
+  };
+}
+
+async function waitForInstagramAlbumEntry(target, packageName, timeoutMs) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    await delay(700);
+    const [nodes, foreground] = await Promise.all([
+      dumpVisibleNodes(target),
+      getForegroundAndroidPackage(target)
+    ]);
+    if (foreground.packageName !== packageName) continue;
+    const hasGallery = (findNodeInNodes(nodes, instagramNewPostLabels, { exact: true })
+      || nodes.some((node) => /new_post_title/i.test(node.raw || '')))
+      && (findNodeInNodes(nodes, instagramSelectMultipleLabels)
+        || nodes.some((node) => /multi_select_slide_button/i.test(node.raw || '')));
+    if (hasGallery) return { state: 'gallery', nodes, foreground, elapsedMs: Date.now() - startedAt };
+    if (findNodeInNodes(nodes, instagramCreateLabels, { exact: true })) {
+      return { state: 'home', nodes, foreground, elapsedMs: Date.now() - startedAt };
+    }
+  }
+  return null;
+}
+
+async function openInstagramAlbumGallery(account, userId, target, packageName, maxAttempts = 3) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const existing = await waitForInstagramAlbumGallery(target, attempt === 1 ? 3_000 : 2_000);
+    if (existing) return existing;
+
+    let nodes = await dumpVisibleNodes(target);
+    const createNode = findNodeInNodes(nodes, instagramCreateLabels, { exact: true });
+    if (createNode) {
+      const point = {
+        x: Math.round((createNode.left + createNode.right) / 2),
+        y: Math.round((createNode.top + createNode.bottom) / 2)
+      };
+      await tapAndLog(userId, account._id, target, 'instagram_post_open_album_gallery', point);
+    } else {
+      await writeLog(userId, account._id, 'warn', 'instagram_post_album_create_missing', 'Chưa tìm thấy nút Create, chờ Instagram Home ổn định rồi thử lại.', {
+        attempt,
+        labels: nodes.map((node) => node.text || node.desc).filter(Boolean).slice(0, 40)
+      });
+    }
+
+    await delay(700);
+    nodes = await dumpVisibleNodes(target);
+    const postDestination = findNodeInNodes(nodes, instagramPostDestinationLabels, { exact: true });
+    if (postDestination && !findNodeInNodes(nodes, instagramNewPostLabels, { exact: true })) {
+      const point = {
+        x: Math.round((postDestination.left + postDestination.right) / 2),
+        y: Math.round((postDestination.top + postDestination.bottom) / 2)
+      };
+      await tapAndLog(userId, account._id, target, 'instagram_post_choose_post_destination', point);
+    }
+
+    const gallery = await waitForInstagramAlbumGallery(target, 12_000);
+    if (gallery) return gallery;
+    await writeLog(userId, account._id, 'warn', 'instagram_post_album_gallery_retry', 'Instagram chưa hiện thư viện Album, đang thử mở lại.', {
+      attempt
+    });
+    if (attempt < maxAttempts) {
+      const recovered = await openInstagramHomeForAlbum(account, userId, target, packageName);
+      if (!recovered.ok) return null;
+    }
+  }
+  return null;
+}
+
+async function waitForInstagramAlbumGallery(target, timeoutMs = 12_000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    await delay(500);
+    const nodes = await dumpVisibleNodes(target);
+    const hasNewPost = findNodeInNodes(nodes, instagramNewPostLabels, { exact: true })
+      || nodes.some((node) => /new_post_title/i.test(node.raw || ''));
+    const hasSelectMultiple = findNodeInNodes(nodes, instagramSelectMultipleLabels)
+      || nodes.some((node) => /multi_select_slide_button/i.test(node.raw || ''));
+    if (hasNewPost && hasSelectMultiple) return { nodes };
+  }
+  return null;
+}
+
+async function selectInstagramRecentAlbumPhotos(account, userId, target, imageCount, options = {}) {
+  let selectedCount = 1;
+  let scrollCount = 0;
+  let firstCandidateBounds = null;
+  let tappedBounds = [];
+
+  while (selectedCount < imageCount && scrollCount <= 10) {
+    const nodes = await dumpVisibleNodes(target);
+    let visibleCandidates = nodes
+      .filter((node) => /gallery_grid_item_thumbnail/i.test(node.raw || ''))
+      .filter((node) => /^Unselected Photo thumbnail/i.test(node.desc || ''))
+      .filter((node) => {
+        const height = node.bounds.bottom - node.bounds.top;
+        const centerY = (node.bounds.top + node.bounds.bottom) / 2;
+        return height >= 80 && centerY < 820;
+      })
+      .sort((left, right) => left.bounds.top - right.bounds.top || left.bounds.left - right.bounds.left);
+
+    // Sau khi cuộn, hàng ảnh cũ vẫn còn hiển thị ở phía trên. Không tap lại
+    // hàng này vì Instagram sẽ bỏ chọn ảnh đã thêm trước đó. Chỉ lấy hàng mới
+    // thấp nhất vừa xuất hiện trong viewport.
+    if (scrollCount > 0 && visibleCandidates.length) {
+      const lowestRowTop = Math.max(...visibleCandidates.map((node) => node.bounds.top));
+      visibleCandidates = visibleCandidates.filter((node) => Math.abs(node.bounds.top - lowestRowTop) <= 24);
+    }
+
+    if (options.skipFirstCandidate && !firstCandidateBounds && scrollCount === 0 && visibleCandidates.length) {
+      firstCandidateBounds = { ...visibleCandidates[0].bounds };
+    }
+
+    visibleCandidates = visibleCandidates.filter((candidate) => {
+      if (firstCandidateBounds && boundsOverlap(firstCandidateBounds, candidate.bounds) >= 0.8) return false;
+      return !tappedBounds.some((bounds) => boundsOverlap(bounds, candidate.bounds) >= 0.8);
+    });
+
+    const candidate = visibleCandidates[0];
+    if (candidate) {
+      const point = {
+        x: Math.round((candidate.bounds.left + candidate.bounds.right) / 2),
+        y: Math.round((candidate.bounds.top + candidate.bounds.bottom) / 2)
+      };
+      await tapAndLog(userId, account._id, target, 'instagram_post_select_album_photo', point);
+      tappedBounds.push({ ...candidate.bounds });
+      selectedCount += 1;
+      await delay(postStepDelay(0.5));
+      // UI gallery thay đổi trạng thái node sau mỗi lần chọn. Đọc lại hierarchy
+      // ở vòng kế tiếp thay vì tiếp tục dùng danh sách tọa độ cũ.
+      continue;
+    }
+
+    const swipe = await runCommand(env.mobileAutomation.adbPath, [
+      '-s',
+      target,
+      'shell',
+      'input',
+      'swipe',
+      '800',
+      '795',
+      '800',
+      '590',
+      '350'
+    ], { timeoutMs: 10_000 });
+    if (!swipe.ok) {
+      return { ok: false, error: swipe.error || swipe.stderr || 'Không cuộn được thư viện Instagram.', selectedCount };
+    }
+    scrollCount += 1;
+    tappedBounds = [];
+    await delay(postStepDelay(1.5));
+  }
+
+  if (selectedCount !== imageCount) {
+    return {
+      ok: false,
+      error: `Chỉ chọn được ${selectedCount}/${imageCount} ảnh trong thư viện Instagram.`,
+      selectedCount,
+      scrollCount
+    };
+  }
+  return { ok: true, selectedCount, scrollCount };
 }
 
 async function waitForInstagramComposerBootstrap(account, userId, target, config, text, method, timeoutMs = 14_000) {

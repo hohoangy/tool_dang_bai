@@ -132,7 +132,7 @@ const instagramPostSchema = z.object({
     name: z.string().optional(),
     mimeType: z.string().startsWith('image/').optional(),
     size: z.number().int().positive().max(5 * 1024 * 1024).optional()
-  })).min(1).max(1)
+  })).min(1).max(10)
 });
 
 mobileRoutes.get('/accounts', requireAuth, asyncHandler(async (req, res) => {
@@ -306,6 +306,7 @@ mobileRoutes.post('/accounts/:id/instagram/post', requireAuth, asyncHandler(asyn
     await writeLog(req.user._id, account._id, 'error', 'instagram_post_failed', error.message, {
       autoSubmit: platformInput.autoSubmit,
       appPackage: platformInput.appPackage,
+      postType: (platformInput.images?.length || 0) > 1 ? 'carousel' : 'singlePhoto',
       imageCount: platformInput.images?.length || 0
     });
     throw new ApiError(400, error.message);

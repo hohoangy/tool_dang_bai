@@ -1,7 +1,7 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
-import { AlertTriangle, BarChart3, CalendarClock, CheckCircle2, ChevronLeft, ChevronRight, Clock3, Eye, FileText, Gauge, GripVertical, Home, Image, Keyboard, ListChecks, Loader2, LogOut, Moon, MousePointer2, Play, RefreshCcw, Save, Send, ShieldCheck, Smartphone, Sparkles, Sun, Terminal, Timer, Trash2, Undo2, Users, Video, Wifi, XCircle, Zap } from 'lucide-vue-next';
+import { AlertTriangle, BarChart3, CalendarClock, CheckCircle2, ChevronLeft, ChevronRight, Clock3, Eye, FileText, Gauge, Home, Image, Keyboard, ListChecks, Loader2, LogOut, Moon, MousePointer2, Play, RefreshCcw, Save, Send, ShieldCheck, Smartphone, Sparkles, Sun, Terminal, Timer, Trash2, Undo2, Users, Video, Wifi, XCircle, Zap } from 'lucide-vue-next';
 import { http } from '../api/http';
 import BaseCard from '../components/BaseCard.vue';
 import { useAuthStore } from '../stores/auth';
@@ -34,7 +34,6 @@ const technicalLogsOpen = ref(false);
 const workflowStage = ref('idle');
 const publishMode = ref('direct');
 const facebookPostType = ref('imageText');
-const instagramPostType = ref('singlePhoto');
 const composerTab = ref('compose');
 const selectedQueueAccountIds = ref([]);
 const queueItems = ref([]);
@@ -45,6 +44,7 @@ const drafts = ref([]);
 const draggedPreviewPhotoId = ref('');
 
 const maxPhotos = 4;
+const maxInstagramAlbumPhotos = 10;
 const maxVideoSizeMb = 100;
 const draftStorageKey = 'socialpilot-platform-composer-drafts';
 const runtimeStatusIntervalMs = 8_000;
@@ -126,27 +126,6 @@ const composerTabs = [
   { id: 'queue', label: 'Tiến trình' }
 ];
 
-const instagramPostModes = [
-  {
-    id: 'singlePhoto',
-    label: 'Ảnh đơn',
-    description: 'Đăng 1 ảnh kèm caption lên Feed',
-    disabled: false
-  },
-  {
-    id: 'carousel',
-    label: 'Album',
-    description: 'Đăng nhiều ảnh dạng carousel',
-    disabled: true
-  },
-  {
-    id: 'feedVideo',
-    label: 'Video Feed',
-    description: 'Đăng video lên Feed/profile',
-    disabled: true
-  }
-];
-
 const emojiGroups = [
   {
     label: 'Da dung gan day',
@@ -183,18 +162,23 @@ const technicalLogStats = computed(() => ({
 const canUseRemote = computed(() => Boolean(selectedAccount.value));
 const facebookAccounts = computed(() => accounts.value.filter((account) => account.platform === selectedPlatformId.value));
 const selectedQueueAccounts = computed(() => facebookAccounts.value.filter((account) => selectedQueueAccountIds.value.includes(account._id)));
-const platformMaxPhotos = computed(() => selectedPlatformId.value === 'instagram' ? 1 : maxPhotos);
+const selectedPhotoCount = computed(() => post.media.filter((item) => item.type === 'photo').length);
+const isInstagramAlbumMode = computed(() => selectedPlatformId.value === 'instagram' && selectedPhotoCount.value > 1);
+const platformMaxPhotos = computed(() => {
+  if (selectedPlatformId.value === 'instagram') return maxInstagramAlbumPhotos;
+  return maxPhotos;
+});
 const platformRequiresPhoto = computed(() => selectedPlatformId.value === 'instagram');
 const isFacebookVideoMode = computed(() => selectedPlatformId.value === 'facebook' && facebookPostType.value === 'video');
-const selectedInstagramPostMode = computed(() => instagramPostModes.find((mode) => mode.id === instagramPostType.value) || instagramPostModes[0]);
 const uploadedPhotoCount = computed(() => post.media.filter((item) => item.type === 'photo' && item.uploadedUrl).length);
 const uploadedVideoCount = computed(() => post.media.filter((item) => item.type === 'video' && item.uploadedUrl).length);
 const selectedVideo = computed(() => post.media.find((item) => item.type === 'video') || null);
 const uploadedMediaCount = computed(() => isFacebookVideoMode.value ? uploadedVideoCount.value : uploadedPhotoCount.value);
 const mediaReady = computed(() => {
   if (isFacebookVideoMode.value) return uploadedVideoCount.value === 1;
-  return (!post.media.length || uploadedPhotoCount.value === Math.min(post.media.length, platformMaxPhotos.value))
-    && (!platformRequiresPhoto.value || uploadedPhotoCount.value > 0);
+  const allSelectedPhotosUploaded = !post.media.length
+    || uploadedPhotoCount.value === Math.min(post.media.length, platformMaxPhotos.value);
+  return allSelectedPhotosUploaded && (!platformRequiresPhoto.value || uploadedPhotoCount.value > 0);
 });
 const mediaInputAccept = computed(() => isFacebookVideoMode.value ? 'video/mp4,video/quicktime,video/webm,video/3gpp' : 'image/*');
 const mediaInputMultiple = computed(() => !isFacebookVideoMode.value);
@@ -228,7 +212,12 @@ const currentPublishModeShortLabel = computed(() => ({
 const isBulkMode = computed(() => publishMode.value === 'bulk');
 const isReviewMode = computed(() => publishMode.value === 'review');
 const isScheduleMode = computed(() => publishMode.value === 'schedule');
-const requiresFacebookSession = computed(() => !isBulkMode.value && !isScheduleMode.value);
+// Facebook cần được mở trước để ổn định Home/composer. Instagram tự mở
+// ShareHandlerActivity khi chạy workflow nên không được chặn chỉ vì app
+// hiện không nằm ở foreground.
+const requiresFacebookSession = computed(() => selectedPlatformId.value === 'facebook'
+  && !isBulkMode.value
+  && !isScheduleMode.value);
 const facebookAppReady = computed(() => Boolean(selectedAccount.value?._id) && facebookSessionAccountId.value === selectedAccount.value._id);
 const facebookOpenButtonLabel = computed(() => {
   if (facebookOpening.value) return `Đang mở ${selectedPlatform.value.label}`;
@@ -269,7 +258,9 @@ const contentReady = computed(() => characterCount.value <= 5000 && (!captionReq
 const submitWaitMs = computed(() => {
   if (isReviewMode.value) return 0;
   if (isFacebookVideoMode.value) return 90_000;
-  if (selectedPlatformId.value === 'instagram') return 25_000;
+  if (selectedPlatformId.value === 'instagram') {
+    return Math.min(60_000, 21_000 + (uploadedPhotoCount.value * 4_000));
+  }
   return 8_000 + (uploadedPhotoCount.value * 5_000);
 });
 const canRunWorkflow = computed(() => selectedPlatform.value.status === 'ready'
@@ -335,7 +326,11 @@ const preflightItems = computed(() => [
   },
   {
     label: `${selectedPlatform.value.label} app`,
-    detail: facebookAppReady.value ? `${selectedPlatform.value.label} đã sẵn sàng trong LDPlayer` : `Mở ${selectedPlatform.value.label} trước khi đăng`,
+    detail: !requiresFacebookSession.value
+      ? `${selectedPlatform.value.label} sẽ tự mở khi bắt đầu đăng`
+      : facebookAppReady.value
+        ? `${selectedPlatform.value.label} đã sẵn sàng trong LDPlayer`
+        : `Mở ${selectedPlatform.value.label} trước khi đăng`,
     ok: Boolean(facebookAppPackage.value) && (!requiresFacebookSession.value || facebookAppReady.value),
     blocking: true
   },
@@ -351,6 +346,8 @@ const preflightItems = computed(() => [
     label: 'Media',
     detail: isFacebookVideoMode.value
       ? (uploadedVideoCount.value ? 'Video đã sẵn sàng' : 'Facebook video cần 1 tệp video')
+      : selectedPlatformId.value === 'instagram' && uploadedPhotoCount.value
+        ? `${uploadedPhotoCount.value} ảnh · ${isInstagramAlbumMode.value ? 'Tự động đăng Album' : 'Tự động đăng ảnh đơn'}`
       : uploadedPhotoCount.value
         ? `${uploadedPhotoCount.value}/${platformMaxPhotos.value} ảnh đã sẵn sàng`
         : (platformRequiresPhoto.value ? 'Instagram bắt buộc có ảnh' : 'Không dùng ảnh'),
@@ -602,7 +599,7 @@ const professionalKpis = computed(() => [
     detail: isFacebookVideoMode.value
       ? 'Đăng video Facebook'
       : selectedPlatformId.value === 'instagram'
-        ? `Instagram Feed - ${selectedInstagramPostMode.value.label}`
+        ? `Instagram Feed - ${isInstagramAlbumMode.value ? 'Album' : 'Ảnh đơn'}`
       : post.media.length ? 'Ảnh đã sẵn sàng để gắn vào bài' : 'Bài đăng dạng text',
     tone: mediaReady.value ? 'ok' : 'warn'
   },
@@ -1293,12 +1290,6 @@ function setFacebookPostType(type) {
   facebookPostType.value = type;
 }
 
-function setInstagramPostType(type) {
-  const mode = instagramPostModes.find((item) => item.id === type);
-  if (!mode || mode.disabled || instagramPostType.value === type) return;
-  instagramPostType.value = type;
-}
-
 async function addMedia(event) {
   const files = Array.from(event.target.files || []);
   event.target.value = '';
@@ -1354,9 +1345,11 @@ async function addMedia(event) {
   }
 
   mediaUploading.value = true;
+  const pendingPreviews = [];
   try {
-    for (const file of selectedFiles) {
+    const uploadedItems = await Promise.all(selectedFiles.map(async (file, index) => {
       const previewUrl = URL.createObjectURL(file);
+      pendingPreviews.push(previewUrl);
       try {
         const { data } = await http.post('/media/images', file, {
           headers: {
@@ -1364,22 +1357,24 @@ async function addMedia(event) {
             'X-File-Name': encodeURIComponent(file.name)
           }
         });
-        post.media.push({
-          id: `${Date.now()}-${file.name}-${Math.random().toString(16).slice(2)}`,
+        return {
+          id: `${Date.now()}-${index}-${file.name}-${Math.random().toString(16).slice(2)}`,
           name: file.name,
           type: 'photo',
           url: previewUrl,
           uploadedUrl: data.image.url,
           mimeType: data.image.mimeType,
           size: data.image.size
-        });
+        };
       } catch (error) {
         URL.revokeObjectURL(previewUrl);
         throw error;
       }
-    }
+    }));
+    post.media.push(...uploadedItems);
     ui.notify(`Da tai ${selectedFiles.length} anh len server.`);
   } catch (error) {
+    pendingPreviews.forEach((previewUrl) => URL.revokeObjectURL(previewUrl));
     ui.notify(error.message, 'error');
   } finally {
     mediaUploading.value = false;
@@ -1536,9 +1531,6 @@ watch(selectedPlatformId, async () => {
       URL.revokeObjectURL(item.url);
       return false;
     });
-  }
-  if (selectedPlatformId.value !== 'instagram') {
-    instagramPostType.value = 'singlePhoto';
   }
   const preferred = findPreferredAccount(accounts.value);
   selectedAccountId.value = preferred?._id || '';
@@ -2201,23 +2193,26 @@ watch(selectedPlatformId, async () => {
                 <div v-else-if="selectedPlatformId === 'instagram'" class="flex flex-wrap items-center border-b border-zinc-200 pb-3 dark:border-zinc-700">
                   <div class="inline-flex rounded-full border border-zinc-200 bg-zinc-100 p-1 dark:border-zinc-700 dark:bg-zinc-950">
                     <button
-                      v-for="mode in instagramPostModes"
-                      :key="mode.id"
-                      :class="[
-                        'inline-flex h-8 items-center gap-2 rounded-full px-3 text-xs font-extrabold transition',
-                        instagramPostType === mode.id ? 'bg-white text-zinc-950 shadow-sm dark:bg-zinc-800 dark:text-white' : 'text-zinc-500 hover:text-zinc-950 dark:hover:text-white',
-                        mode.disabled ? 'cursor-not-allowed opacity-45 hover:text-zinc-500 dark:hover:text-zinc-500' : ''
-                      ]"
+                      class="inline-flex h-8 items-center gap-2 rounded-full bg-white px-3 text-xs font-extrabold text-zinc-950 shadow-sm dark:bg-zinc-800 dark:text-white"
                       type="button"
-                      :disabled="posting || queueRunning || mode.disabled"
-                      :title="mode.disabled ? `${mode.label} chưa bật automation` : mode.description"
-                      @click="setInstagramPostType(mode.id)"
+                      disabled
+                      title="1 ảnh sẽ đăng ảnh đơn; từ 2 ảnh sẽ tự động đăng Album"
                     >
-                      <Image v-if="mode.id === 'singlePhoto'" class="h-3.5 w-3.5" />
-                      <GripVertical v-else-if="mode.id === 'carousel'" class="h-3.5 w-3.5" />
-                      <Video v-else class="h-3.5 w-3.5" />
-                      {{ mode.label }}
-                      <span v-if="mode.disabled" class="hidden text-[10px] font-black uppercase tracking-wide sm:inline">Sắp có</span>
+                      <Image class="h-3.5 w-3.5" />
+                      Ảnh / Album
+                      <span class="hidden text-[10px] font-black uppercase tracking-wide text-zinc-500 sm:inline">
+                        {{ selectedPhotoCount > 1 ? `${selectedPhotoCount} ảnh` : 'Tự động' }}
+                      </span>
+                    </button>
+                    <button
+                      class="inline-flex h-8 cursor-not-allowed items-center gap-2 rounded-full px-3 text-xs font-extrabold text-zinc-500 opacity-45"
+                      type="button"
+                      disabled
+                      title="Video Feed chưa bật automation"
+                    >
+                      <Video class="h-3.5 w-3.5" />
+                      Video Feed
+                      <span class="hidden text-[10px] font-black uppercase tracking-wide sm:inline">Sắp có</span>
                     </button>
                   </div>
                 </div>
@@ -2260,7 +2255,11 @@ watch(selectedPlatformId, async () => {
                     <div
                       v-for="item in post.media"
                       :key="item.id"
+                      :draggable="isInstagramAlbumMode && item.type === 'photo'"
                       class="group relative overflow-hidden rounded-2xl border border-zinc-300 bg-zinc-100 shadow-sm dark:border-zinc-700 dark:bg-zinc-900"
+                      @dragstart="isInstagramAlbumMode && startPreviewPhotoDrag(item, $event)"
+                      @dragover.prevent
+                      @drop="isInstagramAlbumMode && dropPreviewPhoto(item, $event)"
                     >
                       <img v-if="item.type === 'photo'" :src="item.url" :alt="item.name" class="h-52 w-full object-cover" />
                       <video v-else-if="item.type === 'video'" :src="item.url" class="h-64 w-full bg-black object-contain" controls playsinline></video>
@@ -2273,7 +2272,31 @@ watch(selectedPlatformId, async () => {
                         <XCircle class="h-5 w-5" />
                       </button>
                       <div class="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent px-3 py-2">
-                        <p class="truncate text-xs font-bold text-white">{{ item.name }}</p>
+                        <div class="flex items-center justify-between gap-2">
+                          <p class="truncate text-xs font-bold text-white">
+                            <span v-if="isInstagramAlbumMode && item.type === 'photo'">{{ previewPhotoOrder(item) + 1 }}. </span>{{ item.name }}
+                          </p>
+                          <div v-if="isInstagramAlbumMode && item.type === 'photo'" class="flex shrink-0 items-center gap-1">
+                            <button
+                              class="grid h-7 w-7 place-items-center rounded-md bg-black/60 text-white disabled:opacity-30"
+                              title="Chuyển ảnh sang trái"
+                              type="button"
+                              :disabled="previewPhotoOrder(item) === 0"
+                              @click="movePreviewPhoto(item, -1)"
+                            >
+                              <ChevronLeft class="h-4 w-4" />
+                            </button>
+                            <button
+                              class="grid h-7 w-7 place-items-center rounded-md bg-black/60 text-white disabled:opacity-30"
+                              title="Chuyển ảnh sang phải"
+                              type="button"
+                              :disabled="previewPhotoOrder(item) === previewPhotos.length - 1"
+                              @click="movePreviewPhoto(item, 1)"
+                            >
+                              <ChevronRight class="h-4 w-4" />
+                            </button>
+                          </div>
+                        </div>
                       </div>
                     </div>
                   </div>
