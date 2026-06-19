@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router';
 import { AlertTriangle, BarChart3, CalendarClock, CheckCircle2, ChevronLeft, ChevronRight, Clock3, Eye, FileText, Gauge, Home, Image, Keyboard, ListChecks, Loader2, LogOut, Moon, MousePointer2, Play, RefreshCcw, Save, Send, ShieldCheck, Smartphone, Sparkles, Sun, Terminal, Timer, Trash2, Undo2, Users, Video, Wifi, XCircle, Zap } from 'lucide-vue-next';
 import { http } from '../api/http';
 import BaseCard from '../components/BaseCard.vue';
+import FacebookActivityIcon from '../components/FacebookActivityIcon.vue';
 import { useAuthStore } from '../stores/auth';
 import { useUiStore } from '../stores/ui';
 
@@ -39,9 +40,12 @@ const selectedQueueAccountIds = ref([]);
 const queueItems = ref([]);
 const queueRunning = ref(false);
 const queueDelaySeconds = ref(0);
+const queuePhase = ref('idle');
+const queueCurrentAccountId = ref('');
 const scheduleDateTime = ref(defaultScheduleDateTime());
 const drafts = ref([]);
 const draggedPreviewPhotoId = ref('');
+const photoLayout = ref('grid');
 
 const maxPhotos = 4;
 const maxInstagramAlbumPhotos = 10;
@@ -49,6 +53,7 @@ const maxVideoSizeMb = 100;
 const draftStorageKey = 'socialpilot-platform-composer-drafts';
 const runtimeStatusIntervalMs = 8_000;
 let runtimeStatusTimer = null;
+let collageCache = { key: '', item: null };
 
 const platforms = [
   {
@@ -122,8 +127,8 @@ const post = reactive({
 
 const composerTabs = [
   { id: 'compose', label: 'Soạn' },
-  { id: 'preview', label: 'Preview' },
-  { id: 'queue', label: 'Tiến trình' }
+  { id: 'preview', label: 'Xem trước' },
+  { id: 'queue', label: 'Bài đã lưu' }
 ];
 
 const emojiGroups = [
@@ -184,11 +189,34 @@ const mediaInputAccept = computed(() => isFacebookVideoMode.value ? 'video/mp4,v
 const mediaInputMultiple = computed(() => !isFacebookVideoMode.value);
 const previewPhotos = computed(() => post.media.filter((item) => item.type === 'photo').slice(0, platformMaxPhotos.value));
 const facebookPreviewPhotos = computed(() => previewPhotos.value);
+const canArrangePhotos = computed(() => previewPhotos.value.length > 1);
+const photoLayouts = [
+  { id: 'grid', label: 'Lưới đều', description: 'Các ảnh có kích thước cân bằng' },
+  { id: 'focus-first', label: 'Ưu tiên ảnh đầu', description: 'Ảnh đầu lớn ở bên trái' },
+  { id: 'hero-top', label: 'Ảnh đầu phía trên', description: 'Ảnh đầu trải rộng phía trên' }
+];
+const availablePhotoLayouts = computed(() => {
+  if (previewPhotos.value.length === 2) {
+    return [
+      { id: 'grid', label: 'Trái / phải', description: 'Hai ảnh chia đều theo chiều ngang' },
+      { id: 'hero-top', label: 'Trên / dưới', description: 'Hai ảnh chia đều theo chiều dọc' }
+    ];
+  }
+  return photoLayouts;
+});
 const previewGalleryClass = computed(() => {
   if (previewPhotos.value.length === 1) return 'grid grid-cols-1';
-  if (previewPhotos.value.length === 2) return 'grid aspect-[16/9] grid-cols-2 gap-0.5';
-  if (previewPhotos.value.length === 3) return 'grid aspect-square grid-cols-2 grid-rows-2 gap-0.5';
-  return 'grid aspect-[16/9] grid-cols-2 grid-rows-2 gap-0.5';
+  if (photoLayout.value === 'focus-first') {
+    if (previewPhotos.value.length === 2) return 'grid aspect-[16/9] grid-cols-3 gap-0.5';
+    return `grid w-full aspect-[16/9] grid-cols-2 ${previewPhotos.value.length === 3 ? 'grid-rows-2' : 'grid-rows-3'} gap-0.5`;
+  }
+  if (photoLayout.value === 'hero-top') {
+    if (previewPhotos.value.length === 2) return 'grid w-full aspect-[16/9] grid-rows-2 gap-0.5';
+    return 'grid w-full aspect-[16/9] grid-cols-6 grid-rows-2 gap-0.5';
+  }
+  if (previewPhotos.value.length === 2) return 'grid w-full aspect-[16/9] grid-cols-2 gap-0.5';
+  if (previewPhotos.value.length === 3) return 'grid w-full aspect-[16/9] grid-cols-3 gap-0.5';
+  return 'grid w-full aspect-[16/9] grid-cols-2 grid-rows-2 gap-0.5';
 });
 const hashtagItems = computed(() => parseHashtags(post.hashtags));
 const normalizedHashtags = computed(() => hashtagItems.value.join(' '));
@@ -223,6 +251,15 @@ const facebookOpenButtonLabel = computed(() => {
   if (facebookOpening.value) return `Đang mở ${selectedPlatform.value.label}`;
   return facebookAppReady.value ? `Đã mở ${selectedPlatform.value.label}` : `Mở ${selectedPlatform.value.label}`;
 });
+const facebookActivityLabel = computed(() => {
+  if (facebookOpening.value) return `Đang mở ${selectedPlatform.value.label}`;
+  if (queueRunning.value) return 'Đang đăng bài lên nhiều tài khoản';
+  if (posting.value && isReviewMode.value) return `Đang mở ${selectedPlatform.value.label} để kiểm tra`;
+  if (posting.value) return `Đang đăng bài lên ${selectedPlatform.value.label}`;
+  return '';
+});
+const showFacebookActivityOverlay = computed(() => selectedPlatformId.value === 'facebook'
+  && (facebookOpening.value || posting.value || queueRunning.value));
 const facebookSessionStatusLabel = computed(() => facebookAppReady.value ? `Đã mở ${selectedPlatform.value.label}` : `Chưa mở ${selectedPlatform.value.label}`);
 const minScheduleDateTime = computed(() => toDateTimeLocal(new Date(Date.now() + 60 * 1000)));
 const minScheduleDate = computed(() => minScheduleDateTime.value.slice(0, 10));
@@ -261,7 +298,7 @@ const submitWaitMs = computed(() => {
   if (selectedPlatformId.value === 'instagram') {
     return Math.min(60_000, 21_000 + (uploadedPhotoCount.value * 4_000));
   }
-  return 8_000 + (uploadedPhotoCount.value * 5_000);
+  return uploadedPhotoCount.value > 0 ? 12_000 : 8_000;
 });
 const canRunWorkflow = computed(() => selectedPlatform.value.status === 'ready'
   && canUseRemote.value
@@ -289,7 +326,7 @@ const composerChecks = computed(() => [
     ok: !duplicateDraft.value
   },
   {
-    label: 'Preview hashtag',
+    label: 'Xem trước hashtag',
     detail: 'Hashtag hiển thị dạng chip để kiểm tra nhanh',
     ok: true
   }
@@ -567,6 +604,8 @@ const queueStats = computed(() => {
   };
 });
 const primaryActionLabel = computed(() => {
+  if (queueRunning.value) return 'Đang đăng hàng loạt';
+  if (posting.value) return isReviewMode.value ? 'Đang mở Facebook' : 'Đang đăng Facebook';
   if (isReviewMode.value) return 'Mở kiểm tra';
   if (isBulkMode.value) return `Bắt đầu đăng (${selectedQueueAccounts.value.length})`;
   if (isScheduleMode.value) return 'Lưu lịch';
@@ -1002,6 +1041,8 @@ async function runQueueWorkflow() {
   const interAccountDelaySeconds = Math.max(0, Math.min(Number(queueDelaySeconds.value) || 0, 600));
   posting.value = true;
   queueRunning.value = true;
+  queuePhase.value = 'preparing';
+  queueCurrentAccountId.value = '';
   postResult.value = null;
   workflowStage.value = 'posting';
   queueItems.value = queueAccounts.map((account) => ({
@@ -1018,9 +1059,12 @@ async function runQueueWorkflow() {
     let stopQueue = false;
     for (let index = 0; index < queueAccounts.length; index += 1) {
       const account = queueAccounts[index];
+      queueCurrentAccountId.value = account._id;
+      queuePhase.value = index > 0 ? 'switching' : 'preparing';
 
       try {
         updateQueueItem(account._id, { status: 'running', message: 'Đang kiểm tra LDPlayer và ADB' });
+        queuePhase.value = 'posting';
         const queueSubmitWaitMs = submitWaitMs.value;
         updateQueueItem(account._id, {
           status: 'running',
@@ -1052,10 +1096,12 @@ async function runQueueWorkflow() {
             message: successMessage,
             result: data.result
           });
+          queuePhase.value = 'closing';
           await closeQueueAccount(account, successMessage);
         }
       } catch (error) {
         updateQueueItem(account._id, { status: 'failed', message: error.message });
+        queuePhase.value = 'closing';
         await closeQueueAccount(account, `Lỗi: ${error.message}`);
       }
 
@@ -1068,11 +1114,16 @@ async function runQueueWorkflow() {
       }
 
       if (index < queueAccounts.length - 1 && interAccountDelaySeconds > 0) {
+        queuePhase.value = 'waiting';
         updateQueueItem(queueAccounts[index + 1]._id, {
           status: 'waiting',
           message: `Nghỉ ${interAccountDelaySeconds} giây trước lượt tiếp theo`
         });
         await wait(interAccountDelaySeconds * 1000);
+      }
+      if (index < queueAccounts.length - 1) {
+        queuePhase.value = 'switching';
+        queueCurrentAccountId.value = queueAccounts[index + 1]._id;
       }
     }
 
@@ -1082,6 +1133,8 @@ async function runQueueWorkflow() {
   } finally {
     posting.value = false;
     queueRunning.value = false;
+    queuePhase.value = 'idle';
+    queueCurrentAccountId.value = '';
   }
 }
 
@@ -1097,7 +1150,7 @@ async function prepareQueueEnvironment() {
   await wait(100);
 }
 
-function submitFacebookForAccount(account, autoSubmit, waitAfterSubmitMs = 0) {
+async function submitFacebookForAccount(account, autoSubmit, waitAfterSubmitMs = 0) {
   const uniqueImages = Array.from(
     new Map(
       post.media
@@ -1108,13 +1161,16 @@ function submitFacebookForAccount(account, autoSubmit, waitAfterSubmitMs = 0) {
   const uniqueVideos = post.media
     .filter((item) => item.type === 'video' && item.uploadedUrl)
     .slice(0, 1);
+  const publishImages = isFacebookVideoMode.value
+    ? []
+    : await prepareFacebookPublishImages(uniqueImages);
 
   return http.post(`/mobile/accounts/${account._id}/${selectedPlatformId.value}/post`, {
     text: finalPostText.value.trim(),
     appPackage: selectedPlatform.value.packageName,
     autoSubmit,
     waitAfterSubmitMs,
-    images: isFacebookVideoMode.value ? [] : uniqueImages
+    images: publishImages
       .map((item) => ({
         url: item.uploadedUrl,
         name: item.name,
@@ -1130,6 +1186,163 @@ function submitFacebookForAccount(account, autoSubmit, waitAfterSubmitMs = 0) {
       }))
       : []
   });
+}
+
+async function prepareFacebookPublishImages(images) {
+  if (selectedPlatformId.value !== 'facebook' || images.length < 2) return images;
+
+  const cacheKey = JSON.stringify({
+    layout: photoLayout.value,
+    images: images.map((item) => item.uploadedUrl)
+  });
+  if (collageCache.key === cacheKey && collageCache.item) return [collageCache.item];
+
+  const blob = await createPhotoCollage(images, photoLayout.value);
+  if (blob.size > 5 * 1024 * 1024) {
+    throw new Error('Ảnh ghép vượt quá 5 MB. Hãy dùng ảnh nguồn nhỏ hơn.');
+  }
+
+  const filename = `bo-cuc-${photoLayout.value}-${Date.now()}.jpg`;
+  const { data } = await http.post('/media/images', blob, {
+    headers: {
+      'Content-Type': 'image/jpeg',
+      'X-File-Name': encodeURIComponent(filename)
+    }
+  });
+  const item = {
+    id: `collage-${Date.now()}`,
+    name: filename,
+    type: 'photo',
+    url: data.image.url,
+    uploadedUrl: data.image.url,
+    mimeType: data.image.mimeType,
+    size: data.image.size
+  };
+  collageCache = { key: cacheKey, item };
+  return [item];
+}
+
+async function createPhotoCollage(images, layout) {
+  const width = 1600;
+  const height = 900;
+  const gap = 4;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext('2d');
+  if (!context) throw new Error('Trình duyệt không hỗ trợ tạo ảnh bố cục.');
+
+  context.fillStyle = '#111827';
+  context.fillRect(0, 0, width, height);
+  const loadedImages = await Promise.all(images.map((item) => loadCollageImage(item.uploadedUrl)));
+  const rectangles = getCollageRectangles(loadedImages.length, layout, width, height, gap);
+  loadedImages.forEach((image, index) => drawImageCover(context, image, rectangles[index]));
+
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => blob ? resolve(blob) : reject(new Error('Không thể tạo ảnh bố cục.')),
+      'image/jpeg',
+      0.9
+    );
+  });
+}
+
+function loadCollageImage(url) {
+  return new Promise((resolve, reject) => {
+    const image = new window.Image();
+    image.crossOrigin = 'anonymous';
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error('Không tải được ảnh để tạo bố cục.'));
+    image.src = url;
+  });
+}
+
+function getCollageRectangles(count, layout, width, height, gap) {
+  const halfWidth = (width - gap) / 2;
+  const halfHeight = (height - gap) / 2;
+
+  if (count === 2) {
+    return layout === 'hero-top'
+      ? [
+        { x: 0, y: 0, width, height: halfHeight },
+        { x: 0, y: halfHeight + gap, width, height: halfHeight }
+      ]
+      : [
+        { x: 0, y: 0, width: halfWidth, height },
+        { x: halfWidth + gap, y: 0, width: halfWidth, height }
+      ];
+  }
+
+  if (layout === 'focus-first') {
+    const sideHeight = (height - gap * (count - 2)) / (count - 1);
+    return [
+      { x: 0, y: 0, width: halfWidth, height },
+      ...Array.from({ length: count - 1 }, (_, index) => ({
+        x: halfWidth + gap,
+        y: index * (sideHeight + gap),
+        width: halfWidth,
+        height: sideHeight
+      }))
+    ];
+  }
+
+  if (layout === 'hero-top') {
+    const bottomWidth = (width - gap * (count - 2)) / (count - 1);
+    return [
+      { x: 0, y: 0, width, height: halfHeight },
+      ...Array.from({ length: count - 1 }, (_, index) => ({
+        x: index * (bottomWidth + gap),
+        y: halfHeight + gap,
+        width: bottomWidth,
+        height: halfHeight
+      }))
+    ];
+  }
+
+  if (count === 3) {
+    const thirdWidth = (width - gap * 2) / 3;
+    return [
+      { x: 0, y: 0, width: thirdWidth, height },
+      { x: thirdWidth + gap, y: 0, width: thirdWidth, height },
+      { x: (thirdWidth + gap) * 2, y: 0, width: thirdWidth, height }
+    ];
+  }
+
+  return [
+    { x: 0, y: 0, width: halfWidth, height: halfHeight },
+    { x: halfWidth + gap, y: 0, width: halfWidth, height: halfHeight },
+    { x: 0, y: halfHeight + gap, width: halfWidth, height: halfHeight },
+    { x: halfWidth + gap, y: halfHeight + gap, width: halfWidth, height: halfHeight }
+  ];
+}
+
+function drawImageCover(context, image, rectangle) {
+  const sourceRatio = image.naturalWidth / image.naturalHeight;
+  const targetRatio = rectangle.width / rectangle.height;
+  let sourceWidth = image.naturalWidth;
+  let sourceHeight = image.naturalHeight;
+  let sourceX = 0;
+  let sourceY = 0;
+
+  if (sourceRatio > targetRatio) {
+    sourceWidth = image.naturalHeight * targetRatio;
+    sourceX = (image.naturalWidth - sourceWidth) / 2;
+  } else {
+    sourceHeight = image.naturalWidth / targetRatio;
+    sourceY = (image.naturalHeight - sourceHeight) / 2;
+  }
+
+  context.drawImage(
+    image,
+    sourceX,
+    sourceY,
+    sourceWidth,
+    sourceHeight,
+    rectangle.x,
+    rectangle.y,
+    rectangle.width,
+    rectangle.height
+  );
 }
 
 function updateQueueItem(id, patch) {
@@ -1157,6 +1370,21 @@ function wait(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+function setQueueDelay(value) {
+  queueDelaySeconds.value = Math.max(0, Math.min(Number(value) || 0, 600));
+}
+
+function handleQueueDelayInput(event) {
+  const digits = String(event.target.value || '').replace(/\D/g, '').slice(0, 3);
+  const value = Math.min(Number(digits || 0), 600);
+  queueDelaySeconds.value = value;
+  event.target.value = String(value);
+}
+
+function adjustQueueDelay(amount) {
+  setQueueDelay(queueDelaySeconds.value + amount);
+}
+
 function toggleQueueAccount(accountId) {
   if (selectedQueueAccountIds.value.includes(accountId)) {
     selectedQueueAccountIds.value = selectedQueueAccountIds.value.filter((id) => id !== accountId);
@@ -1168,7 +1396,13 @@ function toggleQueueAccount(accountId) {
 function loadDrafts() {
   try {
     const raw = window.localStorage.getItem(draftStorageKey);
-    drafts.value = raw ? JSON.parse(raw) : [];
+    const storedDrafts = raw ? JSON.parse(raw) : [];
+    drafts.value = Array.isArray(storedDrafts)
+      ? storedDrafts.map((draft) => ({
+        ...draft,
+        media: Array.isArray(draft.media) ? draft.media.filter((item) => item?.uploadedUrl || item?.url) : []
+      }))
+      : [];
   } catch {
     drafts.value = [];
   }
@@ -1233,6 +1467,17 @@ function saveDraft(status = 'draft', options = {}) {
     rawText: normalizeTextFormatArtifacts(post.text),
     hashtags: post.hashtags,
     mediaCount: post.media.length,
+    media: post.media.map((item) => ({
+      id: item.id,
+      name: item.name,
+      type: item.type,
+      uploadedUrl: item.uploadedUrl,
+      mimeType: item.mimeType,
+      size: item.size
+    })).filter((item) => item.uploadedUrl),
+    platform: selectedPlatformId.value,
+    facebookPostType: facebookPostType.value,
+    photoLayout: photoLayout.value,
     status,
     createdAt: new Date().toISOString(),
     scheduledFor: options.scheduledFor || null,
@@ -1263,14 +1508,45 @@ function saveScheduledPost() {
 }
 
 function loadDraft(draft) {
+  clearComposerMedia();
+  if (draft.platform && platforms.some((platform) => platform.id === draft.platform)) {
+    selectedPlatformId.value = draft.platform;
+  }
+  facebookPostType.value = draft.facebookPostType === 'video' ? 'video' : 'imageText';
+  photoLayout.value = photoLayouts.some((layout) => layout.id === draft.photoLayout) ? draft.photoLayout : 'grid';
   post.text = normalizeTextFormatArtifacts(draft.rawText || draft.text || '');
   post.hashtags = draft.hashtags || '';
+  post.media = (Array.isArray(draft.media) ? draft.media : [])
+    .filter((item) => item?.uploadedUrl || item?.url)
+    .map((item, index) => {
+      const uploadedUrl = item.uploadedUrl || item.url;
+      return {
+        id: item.id || `draft-${draft.id}-${index}`,
+        name: item.name || `media-${index + 1}`,
+        type: item.type === 'video' ? 'video' : 'photo',
+        url: uploadedUrl,
+        uploadedUrl,
+        mimeType: item.mimeType || '',
+        size: item.size
+      };
+    });
+  ensureValidPhotoLayout();
+  if (draft.targetAccountId && accounts.value.some((account) => account._id === draft.targetAccountId)) {
+    selectedAccountId.value = draft.targetAccountId;
+  }
   if (draft.scheduledFor) {
     const scheduledAt = new Date(draft.scheduledFor);
     scheduleDateTime.value = toDateTimeLocal(scheduledAt);
   }
   composerTab.value = 'compose';
-  ui.notify('Đã tải nháp vào composer.');
+  const restoredMediaCount = post.media.length;
+  if (draft.mediaCount && !restoredMediaCount) {
+    ui.notify('Đã tải nội dung nháp. Nháp cũ không lưu đường dẫn ảnh nên không thể khôi phục ảnh.', 'error');
+    return;
+  }
+  ui.notify(restoredMediaCount
+    ? `Đã tải nháp và khôi phục ${restoredMediaCount} tệp media.`
+    : 'Đã tải nháp vào composer.');
 }
 
 function deleteDraft(draftId) {
@@ -1285,9 +1561,22 @@ function duplicateComposer() {
 
 function setFacebookPostType(type) {
   if (!['imageText', 'video'].includes(type) || facebookPostType.value === type) return;
-  post.media.forEach((item) => URL.revokeObjectURL(item.url));
-  post.media = [];
+  clearComposerMedia();
   facebookPostType.value = type;
+}
+
+function revokeMediaPreview(item) {
+  if (String(item?.url || '').startsWith('blob:')) URL.revokeObjectURL(item.url);
+}
+
+function clearComposerMedia() {
+  post.media.forEach(revokeMediaPreview);
+  post.media = [];
+  invalidateCollageCache();
+}
+
+function invalidateCollageCache() {
+  collageCache = { key: '', item: null };
 }
 
 async function addMedia(event) {
@@ -1304,8 +1593,7 @@ async function addMedia(event) {
       ui.notify(`Video phải nhỏ hơn hoặc bằng ${maxVideoSizeMb} MB.`, 'error');
       return;
     }
-    post.media.forEach((item) => URL.revokeObjectURL(item.url));
-    post.media = [];
+    clearComposerMedia();
 
     mediaUploading.value = true;
     const previewUrl = URL.createObjectURL(file);
@@ -1325,6 +1613,7 @@ async function addMedia(event) {
         mimeType: data.video.mimeType,
         size: data.video.size
       });
+      invalidateCollageCache();
       ui.notify('Đã tải video lên server.');
     } catch (error) {
       URL.revokeObjectURL(previewUrl);
@@ -1372,6 +1661,8 @@ async function addMedia(event) {
       }
     }));
     post.media.push(...uploadedItems);
+    invalidateCollageCache();
+    ensureValidPhotoLayout();
     ui.notify(`Da tai ${selectedFiles.length} anh len server.`);
   } catch (error) {
     pendingPreviews.forEach((previewUrl) => URL.revokeObjectURL(previewUrl));
@@ -1382,12 +1673,30 @@ async function addMedia(event) {
 }
 
 function removeMedia(item) {
-  URL.revokeObjectURL(item.url);
+  revokeMediaPreview(item);
   post.media = post.media.filter((media) => media.id !== item.id);
+  invalidateCollageCache();
+  ensureValidPhotoLayout();
+}
+
+function ensureValidPhotoLayout() {
+  if (!availablePhotoLayouts.value.some((layout) => layout.id === photoLayout.value)) {
+    photoLayout.value = availablePhotoLayouts.value[0]?.id || 'grid';
+  }
 }
 
 function previewPhotoClass(index) {
-  if (previewPhotos.value.length === 3 && index === 0) return 'col-span-2';
+  const count = previewPhotos.value.length;
+  if (photoLayout.value === 'focus-first') {
+    if (count === 2 && index === 0) return 'col-span-2';
+    if (count >= 3 && index === 0) return count === 3 ? 'row-span-2' : 'row-span-3';
+  }
+  if (photoLayout.value === 'hero-top') {
+    if (count === 2) return '';
+    if (index === 0) return 'col-span-6';
+    if (count === 3) return 'col-span-3';
+    return 'col-span-2';
+  }
   return '';
 }
 
@@ -1430,6 +1739,7 @@ function reorderPreviewPhotos(sourceId, targetId) {
   const target = post.media[targetIndex];
   post.media.splice(sourceIndex, 1, target);
   post.media.splice(targetIndex, 1, source);
+  invalidateCollageCache();
 }
 
 async function insertEmoji(emoji) {
@@ -1475,8 +1785,8 @@ function normalizeTextFormatArtifacts(value = '') {
 function resetComposer() {
   post.text = '';
   post.hashtags = '';
-  post.media.forEach((item) => URL.revokeObjectURL(item.url));
-  post.media = [];
+  clearComposerMedia();
+  photoLayout.value = 'grid';
   postResult.value = null;
   showEmojiPicker.value = false;
   workflowStage.value = 'idle';
@@ -1515,20 +1825,44 @@ onMounted(async () => {
 
 onUnmounted(() => {
   stopRuntimeStatusPolling();
-  post.media.forEach((item) => URL.revokeObjectURL(item.url));
+  post.media.forEach(revokeMediaPreview);
 });
 
 watch(selectedAccountId, () => {
   facebookSessionAccountId.value = '';
   syncSelectedAccountRuntimeStatus();
 });
+const queueCurrentItem = computed(() => queueItems.value.find((item) => item.id === queueCurrentAccountId.value)
+  || queueItems.value.find((item) => ['running', 'waiting'].includes(item.status))
+  || null);
+const queueCurrentIndex = computed(() => {
+  const index = queueItems.value.findIndex((item) => item.id === queueCurrentItem.value?.id);
+  return index >= 0 ? index : Math.min(queueStats.value.done + queueStats.value.review + queueStats.value.failed, Math.max(queueStats.value.total - 1, 0));
+});
+const queuePreviousItem = computed(() => {
+  const completed = queueItems.value.filter((item) => ['done', 'review', 'failed'].includes(item.status));
+  return completed[completed.length - 1] || null;
+});
+const queueNextItem = computed(() => queueItems.value.slice(queueCurrentIndex.value + 1)
+  .find((item) => ['pending', 'waiting'].includes(item.status)) || null);
+const queueDisplayTarget = computed(() => ['closing', 'switching', 'waiting'].includes(queuePhase.value)
+  ? (queueNextItem.value || queueCurrentItem.value)
+  : queueCurrentItem.value);
+const queueOverlayTitle = computed(() => {
+  if (queuePhase.value === 'switching') return 'Đang chuyển sang tài khoản tiếp theo';
+  if (queuePhase.value === 'closing') return 'Đang hoàn tất tài khoản hiện tại';
+  if (queuePhase.value === 'waiting') return 'Đang chờ trước lượt tiếp theo';
+  return 'Đang đăng bài';
+});
+
+watch(photoLayout, invalidateCollageCache);
 
 watch(selectedPlatformId, async () => {
   if (selectedPlatformId.value !== 'facebook') {
     facebookPostType.value = 'imageText';
     post.media = post.media.filter((item) => {
       if (item.type === 'photo') return true;
-      URL.revokeObjectURL(item.url);
+      revokeMediaPreview(item);
       return false;
     });
   }
@@ -1543,6 +1877,79 @@ watch(selectedPlatformId, async () => {
 
 <template>
   <div class="grid min-h-[calc(100vh-73px)] lg:grid-cols-[248px_1fr]">
+    <Transition
+      enter-active-class="transition duration-200 ease-out"
+      enter-from-class="opacity-0"
+      enter-to-class="opacity-100"
+      leave-active-class="transition duration-150 ease-in"
+      leave-from-class="opacity-100"
+      leave-to-class="opacity-0"
+    >
+      <div
+        v-if="showFacebookActivityOverlay"
+        class="fixed inset-0 z-[100] flex items-center justify-center bg-zinc-950/55 px-4 backdrop-blur-sm"
+        role="status"
+        aria-live="polite"
+      >
+        <div
+          v-if="queueRunning"
+          class="w-full max-w-md rounded-2xl border border-white/10 bg-zinc-950/95 p-5 text-white shadow-2xl"
+        >
+          <div class="flex items-center gap-3">
+            <FacebookActivityIcon size="md" />
+            <div class="min-w-0 flex-1">
+              <div class="flex items-center justify-between gap-3">
+                <p class="truncate text-sm font-black">{{ queueOverlayTitle }}</p>
+                <span class="shrink-0 rounded-full bg-white/10 px-2.5 py-1 text-[11px] font-black">
+                  {{ Math.min(queueCurrentIndex + 1, queueStats.total) }}/{{ queueStats.total }}
+                </span>
+              </div>
+              <p class="mt-0.5 truncate text-xs text-zinc-400">
+                {{ queueCurrentItem?.message || 'Đang chuẩn bị lượt đăng' }}
+              </p>
+            </div>
+          </div>
+
+          <div class="mt-5 overflow-hidden rounded-full bg-white/10">
+            <div
+              class="h-1.5 rounded-full bg-[#1877F2] transition-all duration-500"
+              :style="{ width: `${Math.max(queueProgressPercent, queueStats.total ? ((queueCurrentIndex + 0.35) / queueStats.total) * 100 : 0)}%` }"
+            ></div>
+          </div>
+
+          <div class="mt-5 grid grid-cols-[1fr_auto_1fr] items-center gap-3">
+            <div class="min-w-0 rounded-xl border border-white/10 bg-white/5 p-3">
+              <p class="text-[10px] font-black uppercase tracking-wider text-zinc-500">Đã xử lý</p>
+              <p class="mt-1 truncate text-xs font-bold text-zinc-200">{{ queuePreviousItem?.name || 'Chưa có' }}</p>
+              <p class="mt-1 text-[10px] text-emerald-400">
+                {{ queuePreviousItem?.status === 'done' ? 'Đăng thành công' : queuePreviousItem?.status === 'failed' ? 'Có lỗi' : 'Đã hoàn tất' }}
+              </p>
+            </div>
+            <ChevronRight class="h-5 w-5 text-zinc-600" />
+            <div class="min-w-0 rounded-xl border border-[#1877F2]/40 bg-[#1877F2]/10 p-3">
+              <p class="text-[10px] font-black uppercase tracking-wider text-blue-300">
+                {{ queuePhase === 'switching' ? 'Tiếp theo' : 'Đang thực hiện' }}
+              </p>
+              <p class="mt-1 truncate text-xs font-bold">{{ queueDisplayTarget?.name || 'Đang chuẩn bị' }}</p>
+              <p class="mt-1 truncate text-[10px] text-zinc-400">{{ queueDisplayTarget?.instanceName || 'LDPlayer' }}</p>
+            </div>
+          </div>
+
+          <div class="mt-4 flex items-center justify-between border-t border-white/10 pt-3 text-[11px] text-zinc-500">
+            <span>{{ queueStats.done }} thành công · {{ queueStats.failed }} lỗi</span>
+            <span>Không đóng cửa sổ</span>
+          </div>
+        </div>
+        <div v-else class="flex min-w-64 flex-col items-center rounded-2xl border border-white/10 bg-zinc-950/90 px-8 py-7 text-center text-white shadow-2xl">
+          <FacebookActivityIcon size="lg" />
+          <p class="mt-5 text-base font-black">{{ facebookActivityLabel }}</p>
+          <p class="mt-1 text-xs text-zinc-400">Vui lòng giữ nguyên cửa sổ trong khi hệ thống xử lý</p>
+          <div class="mt-5 h-1 w-36 overflow-hidden rounded-full bg-white/10">
+            <div class="h-full w-1/2 animate-pulse rounded-full bg-[#1877F2]"></div>
+          </div>
+        </div>
+      </div>
+    </Transition>
     <aside class="border-r border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
       <div class="sticky top-[73px] flex max-h-[calc(100vh-73px)] min-h-[calc(100vh-73px)] flex-col">
         <div class="border-b border-zinc-200 px-4 py-3 dark:border-zinc-800">
@@ -1618,8 +2025,7 @@ watch(selectedPlatformId, async () => {
               :disabled="running || facebookOpening || !canUseRemote || facebookAppReady"
               @click="remoteOpenApp"
             >
-              <Loader2 v-if="facebookOpening" class="h-4 w-4 animate-spin" />
-              <CheckCircle2 v-else-if="facebookAppReady" class="h-4 w-4" />
+              <CheckCircle2 v-if="facebookAppReady" class="h-4 w-4" />
               <Play v-else class="h-4 w-4" />
               {{ facebookOpenButtonLabel }}
             </button>
@@ -1858,25 +2264,68 @@ watch(selectedPlatformId, async () => {
             </div>
 
             <div class="rounded-xl border border-zinc-200 bg-white p-3 dark:border-zinc-800 dark:bg-zinc-950">
-              <label class="block text-xs font-extrabold uppercase tracking-wide text-zinc-500">
-                Nghỉ giữa hai LDPlayer
-                <input
-                  v-model.number="queueDelaySeconds"
-                  class="field mt-2"
-                  type="number"
-                  min="0"
-                  max="600"
+              <div>
+                <p class="text-xs font-black text-zinc-800 dark:text-zinc-100">Thời gian chuyển tài khoản</p>
+                <p class="mt-1 text-[11px] leading-4 text-zinc-500">Khoảng nghỉ trước khi hệ thống xử lý tài khoản tiếp theo.</p>
+              </div>
+              <div class="mt-3 flex h-11 items-center rounded-xl border border-zinc-200 bg-zinc-50 p-1 dark:border-zinc-700 dark:bg-zinc-900">
+                <button
+                  class="grid h-9 w-9 shrink-0 place-items-center rounded-lg text-lg font-bold text-zinc-500 transition hover:bg-white hover:text-zinc-950 disabled:opacity-40 dark:hover:bg-zinc-800 dark:hover:text-white"
+                  type="button"
+                  title="Giảm 5 giây"
+                  :disabled="posting || queueRunning || queueDelaySeconds <= 0"
+                  @click="adjustQueueDelay(-5)"
+                >
+                  −
+                </button>
+                <label class="flex min-w-0 flex-1 items-baseline justify-center gap-1">
+                  <input
+                    :value="queueDelaySeconds"
+                    class="w-12 bg-transparent text-center text-base font-black text-zinc-900 outline-none dark:text-white"
+                    type="text"
+                    inputmode="numeric"
+                    pattern="[0-9]*"
+                    maxlength="3"
+                    aria-label="Thời gian chuyển tài khoản"
+                    :disabled="posting || queueRunning"
+                    @input="handleQueueDelayInput"
+                  />
+                  <span class="text-[11px] font-bold text-zinc-500">giây</span>
+                </label>
+                <button
+                  class="grid h-9 w-9 shrink-0 place-items-center rounded-lg text-lg font-bold text-zinc-500 transition hover:bg-white hover:text-zinc-950 disabled:opacity-40 dark:hover:bg-zinc-800 dark:hover:text-white"
+                  type="button"
+                  title="Tăng 5 giây"
+                  :disabled="posting || queueRunning || queueDelaySeconds >= 600"
+                  @click="adjustQueueDelay(5)"
+                >
+                  +
+                </button>
+              </div>
+              <div class="mt-2 grid grid-cols-3 gap-1.5">
+                <button
+                  v-for="seconds in [0, 5, 10]"
+                  :key="seconds"
+                  :class="[
+                    'h-7 rounded-lg text-[10px] font-extrabold transition',
+                    queueDelaySeconds === seconds
+                      ? 'bg-zinc-900 text-white dark:bg-white dark:text-zinc-950'
+                      : 'bg-zinc-100 text-zinc-500 hover:text-zinc-900 dark:bg-zinc-900 dark:hover:text-white'
+                  ]"
+                  type="button"
                   :disabled="posting || queueRunning"
-                />
-              </label>
+                  @click="setQueueDelay(seconds)"
+                >
+                  {{ seconds === 0 ? 'Không nghỉ' : `${seconds} giây` }}
+                </button>
+              </div>
               <button
                 class="mt-3 inline-flex h-10 w-full items-center justify-center gap-2 rounded-lg bg-white px-4 text-sm font-extrabold text-zinc-950 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-white"
                 type="button"
                 :disabled="!canRunWorkflow"
                 @click="runPostWorkflow()"
               >
-                <Loader2 v-if="queueRunning" class="h-4 w-4 animate-spin" />
-                <Send v-else class="h-4 w-4" />
+                <Send class="h-4 w-4" />
                 Bắt đầu đăng
               </button>
             </div>
@@ -2104,14 +2553,13 @@ watch(selectedPlatformId, async () => {
               <div class="absolute right-3 top-3 flex items-center gap-2">
                 <button
                   v-if="!isBulkMode"
-                  class="inline-flex h-9 items-center gap-2 rounded-lg bg-white px-3 text-xs font-extrabold text-zinc-950 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-white"
+                  class="inline-flex h-9 min-w-20 items-center justify-center gap-2 rounded-lg bg-white px-3 text-xs font-extrabold text-zinc-950 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-white"
                   type="button"
                   :disabled="!canRunWorkflow"
                   :title="facebookAppReady || !requiresFacebookSession ? primaryActionLabel : `Mở ${selectedPlatform.label} trước khi đăng`"
                   @click="runPostWorkflow()"
                 >
-                  <Loader2 v-if="posting || queueRunning" class="h-4 w-4 animate-spin" />
-                  <Send v-else class="h-4 w-4" />
+                  <Send class="h-4 w-4" />
                   {{ primaryActionLabel }}
                 </button>
                 <button
@@ -2217,7 +2665,7 @@ watch(selectedPlatformId, async () => {
                   </div>
                 </div>
 
-                <div class="relative border-b border-zinc-200 pb-3 dark:border-zinc-700">
+                <div class="border-b border-zinc-200 pb-3 dark:border-zinc-700">
                 <textarea
                   ref="composerTextarea"
                   v-model="post.text"
@@ -2225,58 +2673,92 @@ watch(selectedPlatformId, async () => {
                   placeholder="Bạn đang nghĩ gì?"
                   @focus="showEmojiPicker = false"
                 ></textarea>
-                <div
-                  v-if="showEmojiPicker"
-                  class="absolute bottom-12 right-0 z-20 w-[330px] max-w-[calc(100vw-5rem)] rounded-2xl border border-zinc-700 bg-zinc-900 p-3 text-white shadow-2xl"
-                >
-                  <div v-for="group in emojiGroups" :key="group.label" class="mb-3 last:mb-0">
-                    <p class="mb-2 text-xs font-bold text-zinc-400">{{ group.label }}</p>
-                    <div class="grid grid-cols-8 gap-1">
+              </div>
+
+                <div v-if="post.media.length" class="space-y-3">
+                  <div
+                    v-if="selectedPlatformId === 'facebook' && canArrangePhotos"
+                    class="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-2.5 dark:border-zinc-700 dark:bg-zinc-900"
+                  >
+                    <div class="flex min-w-0 items-center gap-2.5">
+                      <span class="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-zinc-200 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
+                        <ListChecks class="h-4 w-4" />
+                      </span>
+                      <div class="min-w-0">
+                        <p class="text-xs font-black text-zinc-800 dark:text-zinc-100">Trình bày ảnh</p>
+                        <p class="truncate text-[11px] text-zinc-500">Chọn bố cục · Kéo thả để sắp xếp · Xuất thành một ảnh ghép</p>
+                      </div>
+                    </div>
+                    <div class="inline-flex max-w-full items-center gap-1 rounded-lg border border-zinc-200 bg-white p-1 dark:border-zinc-700 dark:bg-zinc-950">
                       <button
-                        v-for="emoji in group.items"
-                        :key="`${group.label}-${emoji}`"
-                        class="grid h-8 w-8 place-items-center rounded-lg text-xl hover:bg-zinc-700"
+                        v-for="layout in availablePhotoLayouts"
+                        :key="layout.id"
+                        :class="[
+                          'group inline-flex h-9 items-center gap-2 rounded-md px-2.5 text-xs font-extrabold transition',
+                          photoLayout === layout.id
+                            ? 'bg-zinc-900 text-white shadow-sm dark:bg-white dark:text-zinc-950'
+                            : 'text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-white'
+                        ]"
                         type="button"
-                        @click="insertEmoji(emoji)"
+                        :title="layout.description"
+                        @click="photoLayout = layout.id"
                       >
-                        {{ emoji }}
+                        <span class="grid h-5 w-7 shrink-0 grid-cols-2 gap-px overflow-hidden rounded-sm bg-zinc-300 dark:bg-zinc-700">
+                          <span
+                            :class="[
+                              'bg-current opacity-70',
+                              layout.id === 'focus-first' ? 'row-span-2' : '',
+                              layout.id === 'hero-top' ? 'col-span-2' : ''
+                            ]"
+                          ></span>
+                          <span class="bg-current opacity-40"></span>
+                          <span class="bg-current opacity-40"></span>
+                        </span>
+                        <span class="hidden sm:inline">{{ layout.label }}</span>
                       </button>
                     </div>
                   </div>
-                  <div class="mt-3 flex items-center justify-between border-t border-zinc-700 pt-2 text-xs text-zinc-500">
-                    <span>Emoji sẽ chèn vào nội dung bài viết</span>
-                    <button class="font-bold text-zinc-300 hover:text-white" type="button" @click="showEmojiPicker = false">Đóng</button>
-                  </div>
-                </div>
-              </div>
-
-                <div v-if="post.media.length">
-                  <div class="grid gap-3 sm:grid-cols-2">
+                  <div
+                    :class="[
+                      selectedVideo ? 'grid gap-3' : previewGalleryClass,
+                      !selectedVideo && 'overflow-hidden rounded-xl border border-zinc-300 bg-zinc-200 dark:border-zinc-700 dark:bg-zinc-800'
+                    ]"
+                  >
                     <div
-                      v-for="item in post.media"
+                      v-for="(item, index) in post.media"
                       :key="item.id"
-                      :draggable="isInstagramAlbumMode && item.type === 'photo'"
-                      class="group relative overflow-hidden rounded-2xl border border-zinc-300 bg-zinc-100 shadow-sm dark:border-zinc-700 dark:bg-zinc-900"
-                      @dragstart="isInstagramAlbumMode && startPreviewPhotoDrag(item, $event)"
+                      :draggable="canArrangePhotos && item.type === 'photo'"
+                      :class="[
+                        'group relative min-h-0 overflow-hidden bg-zinc-100 dark:bg-zinc-900',
+                        selectedVideo ? 'rounded-xl border border-zinc-300 shadow-sm dark:border-zinc-700' : '',
+                        item.type === 'photo' ? previewPhotoClass(index) : ''
+                      ]"
+                      @dragstart="canArrangePhotos && startPreviewPhotoDrag(item, $event)"
                       @dragover.prevent
-                      @drop="isInstagramAlbumMode && dropPreviewPhoto(item, $event)"
+                      @drop="canArrangePhotos && dropPreviewPhoto(item, $event)"
                     >
-                      <img v-if="item.type === 'photo'" :src="item.url" :alt="item.name" class="h-52 w-full object-cover" />
+                      <img v-if="item.type === 'photo'" :src="item.url" :alt="item.name" :class="previewImageClass()" />
                       <video v-else-if="item.type === 'video'" :src="item.url" class="h-64 w-full bg-black object-contain" controls playsinline></video>
+                      <span
+                        v-if="canArrangePhotos && item.type === 'photo'"
+                        class="absolute left-2.5 top-2.5 grid h-7 min-w-7 place-items-center rounded-full border border-white/20 bg-black/70 px-2 text-[11px] font-black text-white shadow-sm backdrop-blur"
+                      >
+                        {{ previewPhotoOrder(item) + 1 }}
+                      </span>
                       <button
-                        class="absolute right-2 top-2 grid h-8 w-8 place-items-center rounded-full bg-black/70 text-white transition hover:bg-black"
+                        class="absolute right-2.5 top-2.5 grid h-8 w-8 place-items-center rounded-full border border-white/20 bg-black/60 text-white opacity-0 shadow-sm backdrop-blur transition hover:bg-black group-hover:opacity-100 focus:opacity-100"
                         title="Xóa tệp"
                         type="button"
                         @click="removeMedia(item)"
                       >
                         <XCircle class="h-5 w-5" />
                       </button>
-                      <div class="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent px-3 py-2">
+                      <div class="absolute inset-x-0 bottom-0 translate-y-2 bg-gradient-to-t from-black/90 via-black/55 to-transparent px-3 pb-2.5 pt-8 opacity-0 transition group-hover:translate-y-0 group-hover:opacity-100">
                         <div class="flex items-center justify-between gap-2">
                           <p class="truncate text-xs font-bold text-white">
-                            <span v-if="isInstagramAlbumMode && item.type === 'photo'">{{ previewPhotoOrder(item) + 1 }}. </span>{{ item.name }}
+                            {{ item.name }}
                           </p>
-                          <div v-if="isInstagramAlbumMode && item.type === 'photo'" class="flex shrink-0 items-center gap-1">
+                          <div v-if="canArrangePhotos && item.type === 'photo'" class="flex shrink-0 items-center gap-1">
                             <button
                               class="grid h-7 w-7 place-items-center rounded-md bg-black/60 text-white disabled:opacity-30"
                               title="Chuyển ảnh sang trái"
@@ -2334,15 +2816,40 @@ watch(selectedPlatformId, async () => {
                       <Video class="h-4 w-4" />
                       Video
                     </button>
-                    <button
-                      class="inline-flex h-9 items-center gap-2 rounded-lg px-3 text-xs font-extrabold text-orange-500 transition hover:bg-white hover:text-orange-600 dark:hover:bg-zinc-800"
-                      title="Chọn icon cảm xúc"
-                      type="button"
-                      @click="showEmojiPicker = !showEmojiPicker"
-                    >
-                      ☺
-                      Cảm xúc
-                    </button>
+                    <div class="relative">
+                      <button
+                        class="inline-flex h-9 items-center gap-2 rounded-lg px-3 text-xs font-extrabold text-orange-500 transition hover:bg-white hover:text-orange-600 dark:hover:bg-zinc-800"
+                        title="Chọn icon cảm xúc"
+                        type="button"
+                        @click="showEmojiPicker = !showEmojiPicker"
+                      >
+                        ☺
+                        Cảm xúc
+                      </button>
+                      <div
+                        v-if="showEmojiPicker"
+                        class="absolute bottom-full right-0 z-50 mb-2 w-[330px] max-w-[calc(100vw-3rem)] rounded-2xl border border-zinc-700 bg-zinc-900 p-3 text-white shadow-2xl"
+                      >
+                        <div v-for="group in emojiGroups" :key="group.label" class="mb-3 last:mb-0">
+                          <p class="mb-2 text-xs font-bold text-zinc-400">{{ group.label }}</p>
+                          <div class="grid grid-cols-8 gap-1">
+                            <button
+                              v-for="emoji in group.items"
+                              :key="`${group.label}-${emoji}`"
+                              class="grid h-8 w-8 place-items-center rounded-lg text-xl hover:bg-zinc-700"
+                              type="button"
+                              @click="insertEmoji(emoji)"
+                            >
+                              {{ emoji }}
+                            </button>
+                          </div>
+                        </div>
+                        <div class="mt-3 flex items-center justify-between border-t border-zinc-700 pt-2 text-xs text-zinc-500">
+                          <span>Emoji sẽ chèn vào nội dung bài viết</span>
+                          <button class="font-bold text-zinc-300 hover:text-white" type="button" @click="showEmojiPicker = false">Đóng</button>
+                        </div>
+                      </div>
+                    </div>
                     </div>
                   </div>
                   <button
@@ -2376,20 +2883,20 @@ watch(selectedPlatformId, async () => {
                   </div>
                   <div>
                     <p class="font-extrabold">{{ selectedAccount?.displayName || `${selectedPlatform.label} profile` }}</p>
-                    <p class="text-xs text-zinc-500">Preview bài đăng · {{ characterCount }}/5000 ký tự</p>
+                    <p class="text-xs text-zinc-500">Xem trước bài đăng · {{ characterCount }}/5000 ký tự</p>
                   </div>
                 </div>
                 <div v-if="finalPostText" class="space-y-3 text-lg leading-8">
                   <p v-if="previewCaption" class="whitespace-pre-wrap">{{ previewCaption }}</p>
                 </div>
-                <p v-else class="text-lg leading-8 text-zinc-500">Chưa có nội dung preview.</p>
-                <div v-if="previewPhotos.length" class="grid gap-2 sm:grid-cols-2">
+                <p v-else class="text-lg leading-8 text-zinc-500">Chưa có nội dung để xem trước.</p>
+                <div v-if="previewPhotos.length" :class="previewGalleryClass">
                   <div
-                    v-for="item in facebookPreviewPhotos"
+                    v-for="(item, index) in facebookPreviewPhotos"
                     :key="`preview-${item.id}`"
-                    class="overflow-hidden rounded-lg bg-zinc-950"
+                    :class="['overflow-hidden bg-zinc-950', previewPhotoClass(index)]"
                   >
-                    <img :src="item.url" :alt="item.name" class="h-64 w-full object-cover" />
+                    <img :src="item.url" :alt="item.name" :class="previewImageClass()" />
                   </div>
                 </div>
                 <div v-if="selectedVideo" class="overflow-hidden rounded-lg bg-black">
@@ -2409,8 +2916,8 @@ watch(selectedPlatformId, async () => {
               <div v-if="composerTab === 'queue'" class="space-y-3 rounded-xl border border-zinc-200 p-4 dark:border-zinc-700">
                 <div class="flex flex-wrap items-center justify-between gap-3">
                   <div>
-                    <p class="font-extrabold">Nháp & lịch đã lưu</p>
-                    <p class="mt-1 text-sm text-zinc-500">Dùng để tải lại nội dung, nhân bản hoặc chuẩn bị lịch đăng.</p>
+                    <p class="font-extrabold">Bài đã lưu</p>
+                    <p class="mt-1 text-sm text-zinc-500">Quản lý bài nháp và lịch đăng để tiếp tục chỉnh sửa khi cần.</p>
                   </div>
                   <span class="rounded-full bg-zinc-100 px-3 py-1 text-xs font-extrabold text-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
                     {{ drafts.length }} mục

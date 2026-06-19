@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'crypto';
-import { readFileSync, statSync } from 'fs';
+import { existsSync, readFileSync, statSync } from 'fs';
 import path from 'path';
 import { env } from '../../config/env.js';
 import { getLocalUploadPath } from '../../utils/media-file.js';
@@ -10,8 +10,11 @@ import { writeMobileLog as writeLog } from './mobile-log.service.js';
 const localImageHashCache = new Map();
 const instagramPermissionCache = new Map();
 const directUiDumpSupport = new Map();
+const uiDumpCache = new Map();
+const uiDumpInFlight = new Map();
 const facebookMediaRoot = '/sdcard/Pictures/SocialPilot';
 const instagramPermissionCacheTtlMs = 10 * 60 * 1000;
+const uiDumpCacheTtlMs = 350;
 
 const defaultPackages = {
   facebook: 'com.facebook.katana',
@@ -97,6 +100,13 @@ const postTitleLabels = ['Bài viết mới', 'Bai viet moi', 'Create post'];
 const textEditorLabels = ['Thêm văn bản', 'Them van ban', 'Add text'];
 const loginBlockLabels = ['Log in', 'Đăng nhập', 'Dang nhap', 'Choose a way to confirm your account', 'Confirm your account', 'Session Expired'];
 const facebookHomeLabels = ['Trang chủ', 'Trang chu', 'Home'];
+const systemAnrLabels = [
+  "System UI isn't responding",
+  'System UI is not responding',
+  'Giao diện hệ thống không phản hồi',
+  'System UI không phản hồi'
+];
+const systemAnrWaitLabels = ['Wait', 'Chờ', 'Đợi'];
 const instagramNextLabels = ['Next', 'Tiếp', 'Tiep'];
 const instagramShareLabels = ['Share', 'Chia sẻ', 'Chia se'];
 const instagramCaptionLabels = ['Write a caption', 'Write a caption...', 'Add a caption', 'Caption', 'Viết chú thích', 'Viet chu thich', 'Chú thích', 'Chu thich'];
@@ -296,7 +306,10 @@ async function getLdPlayerDeviceTarget(instanceName = '') {
 
 async function ensureDeviceReady(account, userId, target, attempts = 8) {
   let lastState = null;
-  await runCommand(env.mobileAutomation.adbPath, ['start-server'], { timeoutMs: 10_000 });
+  const initialState = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'get-state'], { timeoutMs: 4_000 });
+  if (initialState.ok && String(initialState.stdout || '').trim() === 'device') return initialState;
+
+  await runCommand(env.mobileAutomation.adbPath, ['start-server'], { timeoutMs: 8_000 });
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const state = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'get-state'], { timeoutMs: 10_000 });
     lastState = state;
@@ -370,13 +383,6 @@ async function ensureAndroidStorageReady(account, userId, target, attempts = 45)
 }
 
 async function getDeviceScreenSize(target) {
-  const nodes = await dumpVisibleNodes(target);
-  const width = nodes.reduce((max, node) => Math.max(max, node.bounds?.right || 0), 0);
-  const height = nodes.reduce((max, node) => Math.max(max, node.bounds?.bottom || 0), 0);
-  if (width > 0 && height > 0) {
-    return { width, height, source: 'ui_hierarchy' };
-  }
-
   const result = await runCommand(env.mobileAutomation.adbPath, [
     '-s',
     target,
@@ -387,12 +393,18 @@ async function getDeviceScreenSize(target) {
   const output = String(result.stdout || '');
   const match = output.match(/Override size:\s*(\d+)x(\d+)/i)
     || output.match(/Physical size:\s*(\d+)x(\d+)/i);
-  if (!match) return null;
-  return {
-    width: Number(match[1]),
-    height: Number(match[2]),
-    source: 'wm_size'
-  };
+  if (match) {
+    return {
+      width: Number(match[1]),
+      height: Number(match[2]),
+      source: 'wm_size'
+    };
+  }
+
+  const nodes = await dumpVisibleNodes(target);
+  const width = nodes.reduce((max, node) => Math.max(max, node.bounds?.right || 0), 0);
+  const height = nodes.reduce((max, node) => Math.max(max, node.bounds?.bottom || 0), 0);
+  return width > 0 && height > 0 ? { width, height, source: 'ui_hierarchy' } : null;
 }
 
 async function ensurePortraitOrientation(account, userId, target) {
@@ -507,6 +519,7 @@ async function resetInstagramDisplaySize(account, userId, target) {
 }
 
 export async function openAccountApp(account, userId, appPackage) {
+  const startedAt = Date.now();
   let target = getDeviceTarget(account);
   const packageName = appPackage || account.metadata?.appPackage || defaultPackages[account.platform];
   if (!target) throw new Error('Thiếu deviceId hoặc adbHost.');
@@ -528,28 +541,99 @@ export async function openAccountApp(account, userId, appPackage) {
     throw new Error(ready.error || ready.stderr || `ADB ${target} chưa sẵn sàng.`);
   }
 
+  const foregroundBefore = await getForegroundAndroidPackage(target);
+  if (foregroundBefore.packageName === packageName) {
+    const readiness = await waitForAppForegroundReady(account, userId, target, packageName, 4_000, {
+      stableChecks: 1,
+      requireVisibleUi: false
+    });
+    if (readiness.ok) {
+      const fastResult = {
+        ok: true,
+        launchMethod: 'already_foreground',
+        target,
+        packageName,
+        elapsedMs: Date.now() - startedAt,
+        readiness,
+        home: packageName === defaultPackages.facebook
+          ? await ensureFacebookHomeOnOpen(account, userId, target, packageName, { fast: true })
+          : null
+      };
+      await writeLog(userId, account._id, 'info', 'remote_open_app_fast_path', `App ${packageName} đã mở sẵn.`, fastResult);
+      return fastResult;
+    }
+  }
+
   let result = packageName === defaultPackages.facebook
-    ? await launchFacebookFresh(target, packageName)
-    : await launchAppFresh(target, packageName);
+    ? await launchFacebookWarm(target, packageName)
+    : await launchAppWarm(target, packageName);
   if (!result.ok && /offline|not found|no devices/i.test(`${result.error || ''} ${result.stderr || ''}`)) {
     const retryReady = await ensureDeviceReady(account, userId, target, 4);
     if (retryReady.ok && retryReady.stdout === 'device') {
       result = packageName === defaultPackages.facebook
-        ? await launchFacebookFresh(target, packageName)
-        : await launchAppFresh(target, packageName);
+        ? await launchFacebookWarm(target, packageName)
+        : await launchAppWarm(target, packageName);
     }
   }
   await writeLog(userId, account._id, result.ok ? 'info' : 'error', 'remote_open_app', result.ok ? `Đã mở app ${packageName}.` : `Mở app lỗi ${packageName}.`, result);
   if (!result.ok) throw new Error(result.error || result.stderr || 'Open app failed.');
-  const readiness = await waitForAppForegroundReady(account, userId, target, packageName);
+  let readiness = await waitForAppForegroundReady(account, userId, target, packageName, 7_000, {
+    stableChecks: 1,
+    requireVisibleUi: false
+  });
+  if (!readiness.ok) {
+    result = packageName === defaultPackages.facebook
+      ? await launchFacebookFresh(target, packageName)
+      : await launchAppFresh(target, packageName);
+    if (!result.ok) throw new Error(result.error || result.stderr || 'Open app failed.');
+    readiness = await waitForAppForegroundReady(account, userId, target, packageName, 14_000);
+  }
   if (!readiness.ok) {
     throw new Error(readiness.error || `${packageName} chưa ổn định trên LDPlayer.`);
   }
   let home = null;
   if (packageName === defaultPackages.facebook) {
-    home = await ensureFacebookHomeOnOpen(account, userId, target, packageName);
+    home = await ensureFacebookHomeOnOpen(account, userId, target, packageName, { fast: true });
   }
-  return { ...result, readiness, home };
+  return { ...result, readiness, home, elapsedMs: Date.now() - startedAt };
+}
+
+async function launchAppWarm(target, packageName) {
+  const launch = await runCommand(env.mobileAutomation.adbPath, [
+    '-s',
+    target,
+    'shell',
+    'monkey',
+    '-p',
+    packageName,
+    '-c',
+    'android.intent.category.LAUNCHER',
+    '1'
+  ], { timeoutMs: 8_000 });
+  return { ...launch, launchMethod: 'warm_monkey' };
+}
+
+async function launchFacebookWarm(target, packageName) {
+  const feed = await runCommand(env.mobileAutomation.adbPath, [
+    '-s',
+    target,
+    'shell',
+    'am',
+    'start',
+    '-a',
+    'android.intent.action.VIEW',
+    '-d',
+    'fb://feed',
+    '-p',
+    packageName,
+    '-f',
+    '0x14000000'
+  ], { timeoutMs: 8_000 });
+  const output = `${feed.stdout || ''}\n${feed.stderr || ''}`;
+  if (feed.ok && !/error:|unable to resolve/i.test(output)) {
+    return { ...feed, launchMethod: 'facebook_warm_feed_uri' };
+  }
+  return launchAppWarm(target, packageName);
 }
 
 async function launchAppFresh(target, packageName) {
@@ -602,12 +686,14 @@ async function launchAppFresh(target, packageName) {
   };
 }
 
-async function waitForAppForegroundReady(account, userId, target, packageName, timeoutMs = 18_000) {
+async function waitForAppForegroundReady(account, userId, target, packageName, timeoutMs = 18_000, options = {}) {
   const startedAt = Date.now();
   let lastForeground = null;
   let stableForegroundCount = 0;
+  const stableChecks = Math.max(1, Number(options.stableChecks || 2));
+  const requireVisibleUi = options.requireVisibleUi !== false;
   while (Date.now() - startedAt < timeoutMs) {
-    await delay(900);
+    await delay(stableForegroundCount ? 350 : 450);
     const foreground = await getForegroundAndroidPackage(target);
     lastForeground = foreground;
     if (foreground.packageName !== packageName) {
@@ -615,10 +701,13 @@ async function waitForAppForegroundReady(account, userId, target, packageName, t
       continue;
     }
 
-    const nodes = await dumpVisibleNodes(target);
-    const hasVisibleUi = nodes.length >= 3;
     stableForegroundCount += 1;
-    if (stableForegroundCount >= 2 && hasVisibleUi) {
+    let nodes = [];
+    if (requireVisibleUi && stableForegroundCount >= stableChecks) {
+      nodes = await dumpVisibleNodes(target);
+    }
+    const hasVisibleUi = !requireVisibleUi || nodes.length >= 3;
+    if (stableForegroundCount >= stableChecks && hasVisibleUi) {
       const ready = {
         ok: true,
         target,
@@ -721,9 +810,15 @@ async function launchFacebookFresh(target, packageName) {
   };
 }
 
-async function ensureFacebookHomeOnOpen(account, userId, target, packageName) {
-  await delay(1200);
+async function ensureFacebookHomeOnOpen(account, userId, target, packageName, options = {}) {
+  await delay(options.fast ? 350 : 1200);
   let state = await detectFacebookState(target, '');
+  if (state.name === 'system_anr') {
+    const recovered = await recoverSystemUiAnr(account, userId, target, state);
+    if (!recovered.ok) throw new Error('System UI của LDPlayer không phản hồi.');
+    invalidateUiDump(target);
+    state = await detectFacebookState(target, '');
+  }
   if (state.name === 'blocked') {
     throw new Error('Facebook đang yêu cầu đăng nhập hoặc xác minh tài khoản.');
   }
@@ -732,9 +827,29 @@ async function ensureFacebookHomeOnOpen(account, userId, target, packageName) {
     return { ok: true, verified: true, state };
   }
 
-  if (state.name === 'discard_dialog') {
-    await tapTextOrPoint(account, userId, target, discardPostLabels, { x: 450, y: 1460 }, 'remote_open_app_discard_draft', { exact: true });
-    await delay(500);
+  if (['discard_dialog', 'ready_to_post', 'composer', 'stale_composer', 'text_editor'].includes(state.name)) {
+    const normalized = await discardStaleFacebookComposer(account, userId, target, state);
+    state = normalized.state;
+    if (state.name === 'home') {
+      await writeLog(userId, account._id, 'info', 'remote_open_facebook_home', 'Đã đóng phiên soạn bài cũ và đưa Facebook về trang chủ.', {
+        state,
+        recovery: normalized
+      });
+      return { ok: true, verified: true, state, recovery: normalized };
+    }
+  }
+
+  if (options.fast && state.name === 'unknown') {
+    const active = await getForegroundAndroidPackage(target);
+    if (active.packageName === packageName) {
+      const feed = await launchFacebookWarm(target, packageName);
+      await delay(500);
+      invalidateUiDump(target);
+      state = await detectFacebookState(target, '');
+      if (state.name === 'home') {
+        return { ok: true, verified: true, state, active, feed, fastPath: true };
+      }
+    }
   }
 
   const screen = await getDeviceScreenSize(target);
@@ -765,6 +880,59 @@ async function ensureFacebookHomeOnOpen(account, userId, target, packageName) {
     throw new Error('Facebook chưa mở thành công trên LDPlayer.');
   }
   return { ok: true, verified, state };
+}
+
+async function discardStaleFacebookComposer(account, userId, target, initialState) {
+  let state = initialState;
+  const steps = [];
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    if (state.name === 'home') return { ok: true, state, steps, attempt };
+
+    if (state.name === 'discard_dialog') {
+      const nodes = await dumpVisibleNodes(target);
+      const discard = findNodeInNodes(nodes, discardPostLabels, { exact: true });
+      if (discard) {
+        const point = {
+          x: Math.round((discard.left + discard.right) / 2),
+          y: Math.round((discard.top + discard.bottom) / 2)
+        };
+        const result = await tapAndLog(userId, account._id, target, 'remote_open_app_discard_stale_draft', point);
+        steps.push(result);
+      } else {
+        const back = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'input', 'keyevent', '4'], { timeoutMs: 5_000 });
+        invalidateUiDump(target);
+        steps.push(back);
+      }
+      await delay(450);
+    } else {
+      const back = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'input', 'keyevent', '4'], { timeoutMs: 5_000 });
+      invalidateUiDump(target);
+      steps.push(back);
+      await writeLog(
+        userId,
+        account._id,
+        back.ok ? 'info' : 'warn',
+        'remote_open_app_close_stale_composer',
+        back.ok ? 'Đã đóng màn soạn bài còn lại từ phiên trước.' : 'Không đóng được màn soạn bài cũ.',
+        { attempt, previousState: state.name, back }
+      );
+      await delay(450);
+    }
+
+    invalidateUiDump(target);
+    state = await detectFacebookState(target, '');
+  }
+
+  if (state.name !== 'home') {
+    const feed = await launchFacebookWarm(target, defaultPackages.facebook);
+    steps.push(feed);
+    await delay(600);
+    invalidateUiDump(target);
+    state = await detectFacebookState(target, '');
+  }
+
+  return { ok: state.name === 'home', state, steps, attempt: 3 };
 }
 
 async function getForegroundAndroidPackage(target) {
@@ -1099,6 +1267,7 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
     if (videos.length) {
       preparedVideos = await prepareFacebookVideos(account, userId, target, videos);
       perf.mark('video_prepared', { videoCount: preparedVideos.length });
+      await assertDeviceConnected(target, 'trước khi mở Facebook composer');
       openHome = await openFacebookComposer(account, userId, target, config, text, preparedVideos, 'video');
       perf.mark('composer_opened', { method: openHome.method || '' });
       if (openHome.method !== 'video_share_intent') {
@@ -1126,15 +1295,18 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
     } else if (images.length === 1) {
       preparedImages = await prepareFacebookImages(account, userId, target, images, { cleanup: false });
       perf.mark('image_prepared', { imageCount: preparedImages.length });
+      await assertDeviceConnected(target, 'trước khi mở Facebook composer');
       openHome = await openFacebookComposer(account, userId, target, config, text, preparedImages, 'image');
       perf.mark('composer_opened', { method: openHome.method || '' });
     } else {
+      await assertDeviceConnected(target, 'trước khi mở Facebook composer');
       openHome = await openFacebookComposer(account, userId, target, config, text, [], 'image');
       perf.mark('composer_opened', { method: openHome.method || '' });
     }
     for (const preparedImage of preparedImages) steps.push(...preparedImage.steps);
     for (const preparedVideo of preparedVideos) steps.push(...preparedVideo.steps);
     steps.push(openHome);
+    await assertDeviceConnected(target, 'sau khi mở Facebook composer');
     await delay(postStepDelay());
 
     const stateMachine = await runFacebookPostStateMachine(
@@ -2263,21 +2435,21 @@ async function resolveStableDeviceTarget(target) {
   return target;
 }
 
-async function openFacebookComposer(account, userId, target, config, text, media = [], mediaKind = 'image') {
-  const stop = await runCommand(env.mobileAutomation.adbPath, [
-    '-s',
-    target,
-    'shell',
-    'am',
-    'force-stop',
-    config.appPackage
-  ]);
-  await writeLog(userId, account._id, stop.ok ? 'info' : 'warn', 'facebook_post_reset_app_task', stop.ok ? 'Đã đóng task Facebook cũ trước khi mở composer mới.' : 'Không đóng được task Facebook cũ.', stop);
-  await delay(postStepDelay());
+async function assertDeviceConnected(target, stage = '') {
+  const state = await runCommand(
+    env.mobileAutomation.adbPath,
+    ['-s', target, 'get-state'],
+    { timeoutMs: 4_000 }
+  );
+  if (state.ok && String(state.stdout || '').trim() === 'device') return state;
+  const detail = stage ? ` ${stage}` : '';
+  throw new Error(`ADB ${target} đã mất kết nối${detail}. Hãy chờ LDPlayer ổn định rồi thử lại.`);
+}
 
+async function openFacebookComposer(account, userId, target, config, text, media = [], mediaKind = 'image') {
   // Facebook hides the gallery action after receiving an image through a share
   // intent. Use that fast path only for one image; multi-image posts must start
-  // from a clean text composer and select all media from Facebook's gallery.
+  // from a text composer and select all media from Facebook's gallery.
   const primaryMedia = media.length === 1 ? media[0] : null;
   const intentType = primaryMedia?.mimeType || 'text/plain';
   const intentArgs = [
@@ -2307,20 +2479,19 @@ async function openFacebookComposer(account, userId, target, config, text, media
     `${config.appPackage}/com.facebook.composer.shareintent.ImplicitShareIntentHandlerDefaultAlias`
   );
 
-  const shareIntent = await runCommand(env.mobileAutomation.adbPath, intentArgs);
+  let shareIntent = await runCommand(env.mobileAutomation.adbPath, intentArgs, { timeoutMs: 12_000 });
+  let coldRetry = null;
+  if (!isSuccessfulFacebookShareIntent(shareIntent)) {
+    coldRetry = await resetFacebookTaskForComposer(account, userId, target, config.appPackage, shareIntent);
+    shareIntent = await runCommand(env.mobileAutomation.adbPath, intentArgs, { timeoutMs: 15_000 });
+  }
 
-  if (shareIntent.ok) {
-    if (shareIntent.stderr && /error:/i.test(shareIntent.stderr)) {
-      if (mediaKind === 'video' && primaryMedia?.remotePath) {
-        const genericShare = await openFacebookGenericShareComposer(account, userId, target, config, intentArgs, 'video');
-        if (genericShare.ok) return genericShare;
-      }
-      return openFacebookHome(account, userId, target, config, shareIntent);
-    }
-
+  if (isSuccessfulFacebookShareIntent(shareIntent)) {
     await writeLog(userId, account._id, 'info', 'facebook_post_open_share_composer', 'Đã mở Facebook composer bằng Android share intent để giữ Unicode.', {
       ...shareIntent,
-      args: maskShareIntentArgs(intentArgs)
+      args: maskShareIntentArgs(intentArgs),
+      launchMode: coldRetry ? 'cold_retry' : 'warm',
+      coldRetry
     });
     return { ...shareIntent, method: primaryMedia ? `${mediaKind}_share_intent` : 'text_share_intent' };
   }
@@ -2331,6 +2502,41 @@ async function openFacebookComposer(account, userId, target, config, text, media
   }
 
   return openFacebookHome(account, userId, target, config, shareIntent);
+}
+
+function isSuccessfulFacebookShareIntent(result) {
+  if (!result?.ok) return false;
+  const output = `${result.stdout || ''}\n${result.stderr || ''}`;
+  return !/error:|unable to resolve|activity not started|exception/i.test(output);
+}
+
+async function resetFacebookTaskForComposer(account, userId, target, packageName, firstAttempt) {
+  const stop = await runCommand(env.mobileAutomation.adbPath, [
+    '-s',
+    target,
+    'shell',
+    'am',
+    'force-stop',
+    packageName
+  ], { timeoutMs: 8_000 });
+  await writeLog(
+    userId,
+    account._id,
+    stop.ok ? 'warn' : 'error',
+    'facebook_post_reset_app_task_retry',
+    stop.ok
+      ? 'Warm start composer thất bại; đã đóng Facebook để thử lại một lần.'
+      : 'Warm start composer thất bại và không đóng được Facebook để retry.',
+    {
+      stop,
+      firstAttempt: {
+        ...firstAttempt,
+        args: maskShareIntentArgs(firstAttempt?.args || [])
+      }
+    }
+  );
+  if (stop.ok) await delay(250);
+  return stop;
 }
 
 async function openFacebookGenericShareComposer(account, userId, target, config, baseIntentArgs, mediaKind) {
@@ -2721,23 +2927,10 @@ async function registerFacebookImageMedia(account, userId, target, preparedImage
     ]);
     steps.push(scan);
     await delay(postStepDelay());
-    mediaQuery = await runCommand(env.mobileAutomation.adbPath, [
-      '-s',
-      target,
-      'shell',
-      'content',
-      'query',
-      '--uri',
-      'content://media/external/images/media',
-      '--projection',
-      '_id:_data'
-    ]);
+    const scannedMedia = await findAndroidMediaByPath(target, remotePath);
+    mediaQuery = scannedMedia.query;
     steps.push(mediaQuery);
-    const mediaRow = mediaQuery.ok
-      ? String(mediaQuery.stdout || '').split(/\r?\n/).find((row) => row.includes(remotePath))
-      : '';
-    const mediaId = mediaRow?.match(/_id=(\d+)/)?.[1] || null;
-    contentUri = mediaId ? `content://media/external/images/media/${mediaId}` : '';
+    contentUri = scannedMedia.contentUri;
   }
   await writeLog(
     userId,
@@ -2833,23 +3026,9 @@ async function registerFacebookVideoMedia(account, userId, target, preparedVideo
     ]);
     steps.push(scan);
     await delay(postStepDelay());
-    const mediaQuery = await runCommand(env.mobileAutomation.adbPath, [
-      '-s',
-      target,
-      'shell',
-      'content',
-      'query',
-      '--uri',
-      'content://media/external/video/media',
-      '--projection',
-      '_id:_data'
-    ]);
-    steps.push(mediaQuery);
-    const mediaRow = mediaQuery.ok
-      ? String(mediaQuery.stdout || '').split(/\r?\n/).find((row) => row.includes(remotePath))
-      : '';
-    const mediaId = mediaRow?.match(/_id=(\d+)/)?.[1] || null;
-    contentUri = mediaId ? `content://media/external/video/media/${mediaId}` : '';
+    const scannedMedia = await findAndroidMediaByPath(target, remotePath, 'video');
+    steps.push(scannedMedia.query);
+    contentUri = scannedMedia.contentUri;
   }
   await writeLog(
     userId,
@@ -2899,8 +3078,10 @@ async function findAndroidMediaByPath(target, remotePath, mediaKind = 'image') {
     '--uri',
     mediaUri,
     '--projection',
-    '_id:_data'
-  ]);
+    '_id:_data',
+    '--where',
+    `_data='${remotePath.replace(/'/g, "''")}'`
+  ], { timeoutMs: 8_000, maxBuffer: 256 * 1024 });
   const mediaRow = query.ok
     ? String(query.stdout || '').split(/\r?\n/).find((row) => row.includes(remotePath))
     : '';
@@ -2989,6 +3170,20 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
       observedText: state.observedText || ''
     });
 
+    if (state.name === 'system_anr') {
+      const recovered = await recoverSystemUiAnr(account, userId, target, state);
+      steps.push(recovered);
+      if (!recovered.ok) {
+        screenshot = await captureScreenshot(account, userId, 'system_ui_anr_unresolved');
+        throw new Error('System UI của LDPlayer không phản hồi. Hãy tăng RAM/CPU hoặc khởi động lại LDPlayer.');
+      }
+      continue;
+    }
+
+    if (state.name === 'unknown' && state.reason === 'no_uiautomator_nodes') {
+      await assertDeviceConnected(target, 'trong lúc điều khiển Facebook');
+    }
+
     if (state.name === 'blocked') {
       screenshot = await captureScreenshot(account, userId, 'facebook_post_blocked');
       throw new Error('Facebook đang ở màn đăng nhập/checkpoint/session expired. Cần xử lý thủ công trước khi tự đăng.');
@@ -3068,7 +3263,17 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
         return { finalState, screenshot, steps, composerPending: false };
       }
 
-      const submitted = await submitFacebookPost(account, userId, target, config, text, steps, 'facebook_post_submit_tap', imageCount);
+      const submitted = await submitFacebookPost(
+        account,
+        userId,
+        target,
+        config,
+        text,
+        steps,
+        'facebook_post_submit_tap',
+        imageCount,
+        state.submitPoint
+      );
       return submitted;
     }
 
@@ -3121,7 +3326,17 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
           screenshot = await captureScreenshot(account, userId, 'facebook_post_composer_ready');
           return { finalState, screenshot, steps, composerPending: false };
         }
-        const submitted = await submitFacebookPost(account, userId, target, config, text, steps, 'facebook_post_submit_from_composer', imageCount);
+        const submitted = await submitFacebookPost(
+          account,
+          userId,
+          target,
+          config,
+          text,
+          steps,
+          'facebook_post_submit_from_composer',
+          imageCount,
+          state.submitPoint
+        );
         return submitted;
       }
 
@@ -3160,9 +3375,13 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
   return { finalState, screenshot, steps, composerPending: true };
 }
 
-async function submitFacebookPost(account, userId, target, config, text, steps, action, imageCount = 0) {
-  await delay(postStepDelay());
-  const submitAttempts = await buildSubmitTapAttempts(target);
+async function submitFacebookPost(account, userId, target, config, text, steps, action, imageCount = 0, knownSubmitPoint = null) {
+  const submitAttempts = knownSubmitPoint
+    ? [
+      { method: 'state_detection', point: knownSubmitPoint },
+      { method: 'state_detection_retry', point: knownSubmitPoint }
+    ]
+    : await buildSubmitTapAttempts(target);
   let submitAccepted = false;
 
   for (let index = 0; index < submitAttempts.length; index += 1) {
@@ -3176,7 +3395,7 @@ async function submitFacebookPost(account, userId, target, config, text, steps, 
     );
     steps.push(submit);
 
-    await delay(900);
+    await delay(index === 0 ? 450 : 700);
     const nodes = await dumpVisibleNodes(target);
     const progress = findNodeInNodes(nodes, postingProgressLabels);
     const confirmation = findNodeInNodes(nodes, postedConfirmationLabels);
@@ -3623,6 +3842,15 @@ async function detectFacebookState(target, text, existingNodes = null) {
   if (!nodes.length) return { name: 'unknown', reason: 'no_uiautomator_nodes', hasTargetText: false };
 
   const hasTargetText = screenHasText(nodes, text);
+  const systemAnr = detectSystemUiAnr(nodes);
+  if (systemAnr) {
+    return {
+      name: 'system_anr',
+      reason: 'android_system_ui_not_responding',
+      hasTargetText,
+      ...systemAnr
+    };
+  }
   if (findNodeInNodes(nodes, shareFeedLabels, { exact: true }) && findNodeInNodes(nodes, shareOnceLabels, { exact: true })) {
     return { name: 'share_chooser', reason: 'android_share_target_picker', hasTargetText };
   }
@@ -3638,12 +3866,27 @@ async function detectFacebookState(target, text, existingNodes = null) {
   if (hasDone || hasTextEditor) return { name: 'text_editor', reason: hasDone ? 'done_visible' : 'text_editor_title', hasTargetText };
 
   const hasPostTitle = Boolean(findNodeInNodes(nodes, postTitleLabels));
-  const hasSubmit = Boolean(findNodeInNodes(nodes, submitLabels, { exact: true }));
+  const submitNode = findSemanticSubmitButton(nodes)
+    || findNodeInNodes(nodes, submitLabels, { exact: true, preferBottomRight: true });
+  const hasSubmit = Boolean(submitNode);
+  const submitPoint = submitNode
+    ? {
+      x: Math.round((submitNode.left + submitNode.right) / 2),
+      y: Math.round((submitNode.top + submitNode.bottom) / 2)
+    }
+    : null;
   const hasAttachedImage = Boolean(findNodeInNodes(nodes, attachedImageLabels));
   const observedText = nodes.find((node) => node.className.includes('EditText') && normalizeSearchText(node.text))?.text || '';
   const hasComposerText = Boolean(observedText);
   if (hasSubmit && (hasTargetText || hasComposerText || hasAttachedImage)) {
-    return { name: 'ready_to_post', reason: 'submit_visible_without_title', hasTargetText, hasAttachedImage, observedText };
+    return {
+      name: 'ready_to_post',
+      reason: 'submit_visible_without_title',
+      hasTargetText,
+      hasAttachedImage,
+      observedText,
+      submitPoint
+    };
   }
   if (hasPostTitle && !hasTargetText && (hasAttachedImage || hasComposerText)) {
     return {
@@ -3655,9 +3898,17 @@ async function detectFacebookState(target, text, existingNodes = null) {
     };
   }
   if ((hasSubmit || hasPostTitle) && hasTargetText) {
-    return { name: 'ready_to_post', reason: hasSubmit ? 'submit_visible' : 'post_title_with_text', hasTargetText, hasAttachedImage };
+    return {
+      name: 'ready_to_post',
+      reason: hasSubmit ? 'submit_visible' : 'post_title_with_text',
+      hasTargetText,
+      hasAttachedImage,
+      submitPoint
+    };
   }
-  if (hasPostTitle) return { name: 'composer', reason: 'post_title_visible', hasTargetText, hasAttachedImage };
+  if (hasPostTitle) {
+    return { name: 'composer', reason: 'post_title_visible', hasTargetText, hasAttachedImage, submitPoint };
+  }
 
   if (findNodeInNodes(nodes, composerLabels)) return { name: 'home', reason: 'composer_entry_visible', hasTargetText, hasAttachedImage };
   if (findNodeInNodes(nodes, facebookHomeLabels)) return { name: 'home', reason: 'home_navigation_visible', hasTargetText, hasAttachedImage };
@@ -3684,6 +3935,7 @@ async function tapAndLog(userId, accountId, target, action, point = {}) {
       if (retry.ok || !isTransientAdbFailure(retry.error || retry.stderr || '')) break;
     }
   }
+  invalidateUiDump(target);
   await writeLog(userId, accountId, result.ok ? 'info' : 'error', action, result.ok ? `Tap ${point.x},${point.y}.` : `Tap lỗi ${point.x},${point.y}.`, result);
   if (!result.ok) throw new Error(result.error || result.stderr || `${action} failed.`);
   await delay(actionDelay(action));
@@ -3755,11 +4007,29 @@ async function findVisibleTextBounds(target, labels, options = {}) {
 }
 
 async function dumpVisibleNodes(target) {
+  const cached = uiDumpCache.get(target);
+  if (cached && Date.now() - cached.createdAt <= uiDumpCacheTtlMs) return cached.nodes;
+  const inFlight = uiDumpInFlight.get(target);
+  if (inFlight) return inFlight;
+
+  const task = dumpVisibleNodesUncached(target)
+    .then((nodes) => {
+      uiDumpCache.set(target, { createdAt: Date.now(), nodes });
+      return nodes;
+    })
+    .finally(() => {
+      uiDumpInFlight.delete(target);
+    });
+  uiDumpInFlight.set(target, task);
+  return task;
+}
+
+async function dumpVisibleNodesUncached(target) {
   if (directUiDumpSupport.get(target) !== false) {
     const direct = await runCommand(
       env.mobileAutomation.adbPath,
-      ['-s', target, 'exec-out', 'uiautomator', 'dump', '/dev/tty'],
-      { timeoutMs: 4_000, maxBuffer: 2 * 1024 * 1024 }
+      ['-s', target, 'exec-out', 'uiautomator', 'dump', '--compressed', '/dev/tty'],
+      { timeoutMs: 3_000, maxBuffer: 2 * 1024 * 1024 }
     );
     const directNodes = direct.ok ? parseVisibleNodes(`${direct.stdout}\n${direct.stderr}`) : [];
     if (directNodes.length) {
@@ -3769,33 +4039,112 @@ async function dumpVisibleNodes(target) {
     directUiDumpSupport.set(target, false);
   }
 
-  const dumpArgs = ['-s', target, 'shell', 'uiautomator', 'dump', '/sdcard/window.xml'];
+  const dumpArgs = ['-s', target, 'shell', 'uiautomator', 'dump', '--compressed', '/sdcard/window.xml'];
   let dump = await runCommand(env.mobileAutomation.adbPath, dumpArgs, {
-    timeoutMs: 10_000
+    timeoutMs: 6_000
   });
   if (!dump.ok && target.includes(':')) {
     await runCommand(env.mobileAutomation.adbPath, ['connect', target]);
     await delay(600);
-    dump = await runCommand(env.mobileAutomation.adbPath, dumpArgs, { timeoutMs: 10_000 });
+    dump = await runCommand(env.mobileAutomation.adbPath, dumpArgs, { timeoutMs: 6_000 });
   }
   if (!dump.ok) return [];
 
   const xmlArgs = ['-s', target, 'shell', 'cat', '/sdcard/window.xml'];
   let xml = await runCommand(env.mobileAutomation.adbPath, xmlArgs, {
-    timeoutMs: 10_000,
+    timeoutMs: 5_000,
     maxBuffer: 2 * 1024 * 1024
   });
   if (!xml.ok && target.includes(':')) {
     await runCommand(env.mobileAutomation.adbPath, ['connect', target]);
     await delay(600);
     xml = await runCommand(env.mobileAutomation.adbPath, xmlArgs, {
-      timeoutMs: 10_000,
+      timeoutMs: 5_000,
       maxBuffer: 2 * 1024 * 1024
     });
   }
   if (!xml.ok || !xml.stdout) return [];
 
   return parseVisibleNodes(xml.stdout);
+}
+
+function invalidateUiDump(target) {
+  uiDumpCache.delete(target);
+}
+
+function detectSystemUiAnr(nodes) {
+  const dialog = findNodeInNodes(nodes, systemAnrLabels);
+  if (!dialog) return null;
+  const wait = findNodeInNodes(nodes, systemAnrWaitLabels, { exact: true });
+  return {
+    dialog,
+    waitPoint: wait
+      ? {
+        x: Math.round((wait.left + wait.right) / 2),
+        y: Math.round((wait.top + wait.bottom) / 2)
+      }
+      : null
+  };
+}
+
+async function recoverSystemUiAnr(account, userId, target, state = {}) {
+  const screen = await getDeviceScreenSize(target);
+  const waitPoint = state.waitPoint || {
+    x: Math.round((screen?.width || 900) * 0.3),
+    y: Math.round((screen?.height || 1600) * 0.61)
+  };
+  const tap = await runCommand(env.mobileAutomation.adbPath, [
+    '-s',
+    target,
+    'shell',
+    'input',
+    'tap',
+    String(waitPoint.x),
+    String(waitPoint.y)
+  ], { timeoutMs: 12_000 });
+  invalidateUiDump(target);
+  await writeLog(
+    userId,
+    account._id,
+    tap.ok ? 'warn' : 'error',
+    'system_ui_anr_recovery',
+    tap.ok ? 'System UI không phản hồi; tool đã chọn Wait và tạm dừng để hệ thống hồi phục.' : 'Không xử lý được hộp thoại System UI không phản hồi.',
+    { tap, waitPoint, dialog: state.dialog }
+  );
+  await delay(1_500);
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    invalidateUiDump(target);
+    const nodes = await dumpVisibleNodes(target);
+    if (!detectSystemUiAnr(nodes)) {
+      return { ok: true, waitPoint, attempt, tapAccepted: tap.ok };
+    }
+    if (attempt === 1) {
+      await runCommand(env.mobileAutomation.adbPath, [
+        '-s',
+        target,
+        'shell',
+        'input',
+        'keyevent',
+        '61'
+      ], { timeoutMs: 4_000 });
+      await runCommand(env.mobileAutomation.adbPath, [
+        '-s',
+        target,
+        'shell',
+        'input',
+        'keyevent',
+        '66'
+      ], { timeoutMs: 4_000 });
+      invalidateUiDump(target);
+    }
+    await delay(1_000);
+  }
+  return {
+    ok: false,
+    waitPoint,
+    tap,
+    error: tap.error || 'System UI ANR dialog is still visible.'
+  };
 }
 
 function parseVisibleNodes(xml = '') {
