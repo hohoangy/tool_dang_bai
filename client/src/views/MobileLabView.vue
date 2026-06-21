@@ -30,7 +30,10 @@ const composerTextarea = ref(null);
 const showEmojiPicker = ref(false);
 const showDeviceTools = ref(false);
 const facebookSessionAccountId = ref('');
+const activeLdPlayerAccountId = ref('');
 const runtimeStatusChecking = ref(false);
+const selectedRuntimeStatus = ref(null);
+const runtimeStatusMissCount = ref(0);
 const technicalLogsOpen = ref(false);
 const workflowStage = ref('idle');
 const publishMode = ref('direct');
@@ -52,7 +55,9 @@ const maxInstagramAlbumPhotos = 10;
 const maxVideoSizeMb = 100;
 const draftStorageKey = 'socialpilot-platform-composer-drafts';
 const runtimeStatusIntervalMs = 8_000;
+const runtimeStatusMissLimit = 3;
 let runtimeStatusTimer = null;
+let runtimeStatusRequestId = 0;
 let collageCache = { key: '', item: null };
 
 const platforms = [
@@ -165,7 +170,16 @@ const technicalLogStats = computed(() => ({
   errors: latestLogs.value.filter((log) => log.level === 'error').length
 }));
 const canUseRemote = computed(() => Boolean(selectedAccount.value));
-const facebookAccounts = computed(() => accounts.value.filter((account) => account.platform === selectedPlatformId.value));
+const facebookAccounts = computed(() => accounts.value
+  .filter((account) => account.platform === selectedPlatformId.value)
+  .sort((left, right) => {
+    const instanceDifference = getAccountOrder(left) - getAccountOrder(right);
+    if (instanceDifference !== 0) return instanceDifference;
+    return formatAccountDisplayName(left).localeCompare(formatAccountDisplayName(right), 'vi', {
+      numeric: true,
+      sensitivity: 'base'
+    });
+  }));
 const selectedQueueAccounts = computed(() => facebookAccounts.value.filter((account) => selectedQueueAccountIds.value.includes(account._id)));
 const selectedPhotoCount = computed(() => post.media.filter((item) => item.type === 'photo').length);
 const isInstagramAlbumMode = computed(() => selectedPlatformId.value === 'instagram' && selectedPhotoCount.value > 1);
@@ -247,6 +261,19 @@ const requiresFacebookSession = computed(() => selectedPlatformId.value === 'fac
   && !isBulkMode.value
   && !isScheduleMode.value);
 const facebookAppReady = computed(() => Boolean(selectedAccount.value?._id) && facebookSessionAccountId.value === selectedAccount.value._id);
+const selectedDeviceReady = computed(() => Boolean(selectedRuntimeStatus.value?.deviceReady));
+const runtimeStatusDetail = computed(() => {
+  if (facebookAppReady.value) return `${selectedPlatform.value.label} đã sẵn sàng trong ${formatInstanceLabel(selectedAccount.value)}`;
+  if (runtimeStatusMissCount.value > 0 && facebookSessionAccountId.value === selectedAccount.value?._id) {
+    return `Đang đồng bộ lại kết nối với ${formatInstanceLabel(selectedAccount.value)}`;
+  }
+  if (!selectedDeviceReady.value) return `${formatInstanceLabel(selectedAccount.value)} chưa chạy hoặc ADB chưa kết nối`;
+  const foregroundPackage = selectedRuntimeStatus.value?.foregroundPackage;
+  if (foregroundPackage && foregroundPackage !== facebookAppPackage.value) {
+    return `${formatInstanceLabel(selectedAccount.value)} đang mở ứng dụng khác`;
+  }
+  return `${selectedPlatform.value.label} chưa ở màn hình hoạt động`;
+});
 const facebookOpenButtonLabel = computed(() => {
   if (facebookOpening.value) return `Đang mở ${selectedPlatform.value.label}`;
   return facebookAppReady.value ? `Đã mở ${selectedPlatform.value.label}` : `Mở ${selectedPlatform.value.label}`;
@@ -365,9 +392,7 @@ const preflightItems = computed(() => [
     label: `${selectedPlatform.value.label} app`,
     detail: !requiresFacebookSession.value
       ? `${selectedPlatform.value.label} sẽ tự mở khi bắt đầu đăng`
-      : facebookAppReady.value
-        ? `${selectedPlatform.value.label} đã sẵn sàng trong LDPlayer`
-        : `Mở ${selectedPlatform.value.label} trước khi đăng`,
+      : runtimeStatusDetail.value,
     ok: Boolean(facebookAppPackage.value) && (!requiresFacebookSession.value || facebookAppReady.value),
     blocking: true
   },
@@ -407,6 +432,7 @@ const readinessSummary = computed(() => {
     return characterCount.value ? 'Đủ điều kiện chạy automation' : 'Đủ điều kiện, caption đang trống';
   }
   if (!contentReady.value && captionRequired.value) return 'Cần nhập nội dung trước khi đăng';
+  if (requiresFacebookSession.value && !facebookAppReady.value) return runtimeStatusDetail.value;
   return `Cần xử lý: ${blockedPreflightItems.value.map((item) => item.label).join(', ')}`;
 });
 const readinessTone = computed(() => {
@@ -620,7 +646,9 @@ const professionalKpis = computed(() => [
     label: 'Điều kiện đăng',
     value: blockedPreflightItems.value.length ? 'Cần kiểm tra' : 'Đủ điều kiện',
     detail: blockedPreflightItems.value.length
-      ? `Thiếu: ${blockedPreflightItems.value.map((item) => item.label).join(', ')}`
+      ? (requiresFacebookSession.value && !facebookAppReady.value
+        ? runtimeStatusDetail.value
+        : `Thiếu: ${blockedPreflightItems.value.map((item) => item.label).join(', ')}`)
       : `Profile, ADB và ${selectedPlatform.value.label} đã sẵn sàng`,
     tone: blockedPreflightItems.value.length ? 'warn' : 'ok'
   },
@@ -795,8 +823,31 @@ function formatInstanceLabel(account) {
   return account?.instanceName === 'LDPlayer' ? 'LDPlayer 01' : (account?.instanceName || 'LDPlayer');
 }
 
+function getAccountOrder(account) {
+  const target = account?.deviceId || '';
+  const emulatorIndex = Number(target.match(/^emulator-(\d+)$/)?.[1]);
+  if (Number.isInteger(emulatorIndex) && emulatorIndex >= 5554) {
+    return ((emulatorIndex - 5554) / 2) + 1;
+  }
+  if (account?.instanceName === 'LDPlayer') return 1;
+  const instanceNumber = Number(account?.instanceName?.match(/-(\d+)$/)?.[1]);
+  return Number.isInteger(instanceNumber) ? instanceNumber : Number.MAX_SAFE_INTEGER;
+}
+
+function formatAccountDisplayName(account) {
+  const displayName = String(account?.displayName || '').trim();
+  if (account?.platform !== 'facebook') return displayName || 'Profile chưa đặt tên';
+
+  const accountNumber = displayName.match(/facebook\s*(?:account)?\s*0*(\d+)/i)?.[1]
+    || String(getAccountOrder(account));
+  if (/^facebook\s*(?:account)?\s*0*\d+$/i.test(displayName) && /^\d+$/.test(accountNumber)) {
+    return `Facebook Account ${String(Number(accountNumber)).padStart(2, '0')}`;
+  }
+  return displayName || `Facebook Account ${String(getAccountOrder(account)).padStart(2, '0')}`;
+}
+
 function formatAccountLabel(account) {
-  return `${account.displayName} · ${formatInstanceLabel(account)}`;
+  return `${formatAccountDisplayName(account)} · ${formatInstanceLabel(account)}`;
 }
 
 function isAuthError(error) {
@@ -828,7 +879,7 @@ async function remoteLaunch() {
 async function remoteOpenApp() {
   if (!selectedAccount.value || facebookOpening.value || facebookAppReady.value) return;
   const nextAccount = selectedAccount.value;
-  const previousAccount = accounts.value.find((account) => account._id === facebookSessionAccountId.value);
+  const previousAccount = await findActiveAccountBeforeSwitch(nextAccount);
   const shouldClosePrevious = previousAccount && previousAccount._id !== nextAccount._id;
   running.value = true;
   facebookOpening.value = true;
@@ -837,12 +888,26 @@ async function remoteOpenApp() {
       await http.post(`/mobile/accounts/${previousAccount._id}/remote/close-session`, {
         appPackage: previousAccount.metadata?.appPackage || selectedPlatform.value.packageName
       });
+      activeLdPlayerAccountId.value = '';
       facebookSessionAccountId.value = '';
     }
     const { data } = await http.post(`/mobile/accounts/${nextAccount._id}/remote/open-app`, {
       appPackage: nextAccount.metadata?.appPackage || selectedPlatform.value.packageName
     });
-    const runtimeReady = await syncSelectedAccountRuntimeStatus({ force: true });
+    const backendConfirmed = Boolean(data.result?.ok && data.result?.readiness?.ok);
+    if (backendConfirmed && selectedAccount.value?._id === nextAccount._id) {
+      activeLdPlayerAccountId.value = nextAccount._id;
+      facebookSessionAccountId.value = nextAccount._id;
+      runtimeStatusMissCount.value = 0;
+      selectedRuntimeStatus.value = {
+        target: data.result?.target || nextAccount.deviceId,
+        deviceReady: true,
+        appReady: true,
+        foregroundPackage: nextAccount.metadata?.appPackage || selectedPlatform.value.packageName,
+        foregroundActivity: data.result?.readiness?.foregroundActivity || ''
+      };
+    }
+    const runtimeReady = await waitForSelectedAccountRuntimeReady(nextAccount._id);
     if (runtimeReady) {
       ui.notify(shouldClosePrevious ? `Đã chuyển sang ${nextAccount.displayName}.` : `Đã mở ${selectedPlatform.value.label}.`);
     } else {
@@ -859,10 +924,44 @@ async function remoteOpenApp() {
   }
 }
 
+async function findActiveAccountBeforeSwitch(nextAccount) {
+  const remembered = accounts.value.find((account) => account._id === activeLdPlayerAccountId.value);
+  if (remembered && remembered._id !== nextAccount._id) return remembered;
+
+  const candidates = accounts.value.filter((account) => (
+    account.platform === nextAccount.platform
+    && account._id !== nextAccount._id
+  ));
+  if (!candidates.length) return null;
+
+  const checks = await Promise.allSettled(candidates.map(async (account) => {
+    const { data } = await http.get(`/mobile/accounts/${account._id}/runtime-status`, {
+      params: {
+        appPackage: account.metadata?.appPackage || selectedPlatform.value.packageName
+      }
+    });
+    return data.status?.deviceReady && data.status?.appReady ? account : null;
+  }));
+  return checks.find((result) => result.status === 'fulfilled' && result.value)?.value || null;
+}
+
+async function waitForSelectedAccountRuntimeReady(accountId, attempts = 4) {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    if (selectedAccount.value?._id !== accountId) return false;
+    const ready = await syncSelectedAccountRuntimeStatus({ force: true });
+    if (ready) return true;
+    if (attempt < attempts) {
+      await new Promise((resolve) => window.setTimeout(resolve, 700));
+    }
+  }
+  return false;
+}
+
 async function syncSelectedAccountRuntimeStatus(options = {}) {
   const account = selectedAccount.value;
   if (!account || (runtimeStatusChecking.value && !options.force) || posting.value || queueRunning.value) return false;
 
+  const requestId = ++runtimeStatusRequestId;
   runtimeStatusChecking.value = true;
   try {
     const { data } = await http.get(`/mobile/accounts/${account._id}/runtime-status`, {
@@ -870,17 +969,36 @@ async function syncSelectedAccountRuntimeStatus(options = {}) {
         appPackage: account.metadata?.appPackage || selectedPlatform.value.packageName
       }
     });
-    if (selectedAccount.value?._id !== account._id) return false;
+    if (selectedAccount.value?._id !== account._id || requestId !== runtimeStatusRequestId) return false;
     const ready = Boolean(data.status?.deviceReady && data.status?.appReady);
-    facebookSessionAccountId.value = ready
-      ? account._id
-      : '';
-    return ready;
+    selectedRuntimeStatus.value = data.status || null;
+    if (ready) {
+      runtimeStatusMissCount.value = 0;
+      activeLdPlayerAccountId.value = account._id;
+      facebookSessionAccountId.value = account._id;
+      return true;
+    }
+
+    const sessionWasConfirmed = facebookSessionAccountId.value === account._id;
+    runtimeStatusMissCount.value += 1;
+    if (!sessionWasConfirmed || runtimeStatusMissCount.value >= runtimeStatusMissLimit) {
+      facebookSessionAccountId.value = '';
+    }
+    return sessionWasConfirmed && runtimeStatusMissCount.value < runtimeStatusMissLimit;
   } catch {
     // Lỗi mạng tạm thời không nên làm thay đổi trạng thái đang hiển thị.
+    if (facebookSessionAccountId.value === account._id) {
+      runtimeStatusMissCount.value += 1;
+      if (runtimeStatusMissCount.value >= runtimeStatusMissLimit) {
+        facebookSessionAccountId.value = '';
+      }
+      return runtimeStatusMissCount.value < runtimeStatusMissLimit;
+    }
     return false;
   } finally {
-    runtimeStatusChecking.value = false;
+    if (requestId === runtimeStatusRequestId) {
+      runtimeStatusChecking.value = false;
+    }
   }
 }
 
@@ -1032,7 +1150,7 @@ async function runQueueWorkflow() {
     return;
   }
 
-  const warmAccountId = facebookSessionAccountId.value;
+  const warmAccountId = activeLdPlayerAccountId.value || facebookSessionAccountId.value;
   const queueAccounts = [...selectedQueueAccounts.value].sort((left, right) => {
     if (left._id === warmAccountId) return -1;
     if (right._id === warmAccountId) return 1;
@@ -1363,6 +1481,9 @@ async function closeQueueAccount(account, message = '') {
   }
   if (facebookSessionAccountId.value === account._id) {
     facebookSessionAccountId.value = '';
+  }
+  if (activeLdPlayerAccountId.value === account._id) {
+    activeLdPlayerAccountId.value = '';
   }
 }
 
@@ -1829,6 +1950,11 @@ onUnmounted(() => {
 });
 
 watch(selectedAccountId, () => {
+  runtimeStatusRequestId += 1;
+  selectedRuntimeStatus.value = null;
+  runtimeStatusMissCount.value = 0;
+  // Chỉ xóa trạng thái của profile đang chọn. Giữ activeLdPlayerAccountId
+  // để khi bấm mở profile mới, hệ thống vẫn biết instance cũ cần được tắt.
   facebookSessionAccountId.value = '';
   syncSelectedAccountRuntimeStatus();
 });
@@ -1858,6 +1984,9 @@ const queueOverlayTitle = computed(() => {
 watch(photoLayout, invalidateCollageCache);
 
 watch(selectedPlatformId, async () => {
+  runtimeStatusRequestId += 1;
+  selectedRuntimeStatus.value = null;
+  runtimeStatusMissCount.value = 0;
   if (selectedPlatformId.value !== 'facebook') {
     facebookPostType.value = 'imageText';
     post.media = post.media.filter((item) => {
@@ -2004,7 +2133,7 @@ watch(selectedPlatformId, async () => {
         <div class="flex flex-wrap items-start justify-between gap-4">
           <div>
             <p class="text-xs font-extrabold uppercase tracking-wide text-zinc-500">Thiết bị đăng bài</p>
-            <h2 class="mt-1 text-xl font-extrabold">{{ selectedAccount?.displayName || 'Chưa chọn profile' }}</h2>
+            <h2 class="mt-1 text-xl font-extrabold">{{ selectedAccount ? formatAccountDisplayName(selectedAccount) : 'Chưa chọn profile' }}</h2>
             <p class="mt-1 text-sm text-zinc-500">
               {{ selectedAccount ? formatInstanceLabel(selectedAccount) : 'LDPlayer' }} · {{ selectedAccount?.deviceId || selectedAccount?.adbHost || 'ADB chưa cấu hình' }}
             </p>
@@ -3088,11 +3217,28 @@ watch(selectedPlatformId, async () => {
             </div>
           </div>
 
-          <div v-if="composerScreenshotSrc" class="overflow-hidden rounded-lg border border-zinc-200 bg-zinc-950 dark:border-zinc-800">
-            <div class="border-b border-zinc-800 px-3 py-2 text-xs font-extrabold uppercase tracking-wide text-zinc-400">Ảnh xác minh sau đăng</div>
-            <div class="grid aspect-[9/16] w-full place-items-center text-sm text-zinc-400">
-              <img :src="composerScreenshotSrc" alt="Composer screenshot" class="h-full w-full object-contain" />
+          <div v-if="composerScreenshotSrc && postResult?.screenshotVerified" class="overflow-hidden rounded-lg border border-zinc-200 bg-zinc-950 dark:border-zinc-800">
+            <div class="flex items-center justify-between gap-3 border-b border-zinc-800 px-3 py-2">
+              <span class="text-xs font-extrabold uppercase tracking-wide text-zinc-400">Bài đăng đã đối chiếu</span>
+              <span class="rounded-full bg-emerald-500/15 px-2 py-1 text-[10px] font-extrabold uppercase text-emerald-400">Đúng nội dung</span>
             </div>
+            <div class="grid aspect-[9/16] w-full place-items-center text-sm text-zinc-400">
+              <img :src="composerScreenshotSrc" alt="Ảnh bài đăng đã được đối chiếu nội dung" class="h-full w-full object-contain" />
+            </div>
+          </div>
+
+          <div v-else-if="composerScreenshotSrc" class="overflow-hidden rounded-lg border border-zinc-200 bg-zinc-950 dark:border-zinc-800">
+            <div class="border-b border-zinc-800 px-3 py-2 text-xs font-extrabold uppercase tracking-wide text-zinc-400">Ảnh trạng thái Facebook</div>
+            <div class="grid aspect-[9/16] w-full place-items-center text-sm text-zinc-400">
+              <img :src="composerScreenshotSrc" alt="Ảnh trạng thái Facebook" class="h-full w-full object-contain" />
+            </div>
+          </div>
+
+          <div
+            v-else-if="postResult?.submitVerified && postResult?.screenshotVerified === false"
+            class="rounded-xl border border-amber-300/60 bg-amber-50 p-4 text-sm text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200"
+          >
+            Bài đã đăng thành công nhưng Facebook chưa đồng bộ bài mới lên feed để chụp ảnh xác minh. Hệ thống không hiển thị ảnh bài cũ để tránh gây nhầm lẫn.
           </div>
 
           <div class="rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">

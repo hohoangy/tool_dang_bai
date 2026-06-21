@@ -1,4 +1,4 @@
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import { existsSync } from 'fs';
 import path from 'path';
@@ -66,6 +66,40 @@ export async function runBinaryCommand(command, args, metadata = {}) {
       durationMs: Date.now() - startedAt,
       stdout: error.stdout,
       stderr: error.stderr?.toString('utf8').trim() || '',
+      error: error.message
+    };
+  }
+}
+
+export function runDetachedCommand(command, args = []) {
+  const executable = resolveExecutable(command);
+  if (!executable) {
+    return {
+      ok: false,
+      command,
+      args,
+      error: `Không tìm thấy ${command}.`
+    };
+  }
+
+  try {
+    const child = spawn(executable, args, {
+      detached: true,
+      windowsHide: true,
+      stdio: 'ignore'
+    });
+    child.unref();
+    return {
+      ok: true,
+      command,
+      args,
+      processId: child.pid
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      command,
+      args,
       error: error.message
     };
   }
