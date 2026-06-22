@@ -47,6 +47,8 @@ const queuePhase = ref('idle');
 const queueCurrentAccountId = ref('');
 const scheduleDateTime = ref(defaultScheduleDateTime());
 const drafts = ref([]);
+const editingDraftId = ref('');
+const clearComposerConfirming = ref(false);
 const draggedPreviewPhotoId = ref('');
 const photoLayout = ref('grid');
 
@@ -54,10 +56,12 @@ const maxPhotos = 4;
 const maxInstagramAlbumPhotos = 10;
 const maxVideoSizeMb = 100;
 const draftStorageKey = 'socialpilot-platform-composer-drafts';
-const runtimeStatusIntervalMs = 8_000;
+const platformDraftStoragePrefix = `${draftStorageKey}-`;
+const runtimeStatusIntervalMs = 5_000;
 const runtimeStatusMissLimit = 3;
 let runtimeStatusTimer = null;
 let runtimeStatusRequestId = 0;
+let clearComposerConfirmTimer = null;
 let collageCache = { key: '', item: null };
 
 const platforms = [
@@ -125,6 +129,7 @@ const defaultMobileAccounts = {
 };
 
 const post = reactive({
+  title: '',
   text: '',
   hashtags: '',
   media: []
@@ -164,10 +169,10 @@ const composerScreenshotSrc = computed(() => postResult.value?.screenshot?.image
 const latestLogs = computed(() => logs.value.slice(0, 80));
 const technicalLogs = computed(() => latestLogs.value.slice(0, 20));
 const technicalLogStats = computed(() => ({
-  total: latestLogs.value.length,
+  total: technicalLogs.value.length,
   shown: technicalLogs.value.length,
-  warnings: latestLogs.value.filter((log) => log.level === 'warn').length,
-  errors: latestLogs.value.filter((log) => log.level === 'error').length
+  warnings: technicalLogs.value.filter((log) => log.level === 'warn').length,
+  errors: technicalLogs.value.filter((log) => log.level === 'error').length
 }));
 const canUseRemote = computed(() => Boolean(selectedAccount.value));
 const facebookAccounts = computed(() => accounts.value
@@ -201,6 +206,12 @@ const mediaReady = computed(() => {
 });
 const mediaInputAccept = computed(() => isFacebookVideoMode.value ? 'video/mp4,video/quicktime,video/webm,video/3gpp' : 'image/*');
 const mediaInputMultiple = computed(() => !isFacebookVideoMode.value);
+const hasComposerContent = computed(() => Boolean(
+  String(post.title || '').trim()
+  || String(post.text || '').trim()
+  || String(post.hashtags || '').trim()
+  || post.media.length
+));
 const previewPhotos = computed(() => post.media.filter((item) => item.type === 'photo').slice(0, platformMaxPhotos.value));
 const facebookPreviewPhotos = computed(() => previewPhotos.value);
 const canArrangePhotos = computed(() => previewPhotos.value.length > 1);
@@ -260,10 +271,31 @@ const isScheduleMode = computed(() => publishMode.value === 'schedule');
 const requiresFacebookSession = computed(() => selectedPlatformId.value === 'facebook'
   && !isBulkMode.value
   && !isScheduleMode.value);
-const facebookAppReady = computed(() => Boolean(selectedAccount.value?._id) && facebookSessionAccountId.value === selectedAccount.value._id);
+const runtimeConfirmsFacebookApp = computed(() => Boolean(
+  selectedRuntimeStatus.value?.deviceReady
+  && selectedRuntimeStatus.value?.appReady
+));
+const facebookAppReady = computed(() => Boolean(
+  selectedAccount.value?._id
+  && (
+    runtimeConfirmsFacebookApp.value
+    || facebookSessionAccountId.value === selectedAccount.value._id
+  )
+));
+const facebookAppInForeground = computed(() => Boolean(
+  selectedRuntimeStatus.value?.deviceReady
+  && selectedRuntimeStatus.value?.appInForeground
+));
+const facebookAppRunningInBackground = computed(() => Boolean(
+  selectedRuntimeStatus.value?.deviceReady
+  && selectedRuntimeStatus.value?.appProcessAlive
+  && !selectedRuntimeStatus.value?.appInForeground
+));
 const selectedDeviceReady = computed(() => Boolean(selectedRuntimeStatus.value?.deviceReady));
 const runtimeStatusDetail = computed(() => {
-  if (facebookAppReady.value) return `${selectedPlatform.value.label} đã sẵn sàng trong ${formatInstanceLabel(selectedAccount.value)}`;
+  if (facebookAppInForeground.value) return `${selectedPlatform.value.label} đang mở trên màn hình ${formatInstanceLabel(selectedAccount.value)}`;
+  if (facebookAppRunningInBackground.value) return `${selectedPlatform.value.label} đang chạy nền trong ${formatInstanceLabel(selectedAccount.value)}`;
+  if (facebookAppReady.value) return `${selectedPlatform.value.label} đã được nhận diện trong ${formatInstanceLabel(selectedAccount.value)}`;
   if (runtimeStatusMissCount.value > 0 && facebookSessionAccountId.value === selectedAccount.value?._id) {
     return `Đang đồng bộ lại kết nối với ${formatInstanceLabel(selectedAccount.value)}`;
   }
@@ -276,7 +308,9 @@ const runtimeStatusDetail = computed(() => {
 });
 const facebookOpenButtonLabel = computed(() => {
   if (facebookOpening.value) return `Đang mở ${selectedPlatform.value.label}`;
-  return facebookAppReady.value ? `Đã mở ${selectedPlatform.value.label}` : `Mở ${selectedPlatform.value.label}`;
+  if (facebookAppInForeground.value) return `Đã mở ${selectedPlatform.value.label}`;
+  if (facebookAppRunningInBackground.value) return `${selectedPlatform.value.label} đang chạy nền`;
+  return facebookAppReady.value ? `Đã nhận diện ${selectedPlatform.value.label}` : `Mở ${selectedPlatform.value.label}`;
 });
 const facebookActivityLabel = computed(() => {
   if (facebookOpening.value) return `Đang mở ${selectedPlatform.value.label}`;
@@ -287,7 +321,11 @@ const facebookActivityLabel = computed(() => {
 });
 const showFacebookActivityOverlay = computed(() => selectedPlatformId.value === 'facebook'
   && (facebookOpening.value || posting.value || queueRunning.value));
-const facebookSessionStatusLabel = computed(() => facebookAppReady.value ? `Đã mở ${selectedPlatform.value.label}` : `Chưa mở ${selectedPlatform.value.label}`);
+const facebookSessionStatusLabel = computed(() => {
+  if (facebookAppInForeground.value) return `Đang mở ${selectedPlatform.value.label}`;
+  if (facebookAppRunningInBackground.value) return `${selectedPlatform.value.label} chạy nền`;
+  return facebookAppReady.value ? `Đã nhận diện ${selectedPlatform.value.label}` : `Chưa mở ${selectedPlatform.value.label}`;
+});
 const minScheduleDateTime = computed(() => toDateTimeLocal(new Date(Date.now() + 60 * 1000)));
 const minScheduleDate = computed(() => minScheduleDateTime.value.slice(0, 10));
 const scheduleDate = computed({
@@ -337,7 +375,30 @@ const canRunWorkflow = computed(() => selectedPlatform.value.status === 'ready'
   && !posting.value
   && !queueRunning.value
   && !mediaUploading.value);
-const duplicateDraft = computed(() => drafts.value.find((draft) => draft.text === finalPostText.value.trim()));
+const currentDraftFingerprint = computed(() => buildDraftFingerprint({
+  platform: selectedPlatformId.value,
+  facebookPostType: facebookPostType.value,
+  text: finalPostText.value.trim(),
+  media: post.media
+}));
+const editingDraft = computed(() => drafts.value.find((draft) => draft.id === editingDraftId.value) || null);
+const duplicateDraft = computed(() => drafts.value.find((draft) => (
+  draft.status === 'draft'
+  && draft.id !== editingDraftId.value
+  && buildDraftFingerprint(draft) === currentDraftFingerprint.value
+)));
+const editingDraftUnchanged = computed(() => {
+  if (!editingDraft.value) return false;
+  const savedTitle = String(editingDraft.value.managementTitle || '').trim();
+  return buildDraftFingerprint(editingDraft.value) === currentDraftFingerprint.value
+    && savedTitle === String(post.title || '').trim();
+});
+const draftAlreadySaved = computed(() => Boolean(
+  finalPostText.value.trim()
+  && (duplicateDraft.value || editingDraftUnchanged.value)
+));
+const imageTextDrafts = computed(() => drafts.value.filter((draft) => getDraftContentType(draft) === 'imageText'));
+const videoDrafts = computed(() => drafts.value.filter((draft) => getDraftContentType(draft) === 'video'));
 const scheduledDrafts = computed(() => drafts.value
   .filter((draft) => draft.status === 'scheduled')
   .sort((a, b) => new Date(a.scheduledFor || a.createdAt) - new Date(b.scheduledFor || b.createdAt)));
@@ -458,27 +519,24 @@ const operationalPostRunActions = new Set([
   'facebook_post_finished',
   'facebook_post_submit_verified',
   'facebook_post_submit_unverified',
-  'facebook_post_submit_waiting',
-  'facebook_post_media_uploading',
-  'facebook_post_submit_still_in_composer',
   'facebook_post_submit_blocked',
   'facebook_post_state_machine_pending',
   'facebook_post_image_attach_failed',
-  'facebook_post_image_attached',
-  'facebook_post_wait_for_ui',
-  'facebook_post_state',
+  'facebook_post_video_upload_reverted',
   'facebook_post_failed',
   'instagram_post_finished',
   'instagram_post_submit_verified',
   'instagram_post_submit_unverified',
-  'instagram_post_submit_waiting',
   'instagram_post_caption_missing_before_submit',
   'instagram_post_state_machine_pending',
-  'instagram_post_state',
   'instagram_post_failed'
 ]);
 const recentPostRuns = computed(() => latestLogs.value
   .filter((log) => operationalPostRunActions.has(String(log.action || '')))
+  .filter((log, index, items) => {
+    const accountId = String(log.accountId || '');
+    return items.findIndex((item) => String(item.accountId || '') === accountId) === index;
+  })
   .slice(0, 3));
 const postRunActionLabels = {
   facebook_post_finished: {
@@ -502,8 +560,12 @@ const postRunActionLabels = {
     detail: 'Giữ Facebook hoạt động cho đến khi quá trình tải hoàn tất.'
   },
   facebook_post_submit_still_in_composer: {
-    title: 'Vẫn còn ở màn soạn bài',
-    detail: 'Facebook chưa rời composer sau khi bấm Đăng.'
+    title: 'Facebook chưa nhận thao tác đăng',
+    detail: 'Nút Đăng vẫn còn hiển thị; bài chưa được gửi.'
+  },
+  facebook_post_video_upload_reverted: {
+    title: 'Facebook từ chối tải video',
+    detail: 'Facebook đã bắt đầu tải nhưng quay lại màn soạn bài. Hãy thử lại hoặc kiểm tra video/mạng.'
   },
   facebook_post_submit_blocked: {
     title: 'Facebook bị chặn bởi checkpoint',
@@ -580,9 +642,15 @@ const postResultSummary = computed(() => {
     };
   }
   if (postResult.value.autoSubmit) {
+    const reasonDetails = {
+      video_upload_reverted_to_composer: 'Facebook đã bắt đầu tải video nhưng quay lại màn soạn bài. Video chưa được đăng.',
+      still_in_composer: 'Facebook vẫn giữ màn soạn bài và chưa nhận thao tác đăng.',
+      video_upload_timeout: 'Facebook tải video quá thời gian cho phép.',
+      published_post_evidence_pending: 'Facebook đã rời composer nhưng chưa tìm thấy đúng bài mới trên feed.'
+    };
     return {
       title: 'Đã bấm Đăng nhưng cần kiểm tra',
-      detail: `Automation chưa xác nhận được bài đã lên feed.${elapsedDetail} Hãy xem screenshot và log mới nhất.`,
+      detail: `${reasonDetails[postResult.value.submitReason] || 'Automation chưa xác nhận được bài đã lên feed.'}${elapsedDetail} Hãy xem ảnh trạng thái mới nhất.`,
       tone: 'warn'
     };
   }
@@ -1065,6 +1133,16 @@ async function sendRemoteText() {
   }
 }
 
+function handleRuntimeVisibilityChange() {
+  if (document.visibilityState === 'visible') {
+    syncSelectedAccountRuntimeStatus({ force: true });
+  }
+}
+
+function handleWindowFocus() {
+  syncSelectedAccountRuntimeStatus({ force: true });
+}
+
 async function sendRemoteKey(key) {
   if (!selectedAccount.value) return;
   await http.post(`/mobile/accounts/${selectedAccount.value._id}/remote/key`, { key });
@@ -1263,8 +1341,24 @@ async function prepareQueueEnvironment() {
     message: 'Đang chờ đến lượt'
   }));
 
-  // Giữ profile đang chạy để lượt đầu có thể dùng warm start. Mỗi profile
-  // vẫn được đóng ngay sau khi hoàn tất để giải phóng RAM trước lượt kế tiếp.
+  // Chỉ giữ profile warm khi chính nó nằm trong hàng đợi. Nếu không, đóng
+  // trước để tránh hai LDPlayer cùng chiếm RAM lúc chuyển tài khoản.
+  const activeAccountId = activeLdPlayerAccountId.value || facebookSessionAccountId.value;
+  if (activeAccountId && !selectedQueueAccountIds.value.includes(activeAccountId)) {
+    const activeAccount = accounts.value.find((account) => account._id === activeAccountId);
+    if (activeAccount) {
+      const { data } = await http.post(`/mobile/accounts/${activeAccount._id}/remote/close-session`, {
+        appPackage: selectedPlatform.value.packageName
+      });
+      if (!data.result?.ok) {
+        throw new Error(`Chưa tắt hoàn toàn ${activeAccount.instanceName}. Dừng hàng loạt để tránh chạy nhiều LDPlayer cùng lúc.`);
+      }
+    }
+    if (facebookSessionAccountId.value === activeAccountId) facebookSessionAccountId.value = '';
+    if (activeLdPlayerAccountId.value === activeAccountId) activeLdPlayerAccountId.value = '';
+  }
+
+  // Mỗi profile trong queue được đóng ngay sau khi xác minh để giải phóng RAM.
   await wait(100);
 }
 
@@ -1472,10 +1566,14 @@ async function closeQueueAccount(account, message = '') {
   const baseMessage = message || current?.message || 'Đã xử lý';
   updateQueueItem(account._id, { message: `${baseMessage} · Đang tắt LDPlayer` });
   try {
-    await http.post(`/mobile/accounts/${account._id}/remote/close-session`, {
+    const { data } = await http.post(`/mobile/accounts/${account._id}/remote/close-session`, {
       appPackage: selectedPlatform.value.packageName
     });
-    updateQueueItem(account._id, { message: `${baseMessage} · Đã tắt LDPlayer` });
+    updateQueueItem(account._id, {
+      message: data.result?.ok
+        ? `${baseMessage} · Đã tắt LDPlayer`
+        : `${baseMessage} · Chưa tắt hoàn toàn LDPlayer`
+    });
   } catch {
     updateQueueItem(account._id, { message: `${baseMessage} · Chưa tắt được LDPlayer` });
   }
@@ -1516,21 +1614,55 @@ function toggleQueueAccount(accountId) {
 
 function loadDrafts() {
   try {
-    const raw = window.localStorage.getItem(draftStorageKey);
-    const storedDrafts = raw ? JSON.parse(raw) : [];
+    const platformKey = getPlatformDraftStorageKey();
+    const platformRaw = window.localStorage.getItem(platformKey);
+    const legacyRaw = window.localStorage.getItem(draftStorageKey);
+    const platformDrafts = platformRaw ? JSON.parse(platformRaw) : null;
+    const legacyDrafts = legacyRaw ? JSON.parse(legacyRaw) : [];
+    const storedDrafts = Array.isArray(platformDrafts)
+      ? platformDrafts
+      : (Array.isArray(legacyDrafts)
+        ? legacyDrafts.filter((draft) => (draft.platform || 'facebook') === selectedPlatformId.value)
+        : []);
     drafts.value = Array.isArray(storedDrafts)
       ? storedDrafts.map((draft) => ({
         ...draft,
+        platform: draft.platform || selectedPlatformId.value,
+        facebookPostType: getDraftContentType(draft),
         media: Array.isArray(draft.media) ? draft.media.filter((item) => item?.uploadedUrl || item?.url) : []
       }))
       : [];
+    if (!platformRaw && drafts.value.length) persistDrafts();
   } catch {
     drafts.value = [];
   }
 }
 
 function persistDrafts() {
-  window.localStorage.setItem(draftStorageKey, JSON.stringify(drafts.value.slice(0, 20)));
+  window.localStorage.setItem(
+    getPlatformDraftStorageKey(),
+    JSON.stringify(drafts.value.slice(0, 20))
+  );
+}
+
+function getPlatformDraftStorageKey(platformId = selectedPlatformId.value) {
+  return `${platformDraftStoragePrefix}${platformId}`;
+}
+
+function getDraftContentType(draft = {}) {
+  if (draft.facebookPostType === 'video') return 'video';
+  return Array.isArray(draft.media) && draft.media.some((item) => item?.type === 'video')
+    ? 'video'
+    : 'imageText';
+}
+
+function getDraftMediaSummary(draft = {}) {
+  const media = Array.isArray(draft.media) ? draft.media : [];
+  const videoCount = media.filter((item) => item?.type === 'video').length;
+  const photoCount = media.filter((item) => item?.type !== 'video').length;
+  if (videoCount) return `${videoCount} video`;
+  if (photoCount) return `${photoCount} ảnh`;
+  return 'Chỉ nội dung';
 }
 
 function defaultScheduleDateTime() {
@@ -1578,12 +1710,27 @@ function saveDraft(status = 'draft', options = {}) {
     ui.notify('Chưa có nội dung để lưu nháp.', 'error');
     return;
   }
+  if (status === 'draft' && duplicateDraft.value) {
+    ui.notify('Bài viết này đã có trong danh sách Bài đã lưu.', 'error');
+    return;
+  }
+  if (status === 'draft' && editingDraftUnchanged.value) {
+    ui.notify('Bài viết chưa có thay đổi mới để cập nhật.', 'error');
+    return;
+  }
+
+  const existingDraft = status === 'draft'
+    ? drafts.value.find((item) => item.id === editingDraftId.value)
+    : null;
+  const now = new Date().toISOString();
+  const customTitle = String(post.title || '').trim();
   const draft = {
-    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    id: existingDraft?.id || `${Date.now()}-${Math.random().toString(16).slice(2)}`,
     title: status === 'scheduled'
-      ? `Lịch đăng ${formatDate(options.scheduledFor)}`
-      : `Bài nháp ${new Date().toLocaleString('vi-VN')}`,
-    type: 'photo',
+      ? (customTitle || `Lịch đăng ${formatDate(options.scheduledFor)}`)
+      : (customTitle || `Bài nháp ${new Date().toLocaleString('vi-VN')}`),
+    managementTitle: customTitle,
+    type: isFacebookVideoMode.value ? 'video' : 'photo',
     text: finalPostText.value.trim(),
     rawText: normalizeTextFormatArtifacts(post.text),
     hashtags: post.hashtags,
@@ -1600,14 +1747,16 @@ function saveDraft(status = 'draft', options = {}) {
     facebookPostType: facebookPostType.value,
     photoLayout: photoLayout.value,
     status,
-    createdAt: new Date().toISOString(),
+    createdAt: existingDraft?.createdAt || now,
+    updatedAt: now,
     scheduledFor: options.scheduledFor || null,
     targetAccountId: options.targetAccountId || selectedAccount.value?._id || null,
     targetAccountLabel: options.targetAccountLabel || selectedAccountLabel.value
   };
-  drafts.value = [draft, ...drafts.value.filter((item) => item.text !== draft.text)].slice(0, 20);
+  drafts.value = [draft, ...drafts.value.filter((item) => item.id !== draft.id)].slice(0, 20);
+  if (status === 'draft') editingDraftId.value = draft.id;
   persistDrafts();
-  if (status !== 'scheduled') ui.notify('Đã lưu nháp bài đăng.');
+  if (status !== 'scheduled') ui.notify(existingDraft ? 'Đã cập nhật bài đã lưu.' : 'Đã lưu bài viết.');
   return draft;
 }
 
@@ -1630,6 +1779,8 @@ function saveScheduledPost() {
 
 function loadDraft(draft) {
   clearComposerMedia();
+  editingDraftId.value = draft.id;
+  post.title = draft.managementTitle || (/^(Bài nháp|Lịch đăng)\s/i.test(draft.title || '') ? '' : (draft.title || ''));
   if (draft.platform && platforms.some((platform) => platform.id === draft.platform)) {
     selectedPlatformId.value = draft.platform;
   }
@@ -1672,8 +1823,22 @@ function loadDraft(draft) {
 
 function deleteDraft(draftId) {
   drafts.value = drafts.value.filter((draft) => draft.id !== draftId);
+  if (editingDraftId.value === draftId) editingDraftId.value = '';
   persistDrafts();
   ui.notify('Đã xóa nháp.');
+}
+
+function buildDraftFingerprint(draft = {}) {
+  const media = (Array.isArray(draft.media) ? draft.media : [])
+    .map((item) => `${item.type || 'photo'}:${item.uploadedUrl || item.url || ''}`)
+    .filter((item) => !item.endsWith(':'))
+    .sort();
+  return JSON.stringify({
+    platform: draft.platform || 'facebook',
+    facebookPostType: draft.facebookPostType || 'imageText',
+    text: normalizeTextFormatArtifacts(draft.text || '').trim(),
+    media
+  });
 }
 
 function duplicateComposer() {
@@ -1904,13 +2069,33 @@ function normalizeTextFormatArtifacts(value = '') {
 }
 
 function resetComposer() {
+  post.title = '';
   post.text = '';
   post.hashtags = '';
+  editingDraftId.value = '';
   clearComposerMedia();
   photoLayout.value = 'grid';
   postResult.value = null;
   showEmojiPicker.value = false;
   workflowStage.value = 'idle';
+}
+
+function clearComposerForm() {
+  if (!hasComposerContent.value) return;
+  if (!clearComposerConfirming.value) {
+    clearComposerConfirming.value = true;
+    window.clearTimeout(clearComposerConfirmTimer);
+    clearComposerConfirmTimer = window.setTimeout(() => {
+      clearComposerConfirming.value = false;
+    }, 4_000);
+    return;
+  }
+
+  window.clearTimeout(clearComposerConfirmTimer);
+  clearComposerConfirming.value = false;
+  resetComposer();
+  composerTab.value = 'compose';
+  ui.notify('Đã xóa toàn bộ nội dung trên form soạn bài.');
 }
 
 function formatDate(value) {
@@ -1920,15 +2105,38 @@ function formatDate(value) {
 
 function formatPostRun(log) {
   const mapped = postRunActionLabels[log.action];
+  if (log.action === 'facebook_post_finished' && log.level !== 'info') {
+    return {
+      title: 'Bài đăng chưa được xác minh',
+      detail: log.message || 'Facebook chưa xác nhận bài đã được đăng.'
+    };
+  }
+  if (log.action === 'instagram_post_finished' && log.level !== 'info') {
+    return {
+      title: 'Bài Instagram chưa được xác minh',
+      detail: log.message || 'Instagram chưa xác nhận bài đã được chia sẻ.'
+    };
+  }
   return {
     title: mapped?.title || 'Cập nhật trạng thái đăng',
-    detail: mapped?.detail || log.message || 'Tool vừa ghi nhận một bước trong workflow đăng bài.'
+    detail: log.message || mapped?.detail || 'Tool vừa ghi nhận một bước trong workflow đăng bài.'
   };
 }
 
 function formatLog(log) {
   const target = accounts.value.find((account) => account._id === log.accountId);
   return target?.displayName || log.accountId;
+}
+
+function formatTechnicalAction(log) {
+  return postRunActionLabels[log.action]?.title
+    || String(log.action || 'Cập nhật kỹ thuật')
+      .replace(/^(facebook|instagram)_/, '')
+      .replaceAll('_', ' ');
+}
+
+function formatLogLevel(level) {
+  return level === 'error' ? 'Lỗi' : level === 'warn' ? 'Cảnh báo' : 'Thông tin';
 }
 
 function logout() {
@@ -1942,10 +2150,15 @@ onMounted(async () => {
   await ensureDefaultProfile();
   await syncSelectedAccountRuntimeStatus();
   startRuntimeStatusPolling();
+  document.addEventListener('visibilitychange', handleRuntimeVisibilityChange);
+  window.addEventListener('focus', handleWindowFocus);
 });
 
 onUnmounted(() => {
   stopRuntimeStatusPolling();
+  document.removeEventListener('visibilitychange', handleRuntimeVisibilityChange);
+  window.removeEventListener('focus', handleWindowFocus);
+  window.clearTimeout(clearComposerConfirmTimer);
   post.media.forEach(revokeMediaPreview);
 });
 
@@ -1999,6 +2212,8 @@ watch(selectedPlatformId, async () => {
   selectedAccountId.value = preferred?._id || '';
   selectedQueueAccountIds.value = accounts.value.filter((account) => account.platform === selectedPlatformId.value).slice(0, 1).map((account) => account._id);
   facebookSessionAccountId.value = '';
+  editingDraftId.value = '';
+  loadDrafts();
   await ensureDefaultProfile();
   await syncSelectedAccountRuntimeStatus();
 });
@@ -2557,7 +2772,7 @@ watch(selectedPlatformId, async () => {
                 <div class="min-w-0">
                   <p class="truncate font-extrabold">{{ formatDate(draft.scheduledFor) }}</p>
                   <p class="mt-1 line-clamp-2 text-zinc-500">{{ draft.text }}</p>
-                  <p class="mt-2 truncate text-xs text-zinc-500">{{ draft.targetAccountLabel || 'Chưa có profile mục tiêu' }} · {{ draft.mediaCount }} ảnh</p>
+                  <p class="mt-2 truncate text-xs text-zinc-500">{{ draft.targetAccountLabel || 'Chưa có profile mục tiêu' }} · {{ getDraftMediaSummary(draft) }}</p>
                 </div>
                 <div class="flex shrink-0 items-center gap-2">
                   <button class="btn-soft h-9 px-3 text-xs" type="button" @click="loadDraft(draft)">
@@ -2694,11 +2909,28 @@ watch(selectedPlatformId, async () => {
                 <button
                   class="inline-flex h-9 items-center gap-2 rounded-lg border border-zinc-200 bg-white px-3 text-xs font-extrabold text-zinc-800 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
                   type="button"
-                  :disabled="!finalPostText.trim()"
+                  :disabled="!finalPostText.trim() || draftAlreadySaved"
                   @click="saveDraft('draft')"
                 >
-                  <Save class="h-4 w-4" />
-                  Lưu nháp
+                  <CheckCircle2 v-if="draftAlreadySaved" class="h-4 w-4 text-emerald-500" />
+                  <Save v-else class="h-4 w-4" />
+                  {{ draftAlreadySaved ? 'Đã lưu' : (editingDraftId ? 'Cập nhật' : 'Lưu bài') }}
+                </button>
+                <button
+                  :class="[
+                    'inline-flex h-9 items-center justify-center gap-2 rounded-lg border px-3 text-xs font-extrabold transition disabled:cursor-not-allowed disabled:opacity-40',
+                    clearComposerConfirming
+                      ? 'border-red-500 bg-red-500 text-white shadow-lg shadow-red-500/20 hover:bg-red-600'
+                      : 'border-zinc-200 bg-white text-zinc-500 hover:border-red-300 hover:bg-red-50 hover:text-red-600 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:border-red-500/50 dark:hover:bg-red-500/10 dark:hover:text-red-300'
+                  ]"
+                  type="button"
+                  :disabled="!hasComposerContent || posting || queueRunning"
+                  :title="clearComposerConfirming ? 'Bấm lần nữa để xóa toàn bộ form' : 'Xóa nội dung đang soạn'"
+                  @click="clearComposerForm"
+                >
+                  <AlertTriangle v-if="clearComposerConfirming" class="h-4 w-4" />
+                  <Trash2 v-else class="h-4 w-4" />
+                  {{ clearComposerConfirming ? 'Xác nhận xóa' : 'Xóa form' }}
                 </button>
                 <span class="inline-flex h-9 items-center gap-2 rounded-lg bg-zinc-100 px-3 text-xs font-extrabold text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300">
                   <BarChart3 class="h-4 w-4" />
@@ -2739,6 +2971,17 @@ watch(selectedPlatformId, async () => {
               </div>
 
               <div v-if="composerTab === 'compose'" class="space-y-4">
+                <label class="block rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-2.5 focus-within:border-emerald-500 dark:border-zinc-700 dark:bg-zinc-900">
+                  <span class="text-[11px] font-extrabold uppercase tracking-wide text-zinc-500">Tiêu đề quản lý</span>
+                  <input
+                    v-model.trim="post.title"
+                    class="mt-1 w-full bg-transparent text-sm font-extrabold text-zinc-900 outline-none placeholder:font-medium placeholder:text-zinc-400 dark:text-white"
+                    maxlength="100"
+                    placeholder="Ví dụ: Khuyến mãi cuối tuần"
+                  />
+                  <span class="mt-1 block text-[11px] text-zinc-500">Chỉ dùng để nhận diện trong công cụ, không đăng lên Facebook.</span>
+                </label>
+
                 <div v-if="selectedPlatformId === 'facebook'" class="flex flex-wrap items-center border-b border-zinc-200 pb-3 dark:border-zinc-700">
                   <div class="inline-flex rounded-full border border-zinc-200 bg-zinc-100 p-1 dark:border-zinc-700 dark:bg-zinc-950">
                     <button
@@ -3045,43 +3288,88 @@ watch(selectedPlatformId, async () => {
               <div v-if="composerTab === 'queue'" class="space-y-3 rounded-xl border border-zinc-200 p-4 dark:border-zinc-700">
                 <div class="flex flex-wrap items-center justify-between gap-3">
                   <div>
-                    <p class="font-extrabold">Bài đã lưu</p>
-                    <p class="mt-1 text-sm text-zinc-500">Quản lý bài nháp và lịch đăng để tiếp tục chỉnh sửa khi cần.</p>
+                    <p class="font-extrabold">Bài đã lưu · {{ selectedPlatform.label }}</p>
+                    <p class="mt-1 text-sm text-zinc-500">Chỉ hiển thị nội dung đã lưu riêng cho {{ selectedPlatform.label }}.</p>
                   </div>
                   <span class="rounded-full bg-zinc-100 px-3 py-1 text-xs font-extrabold text-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
                     {{ drafts.length }} mục
                   </span>
                 </div>
-                <div class="app-scrollbar max-h-72 space-y-2 overflow-auto pr-1">
-                  <article v-for="draft in drafts" :key="draft.id" class="rounded-lg border border-zinc-200 p-3 text-sm dark:border-zinc-800">
-                    <div class="flex items-start justify-between gap-3">
-                      <div class="min-w-0">
-                        <p class="truncate font-extrabold">{{ draft.title }}</p>
-                        <p class="mt-1 line-clamp-2 text-zinc-500">{{ draft.text }}</p>
-                        <p class="mt-2 text-xs text-zinc-500">
-                          {{ draft.status === 'scheduled' ? `Đăng lúc ${formatDate(draft.scheduledFor)}` : `Nháp · ${formatDate(draft.createdAt)}` }} · {{ draft.mediaCount }} ảnh
-                        </p>
-                        <p v-if="draft.status === 'scheduled'" class="mt-1 truncate text-xs text-zinc-500">
-                          {{ draft.targetAccountLabel || 'Chưa có profile mục tiêu' }}
-                        </p>
+                <div class="app-scrollbar max-h-[28rem] space-y-4 overflow-auto pr-1">
+                  <section v-if="imageTextDrafts.length" class="overflow-hidden rounded-xl border border-zinc-200 dark:border-zinc-800">
+                    <div class="flex items-center justify-between gap-3 border-b border-zinc-200 bg-zinc-50 px-3 py-2.5 dark:border-zinc-800 dark:bg-zinc-900">
+                      <div class="flex items-center gap-2">
+                        <span class="grid h-8 w-8 place-items-center rounded-lg bg-sky-500/10 text-sky-500">
+                          <Image class="h-4 w-4" />
+                        </span>
+                        <div>
+                          <p class="text-sm font-extrabold">Ảnh / Text</p>
+                          <p class="text-xs text-zinc-500">Caption, bài chữ và bài có ảnh</p>
+                        </div>
                       </div>
-                      <div class="flex shrink-0 items-center gap-2">
-                        <button class="btn-soft h-9 px-3 text-xs" type="button" @click="loadDraft(draft)">
-                          Tải
-                        </button>
-                        <button
-                          class="grid h-9 w-9 place-items-center rounded-lg border border-red-200 bg-red-50 text-red-600 transition hover:bg-red-100 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-300 dark:hover:bg-red-950/50"
-                          title="Xóa nháp"
-                          type="button"
-                          @click="deleteDraft(draft.id)"
-                        >
-                          <Trash2 class="h-4 w-4" />
-                        </button>
-                      </div>
+                      <span class="rounded-full bg-white px-2.5 py-1 text-xs font-extrabold text-zinc-600 shadow-sm dark:bg-zinc-950 dark:text-zinc-300">
+                        {{ imageTextDrafts.length }}
+                      </span>
                     </div>
-                  </article>
+                    <div class="divide-y divide-zinc-200 dark:divide-zinc-800">
+                      <article v-for="draft in imageTextDrafts" :key="draft.id" class="p-3 text-sm">
+                        <div class="flex items-start justify-between gap-3">
+                          <div class="min-w-0">
+                            <p class="truncate font-extrabold">{{ draft.title }}</p>
+                            <p class="mt-1 line-clamp-2 text-zinc-500">{{ draft.text }}</p>
+                            <p class="mt-2 text-xs text-zinc-500">
+                              {{ draft.status === 'scheduled' ? `Đăng lúc ${formatDate(draft.scheduledFor)}` : `Đã lưu · ${formatDate(draft.createdAt)}` }} · {{ getDraftMediaSummary(draft) }}
+                            </p>
+                          </div>
+                          <div class="flex shrink-0 items-center gap-2">
+                            <button class="btn-soft h-9 px-3 text-xs" type="button" @click="loadDraft(draft)">Tải</button>
+                            <button class="grid h-9 w-9 place-items-center rounded-lg border border-red-200 bg-red-50 text-red-600 transition hover:bg-red-100 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-300" title="Xóa bài đã lưu" type="button" @click="deleteDraft(draft.id)">
+                              <Trash2 class="h-4 w-4" />
+                            </button>
+                          </div>
+                        </div>
+                      </article>
+                    </div>
+                  </section>
+
+                  <section v-if="videoDrafts.length" class="overflow-hidden rounded-xl border border-zinc-200 dark:border-zinc-800">
+                    <div class="flex items-center justify-between gap-3 border-b border-zinc-200 bg-zinc-50 px-3 py-2.5 dark:border-zinc-800 dark:bg-zinc-900">
+                      <div class="flex items-center gap-2">
+                        <span class="grid h-8 w-8 place-items-center rounded-lg bg-emerald-500/10 text-emerald-500">
+                          <Video class="h-4 w-4" />
+                        </span>
+                        <div>
+                          <p class="text-sm font-extrabold">Video</p>
+                          <p class="text-xs text-zinc-500">Bài đăng sử dụng tệp video</p>
+                        </div>
+                      </div>
+                      <span class="rounded-full bg-white px-2.5 py-1 text-xs font-extrabold text-zinc-600 shadow-sm dark:bg-zinc-950 dark:text-zinc-300">
+                        {{ videoDrafts.length }}
+                      </span>
+                    </div>
+                    <div class="divide-y divide-zinc-200 dark:divide-zinc-800">
+                      <article v-for="draft in videoDrafts" :key="draft.id" class="p-3 text-sm">
+                        <div class="flex items-start justify-between gap-3">
+                          <div class="min-w-0">
+                            <p class="truncate font-extrabold">{{ draft.title }}</p>
+                            <p class="mt-1 line-clamp-2 text-zinc-500">{{ draft.text }}</p>
+                            <p class="mt-2 text-xs text-zinc-500">
+                              {{ draft.status === 'scheduled' ? `Đăng lúc ${formatDate(draft.scheduledFor)}` : `Đã lưu · ${formatDate(draft.createdAt)}` }} · {{ getDraftMediaSummary(draft) }}
+                            </p>
+                          </div>
+                          <div class="flex shrink-0 items-center gap-2">
+                            <button class="btn-soft h-9 px-3 text-xs" type="button" @click="loadDraft(draft)">Tải</button>
+                            <button class="grid h-9 w-9 place-items-center rounded-lg border border-red-200 bg-red-50 text-red-600 transition hover:bg-red-100 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-300" title="Xóa bài đã lưu" type="button" @click="deleteDraft(draft.id)">
+                              <Trash2 class="h-4 w-4" />
+                            </button>
+                          </div>
+                        </div>
+                      </article>
+                    </div>
+                  </section>
+
                   <p v-if="!drafts.length" class="rounded-lg border border-dashed border-zinc-300 p-4 text-sm text-zinc-500 dark:border-zinc-700">
-                    Chưa có nháp hoặc lịch cục bộ.
+                    Chưa có bài nào được lưu cho {{ selectedPlatform.label }}.
                   </p>
                 </div>
               </div>
@@ -3290,10 +3578,10 @@ watch(selectedPlatformId, async () => {
             {{ technicalLogStats.total }} log
           </span>
           <span v-if="technicalLogStats.warnings" class="rounded-full bg-amber-100 px-3 py-1 text-xs font-bold text-amber-700">
-            {{ technicalLogStats.warnings }} warn
+            {{ technicalLogStats.warnings }} cảnh báo
           </span>
           <span v-if="technicalLogStats.errors" class="rounded-full bg-red-100 px-3 py-1 text-xs font-bold text-red-700">
-            {{ technicalLogStats.errors }} error
+            {{ technicalLogStats.errors }} lỗi
           </span>
           <button class="btn-soft h-9 px-3 text-sm" type="button" @click="technicalLogsOpen = !technicalLogsOpen">
             <Eye v-if="!technicalLogsOpen" class="h-4 w-4" />
@@ -3316,9 +3604,9 @@ watch(selectedPlatformId, async () => {
         <div class="app-scrollbar max-h-80 space-y-2 overflow-auto pr-1">
           <article v-for="log in technicalLogs" :key="log._id" class="rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
             <div class="flex flex-wrap items-center justify-between gap-2">
-              <p class="truncate font-bold">{{ formatLog(log) }} - {{ log.action }}</p>
+              <p class="truncate font-bold">{{ formatLog(log) }} · {{ formatTechnicalAction(log) }}</p>
               <span :class="['rounded-full px-2 py-1 text-xs font-bold uppercase', log.level === 'error' ? 'bg-red-100 text-red-700' : log.level === 'warn' ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700']">
-                {{ log.level }}
+                {{ formatLogLevel(log.level) }}
               </span>
             </div>
             <p class="mt-1 text-sm text-zinc-600 dark:text-zinc-300">{{ log.message }}</p>
