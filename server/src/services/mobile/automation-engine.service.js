@@ -14,9 +14,11 @@ const uiDumpCache = new Map();
 const uiDumpInFlight = new Map();
 const openAppInFlight = new Map();
 const accountRuntimeTargets = new Map();
+const androidUiReadyCache = new Map();
 const facebookMediaRoot = '/sdcard/Pictures/SocialPilot';
 const instagramPermissionCacheTtlMs = 10 * 60 * 1000;
 const uiDumpCacheTtlMs = 350;
+const androidUiReadyCacheTtlMs = 12_000;
 
 const defaultPackages = {
   facebook: 'com.facebook.katana',
@@ -497,6 +499,18 @@ async function getLdPlayerDeviceTarget(instanceName = '') {
 }
 
 async function ensureDeviceReady(account, userId, target, attempts = 8) {
+  const requestedTarget = target;
+  target = await normalizeAccountDeviceTarget(account, target);
+  if (requestedTarget && target && requestedTarget !== target) {
+    await writeLog(
+      userId,
+      account._id,
+      'warn',
+      'adb_target_corrected',
+      `Đã sửa ADB target từ ${requestedTarget} về ${target} theo ${account.instanceName}.`,
+      { requestedTarget, resolvedTarget: target, instanceName: account.instanceName }
+    );
+  }
   let lastState = null;
   const initialState = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'get-state'], { timeoutMs: 4_000 });
   if (initialState.ok && String(initialState.stdout || '').trim() === 'device') {
@@ -516,7 +530,9 @@ async function ensureDeviceReady(account, userId, target, attempts = 8) {
       return { ...state, resolvedTarget: target };
     }
 
-    const dynamicTarget = await findAvailableEmulatorTarget(target, account.instanceName);
+    const dynamicTarget = shouldAllowDynamicTarget(account, target)
+      ? await findAvailableEmulatorTarget(target, account.instanceName)
+      : '';
     if (dynamicTarget && dynamicTarget !== target) {
       const dynamicState = await runCommand(env.mobileAutomation.adbPath, ['-s', dynamicTarget, 'get-state'], { timeoutMs: 4_000 });
       if (dynamicState.ok && String(dynamicState.stdout || '').trim() === 'device') {
@@ -545,6 +561,28 @@ async function ensureDeviceReady(account, userId, target, attempts = 8) {
   return lastState || { ok: false, error: 'ADB target is not ready.' };
 }
 
+async function normalizeAccountDeviceTarget(account, target = '') {
+  const candidate = target || getDeviceTarget(account);
+  if (!account?.instanceName || !isEmulatorTarget(candidate)) return candidate;
+
+  const instanceTarget = await getLdPlayerDeviceTarget(account.instanceName);
+  if (instanceTarget && candidate !== instanceTarget) {
+    accountRuntimeTargets.delete(account._id);
+    return instanceTarget;
+  }
+  return candidate;
+}
+
+function shouldAllowDynamicTarget(account, target = '') {
+  if (isEmulatorTarget(account?.deviceId) || isEmulatorTarget(account?.adbHost)) return false;
+  if (isEmulatorTarget(target)) return false;
+  return true;
+}
+
+function isEmulatorTarget(value = '') {
+  return /^emulator-\d+$/.test(String(value || ''));
+}
+
 async function findAvailableEmulatorTarget(preferredTarget = '', instanceName = '') {
   const devices = await runCommand(env.mobileAutomation.adbPath, ['devices'], { timeoutMs: 5_000 });
   if (!devices.ok) return '';
@@ -563,6 +601,22 @@ async function findAvailableEmulatorTarget(preferredTarget = '', instanceName = 
 }
 
 async function ensureAndroidUiReady(account, userId, target, attempts = 30) {
+  const cached = androidUiReadyCache.get(target);
+  if (cached && Date.now() - cached.at < androidUiReadyCacheTtlMs) {
+    const state = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'get-state'], { timeoutMs: 3_000 });
+    if (state.ok && String(state.stdout || '').trim() === 'device') {
+      return {
+        ok: true,
+        attempt: 0,
+        waitedForBoot: false,
+        elapsedMs: 0,
+        cached: true,
+        previous: cached.result
+      };
+    }
+    androidUiReadyCache.delete(target);
+  }
+
   let consecutiveReadyChecks = 0;
   let lastCheck = null;
   let recoveryCount = 0;
@@ -668,6 +722,14 @@ async function ensureAndroidUiReady(account, userId, target, attempts = 30) {
           result
         );
       }
+      androidUiReadyCache.set(target, {
+        at: Date.now(),
+        result: {
+          attempt: result.attempt,
+          elapsedMs: result.elapsedMs,
+          recoveryCount: result.recoveryCount
+        }
+      });
       return result;
     }
 
@@ -1027,6 +1089,7 @@ async function performOpenAccountApp(account, userId, appPackage) {
         target,
         packageName,
         elapsedMs: Date.now() - startedAt,
+        androidUi,
         readiness,
         systemUiHealth,
         home: packageName === defaultPackages.facebook
@@ -1081,7 +1144,7 @@ async function performOpenAccountApp(account, userId, appPackage) {
       recentlyBooted: androidUi.waitedForBoot
     });
   }
-  return { ...result, readiness, systemUiHealth, home, androidUi, elapsedMs: Date.now() - startedAt };
+  return { ...result, target, readiness, systemUiHealth, home, androidUi, elapsedMs: Date.now() - startedAt };
 }
 
 export async function openAccountApp(account, userId, appPackage) {
@@ -1364,7 +1427,7 @@ async function ensureFacebookHomeOnOpen(account, userId, target, packageName, op
     state = await detectFacebookState(target, '');
   }
   if (state.name === 'blocked') {
-    throw new Error('Facebook đang yêu cầu đăng nhập hoặc xác minh tài khoản.');
+    throwFacebookBlockedError(state);
   }
   if (isVerifiedFacebookHomeState(state)) {
     await writeLog(userId, account._id, 'info', 'remote_open_facebook_home', 'Facebook đã sẵn sàng tại trang chủ.', { state });
@@ -1433,6 +1496,12 @@ async function ensureFacebookHomeOnOpen(account, userId, target, packageName, op
     }
   }
 
+  if (!isVerifiedFacebookHomeState(state) && ['discard_dialog', 'ready_to_post', 'composer', 'stale_composer', 'text_editor'].includes(state.name)) {
+    const hardReset = await resetFacebookToFeed(account, userId, target, packageName, state);
+    recoverySteps.push(hardReset);
+    state = hardReset.state;
+  }
+
   const verified = isVerifiedFacebookHomeState(state);
   await writeLog(
     userId,
@@ -1443,20 +1512,67 @@ async function ensureFacebookHomeOnOpen(account, userId, target, packageName, op
     { state, active, recoverySteps }
   );
   if (state.name === 'blocked') {
-    throw new Error('Facebook đang yêu cầu đăng nhập hoặc xác minh tài khoản.');
+    throwFacebookBlockedError(state);
   }
   const finalActive = await getForegroundAndroidPackage(target);
   if (finalActive.packageName !== packageName) {
-    throw new Error('Facebook chưa mở thành công trên LDPlayer.');
+    const error = new Error('Facebook chưa mở thành công trên LDPlayer.');
+    error.code = 'FACEBOOK_APP_NOT_FOREGROUND';
+    error.details = { finalActive, target, packageName, state };
+    throw error;
   }
   if (!verified) {
-    throw new Error('Facebook đã mở nhưng chưa về đúng trang chủ. Hãy thử bấm Về trang chủ lần nữa.');
+    const error = new Error('Facebook đã mở nhưng chưa về đúng trang chủ. Hãy thử bấm Về trang chủ lần nữa.');
+    error.code = 'FACEBOOK_HOME_NOT_READY';
+    error.details = { finalActive, target, packageName, state, recoverySteps };
+    throw error;
   }
   return { ok: true, verified: true, state, recoverySteps, finalActive };
 }
 
+async function resetFacebookToFeed(account, userId, target, packageName, previousState = {}) {
+  const fresh = await launchFacebookFresh(target, packageName);
+  await delay(2200);
+  invalidateUiDump(target);
+  let state = await resolveFacebookOpenState(target, await detectFacebookState(target, ''));
+  if (!isVerifiedFacebookHomeState(state) && state.name !== 'blocked') {
+    const warm = await launchFacebookWarm(target, packageName);
+    await delay(1200);
+    invalidateUiDump(target);
+    state = await resolveFacebookOpenState(target, await detectFacebookState(target, ''));
+    const result = { ok: isVerifiedFacebookHomeState(state), method: 'force_stop_then_feed_retry', previousState, fresh, warm, state };
+    await writeLog(
+      userId,
+      account._id,
+      result.ok ? 'info' : 'warn',
+      'remote_open_facebook_hard_reset',
+      result.ok ? 'Đã force-stop Facebook và mở lại Feed để thoát composer cũ.' : 'Force-stop Facebook chưa đưa được về Feed/Home.',
+      result
+    );
+    return result;
+  }
+
+  const result = { ok: isVerifiedFacebookHomeState(state), method: 'force_stop_then_feed', previousState, fresh, state };
+  await writeLog(
+    userId,
+    account._id,
+    result.ok ? 'info' : 'warn',
+    'remote_open_facebook_hard_reset',
+    result.ok ? 'Đã force-stop Facebook và mở lại Feed để thoát composer cũ.' : 'Force-stop Facebook chưa đưa được về Feed/Home.',
+    result
+  );
+  return result;
+}
+
 function isVerifiedFacebookHomeState(state) {
-  return state?.name === 'home' && state?.reason === 'composer_entry_visible';
+  return state?.name === 'home' && ['composer_entry_visible', 'main_tab_activity_after_feed_launch'].includes(state?.reason);
+}
+
+function throwFacebookBlockedError(state = {}) {
+  const error = new Error('Facebook đang yêu cầu đăng nhập hoặc xác minh tài khoản.');
+  error.code = 'FACEBOOK_ACCOUNT_BLOCKED';
+  error.details = { state };
+  throw error;
 }
 
 async function resolveFacebookOpenState(target, state) {
@@ -1470,6 +1586,42 @@ async function resolveFacebookOpenState(target, state) {
       name: 'composer',
       reason: 'foreground_composer_activity',
       active
+    };
+  }
+  if (
+    active.packageName === defaultPackages.facebook
+    && /(?:FbMainTabActivity|MainTab|NewsFeed|Feed)/i.test(active.activityName || '')
+    && ['ready_to_post', 'composer', 'stale_composer', 'text_editor'].includes(state?.name)
+  ) {
+    invalidateUiDump(target);
+    const nodes = await dumpVisibleNodes(target);
+    if (findNodeInNodes(nodes, composerLabels)) {
+      return {
+        name: 'home',
+        reason: 'composer_entry_visible',
+        hasTargetText: state?.hasTargetText || false,
+        hasAttachedImage: false,
+        active,
+        correctedFrom: state
+      };
+    }
+    if (findNodeInNodes(nodes, facebookHomeLabels)) {
+      return {
+        name: 'home',
+        reason: 'main_tab_activity_after_feed_launch',
+        hasTargetText: state?.hasTargetText || false,
+        hasAttachedImage: false,
+        active,
+        correctedFrom: state
+      };
+    }
+    return {
+      name: 'home',
+      reason: 'main_tab_activity_after_feed_launch',
+      hasTargetText: state?.hasTargetText || false,
+      hasAttachedImage: false,
+      active,
+      correctedFrom: state
     };
   }
   return state;
@@ -1610,7 +1762,7 @@ export async function closeAccountSession(account, userId, appPackage) {
   };
 
   if (instanceBeforeClose?.running) {
-    target = await findAvailableEmulatorTarget(target, account.instanceName) || target;
+    target = await normalizeAccountDeviceTarget(account, target);
   }
 
   if (target && packageName) {
@@ -1634,6 +1786,10 @@ export async function closeAccountSession(account, userId, appPackage) {
   }
 
   accountRuntimeTargets.delete(account._id);
+  if (target) {
+    androidUiReadyCache.delete(target);
+    invalidateUiDump(target);
+  }
   return {
     ...result,
     ok: account.instanceName ? Boolean(result.cleanup?.ok) : Boolean(result.app?.ok)
@@ -1714,8 +1870,7 @@ async function getAliveProcessIds(processIds = []) {
 }
 
 export async function remoteTap(account, userId, x, y) {
-  const target = getDeviceTarget(account);
-  if (!target) throw new Error('Thiếu deviceId hoặc adbHost.');
+  const target = await getReadyRemoteTarget(account, userId, 'tap');
   const result = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'input', 'tap', String(Math.round(x)), String(Math.round(y))]);
   await writeLog(userId, account._id, result.ok ? 'info' : 'error', 'remote_tap', result.ok ? `Tap ${Math.round(x)},${Math.round(y)}.` : 'Tap lỗi.', result);
   if (!result.ok) throw new Error(result.error || result.stderr || 'Tap failed.');
@@ -1723,8 +1878,7 @@ export async function remoteTap(account, userId, x, y) {
 }
 
 export async function remoteSwipe(account, userId, fromX, fromY, toX, toY, duration = 350) {
-  const target = getDeviceTarget(account);
-  if (!target) throw new Error('Thiếu deviceId hoặc adbHost.');
+  const target = await getReadyRemoteTarget(account, userId, 'swipe');
   const result = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'input', 'swipe', String(Math.round(fromX)), String(Math.round(fromY)), String(Math.round(toX)), String(Math.round(toY)), String(duration)]);
   await writeLog(userId, account._id, result.ok ? 'info' : 'error', 'remote_swipe', result.ok ? 'Đã swipe màn hình.' : 'Swipe lỗi.', result);
   if (!result.ok) throw new Error(result.error || result.stderr || 'Swipe failed.');
@@ -1732,8 +1886,7 @@ export async function remoteSwipe(account, userId, fromX, fromY, toX, toY, durat
 }
 
 export async function remoteText(account, userId, text) {
-  const target = getDeviceTarget(account);
-  if (!target) throw new Error('Thiếu deviceId hoặc adbHost.');
+  const target = await getReadyRemoteTarget(account, userId, 'text');
   const result = await inputDeviceText(target, text);
   await writeLog(userId, account._id, result.ok ? 'info' : 'error', 'remote_text', result.ok ? 'Đã nhập text vào LDPlayer.' : 'Nhập text lỗi.', {
     ...result,
@@ -1744,8 +1897,7 @@ export async function remoteText(account, userId, text) {
 }
 
 export async function remoteKey(account, userId, key) {
-  const target = getDeviceTarget(account);
-  if (!target) throw new Error('Thiếu deviceId hoặc adbHost.');
+  const target = await getReadyRemoteTarget(account, userId, 'key');
   const keyCodes = {
     back: '4',
     home: '3',
@@ -1758,6 +1910,18 @@ export async function remoteKey(account, userId, key) {
   await writeLog(userId, account._id, result.ok ? 'info' : 'error', 'remote_key', result.ok ? `Đã gửi phím ${key}.` : `Gửi phím lỗi ${key}.`, result);
   if (!result.ok) throw new Error(result.error || result.stderr || 'Key event failed.');
   return result;
+}
+
+async function getReadyRemoteTarget(account, userId, action = 'remote') {
+  const initialTarget = getDeviceTarget(account);
+  if (!initialTarget) throw new Error('Thiếu deviceId hoặc adbHost.');
+  const ready = await ensureDeviceReady(account, userId, initialTarget, 3);
+  const target = ready.resolvedTarget || initialTarget;
+  if (!ready.ok || String(ready.stdout || '').trim() !== 'device') {
+    await writeLog(userId, account._id, 'error', 'remote_target_not_ready', `ADB ${target} chưa sẵn sàng cho lệnh ${action}.`, ready);
+    throw new Error(ready.error || ready.stderr || `ADB ${target} chưa sẵn sàng.`);
+  }
+  return target;
 }
 
 function getDeviceTarget(account) {

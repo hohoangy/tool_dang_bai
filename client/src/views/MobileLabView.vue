@@ -266,11 +266,20 @@ const runtimeConfirmsFacebookApp = computed(() => Boolean(
   selectedRuntimeStatus.value?.deviceReady
   && selectedRuntimeStatus.value?.appReady
 ));
+const facebookRuntimeWaiting = computed(() => Boolean(
+  selectedAccount.value?._id
+  && facebookSessionAccountId.value === selectedAccount.value._id
+  && runtimeStatusMissCount.value > 0
+  && !runtimeConfirmsFacebookApp.value
+));
 const facebookAppReady = computed(() => Boolean(
   selectedAccount.value?._id
   && (
     runtimeConfirmsFacebookApp.value
-    || facebookSessionAccountId.value === selectedAccount.value._id
+    || (
+      facebookSessionAccountId.value === selectedAccount.value._id
+      && !facebookRuntimeWaiting.value
+    )
   )
 ));
 const facebookAppInForeground = computed(() => Boolean(
@@ -284,12 +293,10 @@ const facebookAppRunningInBackground = computed(() => Boolean(
 ));
 const selectedDeviceReady = computed(() => Boolean(selectedRuntimeStatus.value?.deviceReady));
 const runtimeStatusDetail = computed(() => {
+  if (facebookRuntimeWaiting.value) return `Đang chờ ${formatInstanceLabel(selectedAccount.value)} kết nối lại`;
   if (facebookAppInForeground.value) return `${selectedPlatform.value.label} đang mở trên màn hình ${formatInstanceLabel(selectedAccount.value)}`;
   if (facebookAppRunningInBackground.value) return `${selectedPlatform.value.label} đang chạy nền trong ${formatInstanceLabel(selectedAccount.value)}`;
   if (facebookAppReady.value) return `${selectedPlatform.value.label} đã được nhận diện trong ${formatInstanceLabel(selectedAccount.value)}`;
-  if (runtimeStatusMissCount.value > 0 && facebookSessionAccountId.value === selectedAccount.value?._id) {
-    return `Đang đồng bộ lại kết nối với ${formatInstanceLabel(selectedAccount.value)}`;
-  }
   if (!selectedDeviceReady.value) return `${formatInstanceLabel(selectedAccount.value)} chưa chạy hoặc ADB chưa kết nối`;
   const foregroundPackage = selectedRuntimeStatus.value?.foregroundPackage;
   if (foregroundPackage && foregroundPackage !== facebookAppPackage.value) {
@@ -299,7 +306,7 @@ const runtimeStatusDetail = computed(() => {
 });
 const facebookOpenButtonLabel = computed(() => {
   if (facebookOpening.value) return `Đang mở ${selectedPlatform.value.label}`;
-  if (facebookAppReady.value) return 'Về trang chủ';
+  if (facebookAppReady.value) return `Đã mở ${selectedPlatform.value.label}`;
   return `Mở ${selectedPlatform.value.label}`;
 });
 const facebookActivityLabel = computed(() => {
@@ -312,6 +319,7 @@ const facebookActivityLabel = computed(() => {
 const showFacebookActivityOverlay = computed(() => selectedPlatformId.value === 'facebook'
   && (facebookOpening.value || posting.value || queueRunning.value));
 const facebookSessionStatusLabel = computed(() => {
+  if (facebookRuntimeWaiting.value) return `Đang chờ ${formatInstanceLabel(selectedAccount.value)}`;
   if (facebookAppInForeground.value) return `Đang mở ${selectedPlatform.value.label}`;
   if (facebookAppRunningInBackground.value) return `${selectedPlatform.value.label} chạy nền`;
   return facebookAppReady.value ? `Đã nhận diện ${selectedPlatform.value.label}` : `Chưa mở ${selectedPlatform.value.label}`;
@@ -689,7 +697,7 @@ const queueStats = computed(() => {
 });
 const primaryActionLabel = computed(() => {
   if (queueRunning.value) return 'Đang đăng hàng loạt';
-  if (posting.value) return isReviewMode.value ? 'Đang mở Facebook' : 'Đang đăng Facebook';
+  if (posting.value) return isReviewMode.value ? 'Đang kiểm tra' : 'Đang đăng Facebook';
   if (isReviewMode.value) return 'Mở kiểm tra';
   if (isBulkMode.value) return `Bắt đầu đăng (${selectedQueueAccounts.value.length})`;
   if (isScheduleMode.value) return 'Lưu lịch';
@@ -1050,7 +1058,7 @@ async function syncSelectedAccountRuntimeStatus(options = {}) {
     if (!sessionWasConfirmed || runtimeStatusMissCount.value >= runtimeStatusMissLimit) {
       facebookSessionAccountId.value = '';
     }
-    return sessionWasConfirmed && runtimeStatusMissCount.value < runtimeStatusMissLimit;
+    return false;
   } catch {
     // Lỗi mạng tạm thời không nên làm thay đổi trạng thái đang hiển thị.
     if (facebookSessionAccountId.value === account._id) {
@@ -1058,7 +1066,7 @@ async function syncSelectedAccountRuntimeStatus(options = {}) {
       if (runtimeStatusMissCount.value >= runtimeStatusMissLimit) {
         facebookSessionAccountId.value = '';
       }
-      return runtimeStatusMissCount.value < runtimeStatusMissLimit;
+      return false;
     }
     return false;
   } finally {
@@ -2370,10 +2378,10 @@ watch(selectedPlatformId, async () => {
             <button
               class="btn-soft mt-5 h-10"
               :class="facebookAppReady ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-200' : ''"
-              :disabled="running || facebookOpening || !canUseRemote"
+              :disabled="running || facebookOpening || facebookAppReady || !canUseRemote"
               @click="remoteOpenApp"
             >
-              <Home v-if="facebookAppReady" class="h-4 w-4" />
+              <CheckCircle2 v-if="facebookAppReady" class="h-4 w-4" />
               <Play v-else class="h-4 w-4" />
               {{ facebookOpenButtonLabel }}
             </button>
@@ -2956,17 +2964,6 @@ watch(selectedPlatformId, async () => {
                 </div>
 
                 <div class="flex flex-wrap items-center justify-end gap-2">
-                  <span
-                    :class="[
-                      'inline-flex h-8 items-center gap-2 rounded-full border px-3 text-[11px] font-extrabold',
-                      facebookAppReady
-                        ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
-                        : 'border-zinc-200 bg-zinc-50 text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900'
-                    ]"
-                  >
-                    <span :class="['h-2 w-2 rounded-full', facebookAppReady ? 'bg-emerald-500' : 'bg-zinc-400']"></span>
-                    {{ facebookSessionStatusLabel }}
-                  </span>
                   <div class="inline-flex items-center gap-1 rounded-lg border border-zinc-200 bg-zinc-50 p-1 dark:border-zinc-700 dark:bg-zinc-900">
                     <button
                       v-for="tab in composerTabs"

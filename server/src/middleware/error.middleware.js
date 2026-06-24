@@ -4,7 +4,19 @@ export function errorHandler(err, _req, res, _next) {
   const isValidationError = err?.name === 'ZodError';
   const isPayloadTooLarge = err?.type === 'entity.too.large';
   const isRuntimeUnavailable = ['LDPLAYER_ENGINE_NOT_READY'].includes(err?.code);
-  const statusCode = isValidationError ? 400 : isPayloadTooLarge ? 413 : isRuntimeUnavailable ? 503 : err instanceof ApiError ? err.statusCode : 500;
+  const isFacebookAccountBlocked = ['FACEBOOK_ACCOUNT_BLOCKED'].includes(err?.code);
+  const isFacebookRuntimeUnavailable = ['FACEBOOK_APP_NOT_FOREGROUND', 'FACEBOOK_HOME_NOT_READY'].includes(err?.code);
+  const statusCode = isValidationError
+    ? 400
+    : isPayloadTooLarge
+      ? 413
+      : isFacebookAccountBlocked
+        ? 409
+        : (isRuntimeUnavailable || isFacebookRuntimeUnavailable)
+          ? 503
+          : err instanceof ApiError
+            ? err.statusCode
+            : 500;
   const message = isValidationError
     ? 'Invalid request data.'
     : isPayloadTooLarge
