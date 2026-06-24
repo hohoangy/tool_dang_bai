@@ -26,6 +26,42 @@ export async function runCommand(command, args, metadata = {}) {
       stderr: result.stderr?.trim() || ''
     };
   } catch (error) {
+    if (
+      isAdbExecutable(command, executable)
+      && metadata.retryTransient !== false
+      && !['start-server', 'kill-server'].includes(args[0])
+      && isTransientAdbCommandError(error)
+    ) {
+      try {
+        await execFileAsync(executable, ['kill-server'], {
+          windowsHide: true,
+          timeout: 10_000,
+          maxBuffer: 1024 * 1024
+        }).catch(() => null);
+        await execFileAsync(executable, ['start-server'], {
+          windowsHide: true,
+          timeout: 10_000,
+          maxBuffer: 1024 * 1024
+        });
+        const retry = await execFileAsync(executable, args, {
+          windowsHide: true,
+          timeout: metadata.timeoutMs || 60_000,
+          maxBuffer: metadata.maxBuffer || 1024 * 1024
+        });
+        return {
+          ok: true,
+          command,
+          args,
+          durationMs: Date.now() - startedAt,
+          stdout: retry.stdout?.trim() || '',
+          stderr: retry.stderr?.trim() || '',
+          retriedAfterAdbRestart: true,
+          firstError: summarizeCommandError(error)
+        };
+      } catch (retryError) {
+        error.retryError = retryError;
+      }
+    }
     return {
       ok: false,
       command,
@@ -33,7 +69,9 @@ export async function runCommand(command, args, metadata = {}) {
       durationMs: Date.now() - startedAt,
       stdout: error.stdout?.trim() || '',
       stderr: error.stderr?.trim() || '',
-      error: error.message
+      error: error.retryError?.message || error.message,
+      firstError: error.retryError ? summarizeCommandError(error) : undefined,
+      retriedAfterAdbRestart: Boolean(error.retryError)
     };
   }
 }
@@ -167,5 +205,29 @@ function missingExecutableResult(command, args, startedAt, stdout = '') {
     stdout,
     stderr: '',
     error: `Không tìm thấy ${executable}. Hãy cài LDPlayer hoặc cập nhật ADB_PATH/LDCONSOLE_PATH trong file .env.`
+  };
+}
+
+function isAdbExecutable(command, executable) {
+  return path.basename(String(command || executable)).toLowerCase() === 'adb.exe'
+    || path.basename(String(executable || command)).toLowerCase() === 'adb.exe'
+    || String(command || '').toLowerCase() === 'adb';
+}
+
+function isTransientAdbCommandError(error) {
+  const output = `${error?.message || ''}\n${error?.stderr || ''}\n${error?.stdout || ''}`;
+  return Boolean(
+    error?.killed
+    || error?.signal
+    || /timed out|timeout|device offline|device .+ not found|no devices?\/emulators? found|transport error|protocol fault|closed/i.test(output)
+  );
+}
+
+function summarizeCommandError(error) {
+  return {
+    message: error?.message || '',
+    killed: Boolean(error?.killed),
+    signal: error?.signal || null,
+    stderr: error?.stderr?.trim?.() || ''
   };
 }

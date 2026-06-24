@@ -73,15 +73,6 @@ const platforms = [
     packageName: 'com.facebook.katana',
     status: 'ready',
     description: 'Mo composer, nhap text, gan anh va dang truc tiep bang Facebook app trong LDPlayer.'
-  },
-  {
-    id: 'instagram',
-    label: 'Instagram',
-    iconLabel: '◎',
-    iconClass: 'bg-gradient-to-br from-[#833AB4] via-[#E1306C] to-[#FCAF45] text-white',
-    packageName: 'com.instagram.android',
-    status: 'ready',
-    description: 'Dang Feed, Reels hoac Tin qua Instagram app trong LDPlayer.'
   }
 ];
 
@@ -308,9 +299,8 @@ const runtimeStatusDetail = computed(() => {
 });
 const facebookOpenButtonLabel = computed(() => {
   if (facebookOpening.value) return `Đang mở ${selectedPlatform.value.label}`;
-  if (facebookAppInForeground.value) return `Đã mở ${selectedPlatform.value.label}`;
-  if (facebookAppRunningInBackground.value) return `${selectedPlatform.value.label} đang chạy nền`;
-  return facebookAppReady.value ? `Đã nhận diện ${selectedPlatform.value.label}` : `Mở ${selectedPlatform.value.label}`;
+  if (facebookAppReady.value) return 'Về trang chủ';
+  return `Mở ${selectedPlatform.value.label}`;
 });
 const facebookActivityLabel = computed(() => {
   if (facebookOpening.value) return `Đang mở ${selectedPlatform.value.label}`;
@@ -945,9 +935,11 @@ async function remoteLaunch() {
 }
 
 async function remoteOpenApp() {
-  if (!selectedAccount.value || facebookOpening.value || facebookAppReady.value) return;
+  if (!selectedAccount.value || facebookOpening.value) return;
   const nextAccount = selectedAccount.value;
-  const previousAccount = await findActiveAccountBeforeSwitch(nextAccount);
+  const previousAccount = facebookAppReady.value
+    ? null
+    : await findActiveAccountBeforeSwitch(nextAccount);
   const shouldClosePrevious = previousAccount && previousAccount._id !== nextAccount._id;
   running.value = true;
   facebookOpening.value = true;
@@ -1027,7 +1019,13 @@ async function waitForSelectedAccountRuntimeReady(accountId, attempts = 4) {
 
 async function syncSelectedAccountRuntimeStatus(options = {}) {
   const account = selectedAccount.value;
-  if (!account || (runtimeStatusChecking.value && !options.force) || posting.value || queueRunning.value) return false;
+  if (!account || posting.value || queueRunning.value) return false;
+  if (runtimeStatusChecking.value) {
+    return Boolean(
+      selectedRuntimeStatus.value?.deviceReady
+      && selectedRuntimeStatus.value?.appReady
+    );
+  }
 
   const requestId = ++runtimeStatusRequestId;
   runtimeStatusChecking.value = true;
@@ -1377,7 +1375,7 @@ async function submitFacebookForAccount(account, autoSubmit, waitAfterSubmitMs =
     ? []
     : await prepareFacebookPublishImages(uniqueImages);
 
-  return http.post(`/mobile/accounts/${account._id}/${selectedPlatformId.value}/post`, {
+  return http.post(`/mobile/accounts/${account._id}/facebook/post`, {
     text: finalPostText.value.trim(),
     appPackage: selectedPlatform.value.packageName,
     autoSubmit,
@@ -1401,7 +1399,7 @@ async function submitFacebookForAccount(account, autoSubmit, waitAfterSubmitMs =
 }
 
 async function prepareFacebookPublishImages(images) {
-  if (selectedPlatformId.value !== 'facebook' || images.length < 2) return images;
+  if (images.length < 2) return images;
 
   const cacheKey = JSON.stringify({
     layout: photoLayout.value,
@@ -2196,6 +2194,12 @@ const queueOverlayTitle = computed(() => {
 
 watch(photoLayout, invalidateCollageCache);
 
+watch(composerTab, () => {
+  // Đổi giữa Soạn/Xem trước/Bài đã lưu chỉ là trạng thái giao diện.
+  // Luôn đồng bộ lại runtime nhưng không xóa phiên Facebook đã xác nhận.
+  syncSelectedAccountRuntimeStatus({ force: true });
+});
+
 watch(selectedPlatformId, async () => {
   runtimeStatusRequestId += 1;
   selectedRuntimeStatus.value = null;
@@ -2366,10 +2370,10 @@ watch(selectedPlatformId, async () => {
             <button
               class="btn-soft mt-5 h-10"
               :class="facebookAppReady ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-200' : ''"
-              :disabled="running || facebookOpening || !canUseRemote || facebookAppReady"
+              :disabled="running || facebookOpening || !canUseRemote"
               @click="remoteOpenApp"
             >
-              <CheckCircle2 v-if="facebookAppReady" class="h-4 w-4" />
+              <Home v-if="facebookAppReady" class="h-4 w-4" />
               <Play v-else class="h-4 w-4" />
               {{ facebookOpenButtonLabel }}
             </button>
@@ -2951,22 +2955,35 @@ watch(selectedPlatformId, async () => {
                   </div>
                 </div>
 
-                <div class="inline-flex items-center gap-1 rounded-lg border border-zinc-200 bg-zinc-50 p-1 dark:border-zinc-700 dark:bg-zinc-900">
-                  <button
-                    v-for="tab in composerTabs"
-                    :key="tab.id"
+                <div class="flex flex-wrap items-center justify-end gap-2">
+                  <span
                     :class="[
-                      'inline-flex h-8 items-center justify-center gap-1.5 rounded-md px-3 text-xs font-extrabold transition',
-                      composerTab === tab.id ? 'bg-white text-zinc-950 shadow-sm dark:bg-zinc-800 dark:text-white' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-white'
+                      'inline-flex h-8 items-center gap-2 rounded-full border px-3 text-[11px] font-extrabold',
+                      facebookAppReady
+                        ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                        : 'border-zinc-200 bg-zinc-50 text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900'
                     ]"
-                    type="button"
-                    @click="composerTab = tab.id"
                   >
-                    <FileText v-if="tab.id === 'compose'" class="h-3.5 w-3.5" />
-                    <Eye v-else-if="tab.id === 'preview'" class="h-3.5 w-3.5" />
-                    <CalendarClock v-else class="h-3.5 w-3.5" />
-                    {{ tab.label }}
-                  </button>
+                    <span :class="['h-2 w-2 rounded-full', facebookAppReady ? 'bg-emerald-500' : 'bg-zinc-400']"></span>
+                    {{ facebookSessionStatusLabel }}
+                  </span>
+                  <div class="inline-flex items-center gap-1 rounded-lg border border-zinc-200 bg-zinc-50 p-1 dark:border-zinc-700 dark:bg-zinc-900">
+                    <button
+                      v-for="tab in composerTabs"
+                      :key="tab.id"
+                      :class="[
+                        'inline-flex h-8 items-center justify-center gap-1.5 rounded-md px-3 text-xs font-extrabold transition',
+                        composerTab === tab.id ? 'bg-white text-zinc-950 shadow-sm dark:bg-zinc-800 dark:text-white' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-white'
+                      ]"
+                      type="button"
+                      @click="composerTab = tab.id"
+                    >
+                      <FileText v-if="tab.id === 'compose'" class="h-3.5 w-3.5" />
+                      <Eye v-else-if="tab.id === 'preview'" class="h-3.5 w-3.5" />
+                      <CalendarClock v-else class="h-3.5 w-3.5" />
+                      {{ tab.label }}
+                    </button>
+                  </div>
                 </div>
               </div>
 

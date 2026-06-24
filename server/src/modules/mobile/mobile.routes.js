@@ -277,7 +277,11 @@ mobileRoutes.post('/accounts/:id/facebook/post', requireAuth, asyncHandler(async
   if (account.platform !== 'facebook') {
     throw new ApiError(400, 'Profile này không phải Facebook. Hãy chọn đúng profile Facebook.');
   }
-  const platformInput = { ...input, appPackage: 'com.facebook.katana' };
+  const platformInput = {
+    ...input,
+    appPackage: 'com.facebook.katana',
+    images: Array.from(new Map(input.images.map((image) => [image.url, image])).values())
+  };
   try {
     const result = await publishFacebookPostViaMobile(account, req.user._id, platformInput);
     res.json({ result });
