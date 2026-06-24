@@ -222,17 +222,9 @@ const availablePhotoLayouts = computed(() => {
 });
 const previewGalleryClass = computed(() => {
   if (previewPhotos.value.length === 1) return 'grid grid-cols-1';
-  if (photoLayout.value === 'focus-first') {
-    if (previewPhotos.value.length === 2) return 'grid aspect-[16/9] grid-cols-3 gap-0.5';
-    return `grid w-full aspect-[16/9] grid-cols-2 ${previewPhotos.value.length === 3 ? 'grid-rows-2' : 'grid-rows-3'} gap-0.5`;
-  }
-  if (photoLayout.value === 'hero-top') {
-    if (previewPhotos.value.length === 2) return 'grid w-full aspect-[16/9] grid-rows-2 gap-0.5';
-    return 'grid w-full aspect-[16/9] grid-cols-6 grid-rows-2 gap-0.5';
-  }
   if (previewPhotos.value.length === 2) return 'grid w-full aspect-[16/9] grid-cols-2 gap-0.5';
-  if (previewPhotos.value.length === 3) return 'grid w-full aspect-[16/9] grid-cols-3 gap-0.5';
-  return 'grid w-full aspect-[16/9] grid-cols-2 grid-rows-2 gap-0.5';
+  if (previewPhotos.value.length === 3) return 'grid w-full aspect-[16/9] grid-cols-2 grid-rows-2 gap-0.5';
+  return 'grid w-full aspect-[16/9] grid-cols-3 grid-rows-2 gap-0.5';
 });
 const hashtagItems = computed(() => parseHashtags(post.hashtags));
 const normalizedHashtags = computed(() => hashtagItems.value.join(' '));
@@ -1407,37 +1399,11 @@ async function submitFacebookForAccount(account, autoSubmit, waitAfterSubmitMs =
 }
 
 async function prepareFacebookPublishImages(images) {
-  if (images.length < 2) return images;
-
-  const cacheKey = JSON.stringify({
-    layout: photoLayout.value,
-    images: images.map((item) => item.uploadedUrl)
-  });
-  if (collageCache.key === cacheKey && collageCache.item) return [collageCache.item];
-
-  const blob = await createPhotoCollage(images, photoLayout.value);
-  if (blob.size > 5 * 1024 * 1024) {
-    throw new Error('Ảnh ghép vượt quá 5 MB. Hãy dùng ảnh nguồn nhỏ hơn.');
-  }
-
-  const filename = `bo-cuc-${photoLayout.value}-${Date.now()}.jpg`;
-  const { data } = await http.post('/media/images', blob, {
-    headers: {
-      'Content-Type': 'image/jpeg',
-      'X-File-Name': encodeURIComponent(filename)
-    }
-  });
-  const item = {
-    id: `collage-${Date.now()}`,
-    name: filename,
-    type: 'photo',
-    url: data.image.url,
-    uploadedUrl: data.image.url,
-    mimeType: data.image.mimeType,
-    size: data.image.size
-  };
-  collageCache = { key: cacheKey, item };
-  return [item];
+  // Facebook native album layout is controlled by upload order, not by an
+  // editable layout API. Keep every uploaded image separate and send them in
+  // the same order the user arranged in the composer. This avoids turning a
+  // multi-photo post into one flattened collage image.
+  return images;
 }
 
 async function createPhotoCollage(images, layout) {
@@ -1979,16 +1945,8 @@ function ensureValidPhotoLayout() {
 
 function previewPhotoClass(index) {
   const count = previewPhotos.value.length;
-  if (photoLayout.value === 'focus-first') {
-    if (count === 2 && index === 0) return 'col-span-2';
-    if (count >= 3 && index === 0) return count === 3 ? 'row-span-2' : 'row-span-3';
-  }
-  if (photoLayout.value === 'hero-top') {
-    if (count === 2) return '';
-    if (index === 0) return 'col-span-6';
-    if (count === 3) return 'col-span-3';
-    return 'col-span-2';
-  }
+  if (count === 3 && index === 0) return 'col-span-2';
+  if (count >= 4 && index === 0) return 'col-span-3';
   return '';
 }
 
@@ -3071,38 +3029,13 @@ watch(selectedPlatformId, async () => {
                         <ListChecks class="h-4 w-4" />
                       </span>
                       <div class="min-w-0">
-                        <p class="text-xs font-black text-zinc-800 dark:text-zinc-100">Trình bày ảnh</p>
-                        <p class="truncate text-[11px] text-zinc-500">Chọn bố cục · Kéo thả để sắp xếp · Xuất thành một ảnh ghép</p>
+                        <p class="text-xs font-black text-zinc-800 dark:text-zinc-100">Sắp xếp ảnh Facebook</p>
+                        <p class="truncate text-[11px] text-zinc-500">Kéo ảnh để đổi thứ tự · Preview mô phỏng bố cục Facebook</p>
                       </div>
                     </div>
-                    <div class="inline-flex max-w-full items-center gap-1 rounded-lg border border-zinc-200 bg-white p-1 dark:border-zinc-700 dark:bg-zinc-950">
-                      <button
-                        v-for="layout in availablePhotoLayouts"
-                        :key="layout.id"
-                        :class="[
-                          'group inline-flex h-9 items-center gap-2 rounded-md px-2.5 text-xs font-extrabold transition',
-                          photoLayout === layout.id
-                            ? 'bg-zinc-900 text-white shadow-sm dark:bg-white dark:text-zinc-950'
-                            : 'text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-white'
-                        ]"
-                        type="button"
-                        :title="layout.description"
-                        @click="photoLayout = layout.id"
-                      >
-                        <span class="grid h-5 w-7 shrink-0 grid-cols-2 gap-px overflow-hidden rounded-sm bg-zinc-300 dark:bg-zinc-700">
-                          <span
-                            :class="[
-                              'bg-current opacity-70',
-                              layout.id === 'focus-first' ? 'row-span-2' : '',
-                              layout.id === 'hero-top' ? 'col-span-2' : ''
-                            ]"
-                          ></span>
-                          <span class="bg-current opacity-40"></span>
-                          <span class="bg-current opacity-40"></span>
-                        </span>
-                        <span class="hidden sm:inline">{{ layout.label }}</span>
-                      </button>
-                    </div>
+                    <span class="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-[11px] font-black text-emerald-600 dark:text-emerald-300">
+                      {{ previewPhotos.length }} ảnh native
+                    </span>
                   </div>
                   <div
                     :class="[

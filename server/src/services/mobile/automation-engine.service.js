@@ -2250,11 +2250,47 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
       preparedImages = await prepareFacebookImages(account, userId, target, images, { cleanup: false });
       perf.mark('image_prepared', { imageCount: preparedImages.length });
       await assertDeviceConnected(target, 'trước khi mở Facebook composer');
-      // Image share intents can stall ADB/UIAutomator on LDPlayer-3.
-      // Open the text composer first and attach the prepared image through
-      // Facebook's gallery in the state machine.
-      openHome = await openFacebookComposer(account, userId, target, config, text, [], 'image');
-      perf.mark('composer_opened', { method: openHome.method || '' });
+      const useDirectImageShare = shouldUseFacebookImageShareIntent(account);
+      openHome = await openFacebookComposer(account, userId, target, config, text, useDirectImageShare ? preparedImages : [], 'image');
+      perf.mark('composer_opened', { method: openHome.method || '', directImageShare: useDirectImageShare });
+      if (useDirectImageShare && openHome.method === 'image_share_intent') {
+        const imageComposer = await waitForFacebookMediaComposer(target, text, 'image', 12_000);
+        const canContinueFromShareChooser = imageComposer.state === 'share_chooser';
+        await writeLog(
+          userId,
+          account._id,
+          imageComposer.ok || canContinueFromShareChooser ? 'info' : 'warn',
+          'facebook_image_composer_ready',
+          imageComposer.ok
+            ? 'Composer ảnh đã hiển thị đầy đủ caption và ảnh qua share intent.'
+            : canContinueFromShareChooser
+              ? 'Android đang hoàn tất bộ chọn Facebook Feed; tiếp tục bằng state machine.'
+              : 'Facebook chưa xác nhận ảnh qua share intent; fallback sang composer text + gallery.',
+          imageComposer
+        );
+        perf.mark('image_composer_ready', {
+          attempt: imageComposer.attempt,
+          hasTargetText: imageComposer.hasTargetText,
+          hasAttachedMedia: imageComposer.hasAttachedMedia
+        });
+        if (!imageComposer.ok && !canContinueFromShareChooser) {
+          const fallbackStop = await runCommand(env.mobileAutomation.adbPath, [
+            '-s',
+            target,
+            'shell',
+            'am',
+            'force-stop',
+            config.appPackage
+          ], { timeoutMs: 8_000 });
+          steps.push(fallbackStop);
+          await writeLog(userId, account._id, fallbackStop.ok ? 'info' : 'warn', 'facebook_image_share_fallback_reset', fallbackStop.ok
+            ? 'Đã đóng Facebook để fallback sang cách chọn ảnh từ gallery.'
+            : 'Không đóng được Facebook trước fallback gallery; vẫn tiếp tục thử.', fallbackStop);
+          await delay(900);
+          openHome = await openFacebookComposer(account, userId, target, config, text, [], 'image');
+          perf.mark('composer_reopened_for_gallery', { method: openHome.method || '' });
+        }
+      }
     } else {
       await assertDeviceConnected(target, 'trước khi mở Facebook composer');
       openHome = await openFacebookComposer(account, userId, target, config, text, [], 'image');
@@ -2315,6 +2351,14 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
       });
     }
   }
+}
+
+function shouldUseFacebookImageShareIntent(account) {
+  const instanceName = String(account?.instanceName || '');
+  // LDPlayer-3 has repeatedly stalled after Facebook accepts an image share
+  // intent. Keep this instance on the slower gallery path; other instances use
+  // the faster direct share path and still have a fallback if validation fails.
+  return !/LDPlayer-3/i.test(instanceName);
 }
 
 export async function publishInstagramPostViaMobile(account, userId, payload = {}) {
@@ -4500,7 +4544,7 @@ async function submitFacebookPost(account, userId, target, config, text, steps, 
     );
     steps.push(submit);
 
-    await delay(index === 0 ? 450 : 700);
+    await delay(index === 0 ? (mediaCount > 0 ? 2_500 : 450) : (mediaCount > 0 ? 1_500 : 700));
     const nodes = await dumpVisibleNodes(target);
     const progress = findPostingProgressNode(nodes);
     const confirmation = findNodeInNodes(nodes, postedConfirmationLabels);
@@ -4640,7 +4684,7 @@ function findSemanticSubmitButton(nodes) {
       if (!node.enabled || !node.clickable) return false;
       if (!node.className.includes('Button')) return false;
       const value = normalizeSearchText(`${node.text} ${node.desc}`);
-      return labels.some((label) => value === label || value.includes(label));
+      return labels.some((label) => isFacebookSubmitLabelMatch(value, label));
     })
     .map((node) => ({
       ...node.bounds,
@@ -4651,6 +4695,13 @@ function findSemanticSubmitButton(nodes) {
     }));
 
   return candidates.sort((a, b) => (b.bottom - a.bottom) || (b.right - a.right))[0] || null;
+}
+
+function isFacebookSubmitLabelMatch(value, label) {
+  if (!value || !label) return false;
+  if (value === label) return true;
+  if (['post', 'dang', 'share', 'publish'].includes(label)) return false;
+  return value.includes(label);
 }
 
 async function verifyFacebookPostSubmit(
@@ -4664,7 +4715,10 @@ async function verifyFacebookPostSubmit(
   initialPostingProgress = false
 ) {
   let lastState = null;
-  const verificationWindowMs = Math.max(8_000, waitAfterSubmitMs || 0);
+  const mediaMinimumVerificationMs = mediaKind === 'video'
+    ? 90_000
+    : (mediaCount > 0 ? 45_000 : 8_000);
+  const verificationWindowMs = Math.max(mediaMinimumVerificationMs, waitAfterSubmitMs || 0);
   const verificationStartedAt = Date.now();
   const verificationDeadline = verificationStartedAt + verificationWindowMs;
   const uploadDeadline = verificationStartedAt + Math.max(
@@ -4740,6 +4794,20 @@ async function verifyFacebookPostSubmit(
             attempt,
             elapsedMs: Date.now() - verificationStartedAt,
             mediaKind,
+            evidenceReason: evidence.reason
+          });
+          continue;
+        }
+        if (Date.now() < verificationDeadline) {
+          await writeLog(userId, account._id, 'info', 'facebook_post_submit_evidence_waiting', mediaCount > 0
+            ? 'Facebook đã rời màn soạn bài; tiếp tục chờ feed cập nhật bài có media để đối chiếu.'
+            : 'Facebook đã rời màn soạn bài; tiếp tục chờ feed cập nhật để đối chiếu.', {
+            attempt,
+            elapsedMs: Date.now() - verificationStartedAt,
+            mediaCount,
+            mediaKind,
+            sawPostingProgress,
+            state: lastState,
             evidenceReason: evidence.reason
           });
           continue;
@@ -4983,7 +5051,7 @@ function findPostingProgressNode(nodes) {
 async function attachFacebookImages(account, userId, target, imageCount = 1, text = '', options = {}) {
   const steps = [];
   const count = Math.max(1, Math.min(Number(imageCount) || 1, 4));
-  let currentState = await detectFacebookState(target, text);
+  let currentState = await waitForFacebookAttachableComposer(account, userId, target, text);
   if (currentState.name === 'text_editor') {
     const done = await tapTextOrPoint(
       account,
@@ -4996,7 +5064,7 @@ async function attachFacebookImages(account, userId, target, imageCount = 1, tex
     );
     steps.push(done);
     await delay(postStepDelay(1.5));
-    currentState = await detectFacebookState(target, text);
+    currentState = await waitForFacebookAttachableComposer(account, userId, target, text);
   }
   if (!['ready_to_post', 'composer', 'stale_composer'].includes(currentState.name)) {
     throw new Error(`Facebook chưa ở composer để thêm ảnh (${currentState.name}).`);
@@ -5134,6 +5202,39 @@ async function attachFacebookImages(account, userId, target, imageCount = 1, tex
     bounds: attached
   });
   return { steps, attachedCount: count };
+}
+
+async function waitForFacebookAttachableComposer(account, userId, target, text, timeoutMs = 8_000) {
+  const startedAt = Date.now();
+  let attempt = 0;
+  let lastState = null;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    attempt += 1;
+    invalidateUiDump(target);
+    lastState = await detectFacebookState(target, text);
+    if (['ready_to_post', 'composer', 'text_editor', 'stale_composer'].includes(lastState.name)) {
+      if (attempt > 1) {
+        await writeLog(userId, account._id, 'info', 'facebook_post_attach_composer_ready_after_wait', 'Facebook composer đã ổn định lại trước khi thêm ảnh.', {
+          attempt,
+          elapsedMs: Date.now() - startedAt,
+          state: lastState
+        });
+      }
+      return lastState;
+    }
+
+    if (attempt === 1 || attempt % 4 === 0) {
+      await writeLog(userId, account._id, 'info', 'facebook_post_attach_wait_composer', 'Đang chờ Facebook composer ổn định trước khi thêm ảnh.', {
+        attempt,
+        elapsedMs: Date.now() - startedAt,
+        state: lastState
+      });
+    }
+    await delay(attempt < 3 ? 500 : 900);
+  }
+
+  return lastState || { name: 'unknown', reason: 'attach_composer_wait_timeout', hasTargetText: false };
 }
 
 async function selectGalleryImagesByAccessibility(account, userId, target, count) {
