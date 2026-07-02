@@ -30,6 +30,7 @@ import {
   runMobileLogin,
   sanitizeAccount
 } from '../../services/mobile/login-automation.service.js';
+import { isActiveLdPlayerAccount } from '../../services/mobile/ldplayer-account.service.js';
 
 export const mobileRoutes = Router();
 
@@ -102,6 +103,7 @@ const defaultMobileAccount = {
     }
   }
 };
+
 const facebookPostSchema = z.object({
   text: z.string().min(1).max(5000),
   appPackage: z.string().optional().or(z.literal('')),
@@ -126,6 +128,7 @@ const instagramPostSchema = z.object({
   text: z.string().max(2200).default(''),
   appPackage: z.string().optional().or(z.literal('')),
   autoSubmit: z.boolean().default(false),
+  cleanupAfterDryRun: z.boolean().default(false),
   waitAfterSubmitMs: z.number().int().min(0).max(60_000).default(0),
   images: z.array(z.object({
     url: z.string().url(),
@@ -137,6 +140,7 @@ const instagramPostSchema = z.object({
 
 mobileRoutes.get('/accounts', requireAuth, asyncHandler(async (req, res) => {
   let accounts = await MobileAccount.find({ userId: req.user._id }).sort({ updatedAt: -1 });
+  accounts = accounts.filter(isActiveLdPlayerAccount);
   if (!accounts.length) {
     const metadata = normalizeMetadata(defaultMobileAccount.metadata);
     const account = await MobileAccount.create({

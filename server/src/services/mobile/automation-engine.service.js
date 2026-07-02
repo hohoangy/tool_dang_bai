@@ -13,12 +13,20 @@ const directUiDumpSupport = new Map();
 const uiDumpCache = new Map();
 const uiDumpInFlight = new Map();
 const openAppInFlight = new Map();
+const instagramPublishQueues = new Map();
 const accountRuntimeTargets = new Map();
 const androidUiReadyCache = new Map();
+const instagramDisplaySizeCache = new Map();
+const instagramSharePrewarmCache = new Map();
+const instagramShareMethodCache = new Map();
 const facebookMediaRoot = '/sdcard/Pictures/SocialPilot';
 const instagramPermissionCacheTtlMs = 10 * 60 * 1000;
 const uiDumpCacheTtlMs = 350;
 const androidUiReadyCacheTtlMs = 12_000;
+const instagramDisplaySizeCacheTtlMs = 10 * 60 * 1000;
+const instagramSharePrewarmCacheTtlMs = 4 * 60 * 1000;
+const instagramShareMethodCacheTtlMs = 10 * 60 * 1000;
+const instagramFastSubmitProgressMs = 2_600;
 
 const defaultPackages = {
   facebook: 'com.facebook.katana',
@@ -153,6 +161,7 @@ const instagramCreateLabels = ['Create'];
 const instagramPostDestinationLabels = ['Post', 'POST', 'Bài viết', 'Bai viet'];
 const instagramNewPostLabels = ['New post', 'Bài viết mới', 'Bai viet moi'];
 const instagramSelectMultipleLabels = ['Select multiple button', 'Select'];
+const instagramDiscardLabels = ['Discard', 'Discard post', 'Discard edits', 'Bỏ', 'Bỏ bài viết', 'Bo bai viet', 'Hủy', 'Huy'];
 const instagramAddMoreMediaLabels = [
   'Add More Photos and Videos',
   'Add more photos and videos',
@@ -223,6 +232,10 @@ function cleanIntentText(value = '') {
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
     .slice(0, 5000);
+}
+
+function escapeRegExp(value = '') {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function quoteAdbShellArg(value = '') {
@@ -402,7 +415,21 @@ async function ensureLdPlayerVirtualizationService(account, userId) {
 async function getLdPlayerInstanceInfo(instanceName = '') {
   if (!instanceName) return '';
   const instances = await getLdPlayerInstances();
-  return instances.find((instance) => instance.instanceName === instanceName) || null;
+  const exact = instances.find((instance) => instance.instanceName === instanceName);
+  if (exact) return exact;
+  const inferredIndex = inferLdPlayerIndex(instanceName);
+  if (Number.isInteger(inferredIndex)) {
+    const byIndex = instances.find((instance) => instance.index === inferredIndex);
+    if (byIndex) return byIndex;
+  }
+  return null;
+}
+
+function inferLdPlayerIndex(instanceName = '') {
+  const name = String(instanceName || '').trim();
+  if (/^LDPlayer$/i.test(name)) return 0;
+  const number = Number(name.match(/^LDPlayer(?:[-\s]+)?0*(\d+)$/i)?.[1]);
+  return Number.isInteger(number) && number > 0 ? number - 1 : null;
 }
 
 async function getLdPlayerInstances() {
@@ -491,6 +518,64 @@ function parseConnectedAdbTargets(result) {
     .map((line) => line.trim().split(/\s+/))
     .filter(([serial, state]) => serial && state === 'device')
     .map(([serial]) => serial);
+}
+
+async function isAndroidPackageInstalled(target, packageName) {
+  if (!target || !packageName) return { ok: false, target, packageName, error: 'Missing target or package name.' };
+  const result = await runCommand(env.mobileAutomation.adbPath, [
+    '-s',
+    target,
+    'shell',
+    'pm',
+    'path',
+    packageName
+  ], { timeoutMs: 10_000 });
+  const output = `${result.stdout || ''}\n${result.stderr || ''}`.trim();
+  return {
+    ...result,
+    ok: Boolean(result.ok && /^package:/m.test(output)),
+    target,
+    packageName,
+    output
+  };
+}
+
+async function getLauncherActivityComponent(target, packageName) {
+  if (!target || !packageName) {
+    return { ok: false, target, packageName, component: '', error: 'Missing target or package name.' };
+  }
+  const resolve = await runCommand(env.mobileAutomation.adbPath, [
+    '-s',
+    target,
+    'shell',
+    'cmd',
+    'package',
+    'resolve-activity',
+    '--brief',
+    '-a',
+    'android.intent.action.MAIN',
+    '-c',
+    'android.intent.category.LAUNCHER',
+    packageName
+  ], { timeoutMs: 10_000 });
+  const output = `${resolve.stdout || ''}\n${resolve.stderr || ''}`;
+  const component = String(resolve.stdout || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.includes('/') && line.startsWith(`${packageName}/`))
+    || output.match(new RegExp(`(${escapeRegExp(packageName)}/[A-Za-z0-9.$_]+)`))?.[1]
+    || '';
+  return {
+    ...resolve,
+    ok: Boolean(resolve.ok && component),
+    target,
+    packageName,
+    component
+  };
+}
+
+function isTransientAdbCheckOutput(value = '') {
+  return /timed out|timeout|not found|offline|closed|device|more than one/i.test(String(value || ''));
 }
 
 async function getLdPlayerDeviceTarget(instanceName = '') {
@@ -583,6 +668,32 @@ function isEmulatorTarget(value = '') {
   return /^emulator-\d+$/.test(String(value || ''));
 }
 
+function hasActiveSystemUiAnr(windowOutput = '') {
+  const output = String(windowOutput || '');
+  const currentFocus = output.match(/mCurrentFocus=.*$/m)?.[0] || '';
+  if (currentFocus && !/com\.android\.systemui|Application Not Responding/i.test(currentFocus)) {
+    const visibleSystemUiAnr = /Window\{[^\n]*Application Not Responding:\s*com\.android\.systemui[\s\S]*?Surface:\s*shown=true/i.test(output);
+    if (!visibleSystemUiAnr) return false;
+  }
+  return output
+    .split(/\r?\n/)
+    .some((line) => {
+      const text = line.trim();
+      if (!text || /^mLastDisplayFreezeDuration=/i.test(text)) return false;
+      return /(?:Window\{.*|mCurrentFocus=.*)Application Not Responding:\s*com\.android\.systemui/i.test(text)
+        || /mCurrentFocus=.*com\.android\.systemui.*not responding/i.test(text);
+    });
+}
+
+function hasActivePackageAnr(windowOutput = '', packageName = '') {
+  const output = String(windowOutput || '');
+  const escapedPackage = escapeRegExp(packageName);
+  if (!escapedPackage) return false;
+  const anrPattern = new RegExp(`Application Not Responding:\\s*${escapedPackage}`, 'i');
+  const focusPattern = new RegExp(`mCurrentFocus=.*Application Not Responding:\\s*${escapedPackage}`, 'i');
+  return anrPattern.test(output) || focusPattern.test(output);
+}
+
 async function findAvailableEmulatorTarget(preferredTarget = '', instanceName = '') {
   const devices = await runCommand(env.mobileAutomation.adbPath, ['devices'], { timeoutMs: 5_000 });
   if (!devices.ok) return '';
@@ -657,8 +768,7 @@ async function ensureAndroidUiReady(account, userId, target, attempts = 30) {
       durationMs: windowState.durationMs,
       error: windowState.error || windowState.stderr || null
     };
-    const systemUiAnr = /Application Not Responding:\s*com\.android\.systemui/i.test(windowOutput)
-      || /mCurrentFocus=.*com\.android\.systemui.*not responding/i.test(windowOutput);
+    const systemUiAnr = hasActiveSystemUiAnr(windowOutput);
 
     if (systemUiAnr) {
       consecutiveReadyChecks = 0;
@@ -772,8 +882,7 @@ async function waitForSystemUiHealthy(account, userId, target, options = {}) {
       'windows'
     ], { timeoutMs: 6_000 });
     const output = `${windowState.stdout || ''}\n${windowState.stderr || ''}`;
-    const systemUiAnr = /Application Not Responding:\s*com\.android\.systemui/i.test(output)
-      || /mCurrentFocus=.*com\.android\.systemui.*not responding/i.test(output);
+    const systemUiAnr = hasActiveSystemUiAnr(output);
     lastWindowState = {
       ok: windowState.ok,
       durationMs: windowState.durationMs,
@@ -793,6 +902,18 @@ async function waitForSystemUiHealthy(account, userId, target, options = {}) {
         'System UI không phản hồi; đã chọn Wait và tạm dừng automation để Android hồi phục.',
         { attempt, recoveryCount, recovery, phase: options.phase || 'runtime' }
       );
+      if (!recovery.ok) {
+        return {
+          ok: false,
+          error: 'System UI đang ANR và ADB không bấm được Wait; dừng sớm để tránh treo workflow.',
+          recoveryCount,
+          stableChecks,
+          elapsedMs: Date.now() - startedAt,
+          phase: options.phase || 'runtime',
+          lastWindowState,
+          recovery
+        };
+      }
       await delay(3000);
       continue;
     }
@@ -1000,6 +1121,16 @@ async function ensurePortraitOrientation(account, userId, target) {
 }
 
 async function resetInstagramDisplaySize(account, userId, target) {
+  const cached = instagramDisplaySizeCache.get(target);
+  if (cached && Date.now() - cached.at < instagramDisplaySizeCacheTtlMs) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'display_size_cache',
+      cacheAgeMs: Date.now() - cached.at,
+      previous: cached.result
+    };
+  }
   const before = await getDeviceScreenSize(target);
   const reset = await runCommand(env.mobileAutomation.adbPath, [
     '-s',
@@ -1018,13 +1149,19 @@ async function resetInstagramDisplaySize(account, userId, target) {
     after,
     reset
   });
+  if (reset.ok) {
+    instagramDisplaySizeCache.set(target, {
+      at: Date.now(),
+      result: { before, after }
+    });
+  }
   return { ok: reset.ok, before, after, reset };
 }
 
 async function performOpenAccountApp(account, userId, appPackage) {
   const startedAt = Date.now();
   let target = getDeviceTarget(account);
-  const packageName = appPackage || account.metadata?.appPackage || defaultPackages[account.platform];
+  let packageName = appPackage || account.metadata?.appPackage || defaultPackages[account.platform];
   if (!target) throw new Error('Thiếu deviceId hoặc adbHost.');
   if (!packageName) throw new Error('Thiếu Android package name.');
 
@@ -1062,13 +1199,142 @@ async function performOpenAccountApp(account, userId, appPackage) {
     throw new Error(ready.error || ready.stderr || `ADB ${target} chưa sẵn sàng.`);
   }
 
-  const androidUi = await ensureAndroidUiReady(account, userId, target);
+  const androidUiAttempts = packageName === defaultPackages.instagram ? 12 : 2;
+  let androidUi = await ensureAndroidUiReady(account, userId, target, androidUiAttempts);
   if (!androidUi.ok) {
-    throw new Error(androidUi.error || `Android/System UI trên ${target} chưa sẵn sàng.`);
+    await writeLog(
+      userId,
+      account._id,
+      'warn',
+      'remote_open_app_android_ui_soft_bypass',
+      `ADB ${target} đã sẵn sàng; bỏ qua kiểm tra System UI kéo dài để mở app nhanh hơn.`,
+      { androidUi }
+    );
+    androidUi = {
+      ...androidUi,
+      ok: true,
+      softBypass: true,
+      waitedForBoot: true
+    };
   }
   if (androidUi.waitedForBoot) {
     // Let launcher and package manager finish their first render before opening Facebook.
     await delay(900);
+  }
+
+  let packageInstalled = await isAndroidPackageInstalled(target, packageName);
+  if (!packageInstalled.ok) {
+    const packageCheckOutput = `${packageInstalled.error || ''} ${packageInstalled.stderr || ''} ${packageInstalled.output || ''}`;
+    const packageCheckTransient = isTransientAdbCheckOutput(packageCheckOutput);
+    if (packageCheckTransient) {
+      await delay(1_500);
+      const retryReady = await ensureDeviceReady(account, userId, target, 10);
+      target = retryReady.resolvedTarget || target;
+      packageInstalled = retryReady.ok && String(retryReady.stdout || '').trim() === 'device'
+        ? await isAndroidPackageInstalled(target, packageName)
+        : { ...packageInstalled, retryReady };
+    }
+  }
+  if (!packageInstalled.ok) {
+    const packageCheckOutput = `${packageInstalled.error || ''} ${packageInstalled.stderr || ''} ${packageInstalled.output || ''}`;
+    const packageCheckTransient = isTransientAdbCheckOutput(packageCheckOutput);
+    if (packageCheckTransient) {
+      await writeLog(userId, account._id, 'warn', 'remote_open_app_package_check_transient', `Chưa xác minh được package ${packageName}; dừng mở app vì ADB chưa ổn định.`, {
+        target,
+        packageName,
+        packageInstalled
+      });
+      throw new Error(`ADB ${target} chưa ổn định khi kiểm tra app ${packageName}. Hãy thử lại sau khi LDPlayer boot xong.`);
+    } else if (packageName === defaultPackages.instagram) {
+      const liteInstalled = await isAndroidPackageInstalled(target, 'com.instagram.lite');
+      const message = liteInstalled.ok
+        ? 'LDPlayer này đang có Instagram Lite, chưa có Instagram bản full. Hãy cài Instagram bản full (com.instagram.android) để tool mở/đăng tự động.'
+        : 'LDPlayer này chưa cài Instagram bản full. Hãy cài Instagram từ Play Store/LD Store rồi thử lại.';
+      await writeLog(userId, account._id, 'error', 'remote_open_app_package_missing', message, {
+        target,
+        packageName,
+        liteInstalled
+      });
+      throw new Error(message);
+    } else {
+      const message = `LDPlayer này chưa cài app ${packageName}. Hãy cài app rồi thử lại.`;
+      await writeLog(userId, account._id, 'error', 'remote_open_app_package_missing', message, {
+        target,
+        packageName,
+        packageInstalled
+      });
+      throw new Error(message);
+    }
+  }
+  let launcherActivity = await getLauncherActivityComponent(target, packageName);
+  if (!launcherActivity.ok && (androidUi.softBypass || androidUi.waitedForBoot)) {
+    await delay(3_000);
+    const retryLauncherActivity = await getLauncherActivityComponent(target, packageName);
+    launcherActivity = retryLauncherActivity.ok ? retryLauncherActivity : {
+      ...launcherActivity,
+      retry: retryLauncherActivity
+    };
+  }
+  if (!launcherActivity.ok) {
+    const launcherOutput = `${launcherActivity.error || ''} ${launcherActivity.stderr || ''} ${launcherActivity.stdout || ''}`;
+    const launcherTransient = isTransientAdbCheckOutput(launcherOutput);
+    if (launcherTransient) {
+      await delay(1_500);
+      const retryReady = await ensureDeviceReady(account, userId, target, 10);
+      target = retryReady.resolvedTarget || target;
+      const retryLauncherActivity = retryReady.ok && String(retryReady.stdout || '').trim() === 'device'
+        ? await getLauncherActivityComponent(target, packageName)
+        : { ...launcherActivity, retryReady };
+      launcherActivity = retryLauncherActivity.ok ? retryLauncherActivity : {
+        ...launcherActivity,
+        retryReady,
+        retry: retryLauncherActivity
+      };
+    }
+  }
+  if (!launcherActivity.ok) {
+    const launcherOutput = `${launcherActivity.error || ''} ${launcherActivity.stderr || ''} ${launcherActivity.stdout || ''} ${launcherActivity.retry?.error || ''} ${launcherActivity.retry?.stderr || ''} ${launcherActivity.retry?.stdout || ''}`;
+    const launcherTransient = isTransientAdbCheckOutput(launcherOutput);
+    if (launcherTransient) {
+      await writeLog(userId, account._id, 'warn', 'remote_open_app_launcher_check_transient', `Chưa xác minh được launcher activity của ${packageName}; dừng mở app vì ADB chưa ổn định.`, {
+        target,
+        packageName,
+        launcherActivity
+      });
+      throw new Error(`ADB ${target} chưa ổn định khi kiểm tra launcher của ${packageName}. Hãy thử lại sau khi LDPlayer boot xong.`);
+    } else if (packageName === defaultPackages.instagram && packageInstalled.ok) {
+      await writeLog(userId, account._id, 'warn', 'remote_open_app_launcher_unverified', `Chưa xác minh được launcher activity của ${packageName}; package đã tồn tại nên tiếp tục thử mở Instagram.`, {
+        target,
+        packageName,
+        launcherActivity
+      });
+    } else if (packageName === defaultPackages.instagram) {
+      const liteInstalled = await isAndroidPackageInstalled(target, 'com.instagram.lite');
+      const message = liteInstalled.ok
+        ? 'LDPlayer này đang có Instagram Lite hoặc Instagram full không có launcher khả dụng. Hãy cài Instagram bản full (com.instagram.android) rồi thử lại.'
+        : 'Instagram full đã có package nhưng không có màn hình mở app. Hãy gỡ/cài lại Instagram bản full trên LDPlayer này.';
+      await writeLog(userId, account._id, 'error', 'remote_open_app_launcher_missing', message, {
+        target,
+        packageName,
+        launcherActivity,
+        liteInstalled
+      });
+      throw new Error(message);
+    } else {
+      const message = `App ${packageName} không có launcher activity khả dụng trên LDPlayer này.`;
+      await writeLog(userId, account._id, 'error', 'remote_open_app_launcher_missing', message, {
+        target,
+        packageName,
+        launcherActivity
+      });
+      throw new Error(message);
+    }
+  }
+
+  const launchReady = await ensureDeviceReady(account, userId, target, 8);
+  target = launchReady.resolvedTarget || target;
+  if (!launchReady.ok || String(launchReady.stdout || '').trim() !== 'device') {
+    throw new Error(launchReady.error || launchReady.stderr || `ADB ${target} chưa ổn định trước khi mở ${packageName}.`);
   }
 
   const foregroundBefore = await getForegroundAndroidPackage(target);
@@ -1082,7 +1348,16 @@ async function performOpenAccountApp(account, userId, appPackage) {
         phase: 'already_foreground',
         initialDelayMs: androidUi.recoveryCount ? 1800 : 0
       });
-      if (!systemUiHealth.ok) throw new Error(systemUiHealth.error);
+      if (!systemUiHealth.ok) {
+        await writeLog(
+          userId,
+          account._id,
+          'warn',
+          'remote_open_app_system_ui_health_soft_fail',
+          'App đã ở foreground nhưng System UI health-check chưa ổn định; vẫn trả kết quả mở app để tránh chặn thao tác kiểm tra.',
+          systemUiHealth
+        );
+      }
       const fastResult = {
         ok: true,
         launchMethod: 'already_foreground',
@@ -1093,7 +1368,9 @@ async function performOpenAccountApp(account, userId, appPackage) {
         readiness,
         systemUiHealth,
         home: packageName === defaultPackages.facebook
-          ? await ensureFacebookHomeOnOpen(account, userId, target, packageName, {
+          ? isFacebookAuthActivity(readiness.foregroundActivity)
+            ? createFacebookAuthForegroundResult(readiness)
+            : await ensureFacebookHomeOnOpen(account, userId, target, packageName, {
             fast: true,
             recentlyBooted: androidUi.waitedForBoot
           })
@@ -1116,18 +1393,33 @@ async function performOpenAccountApp(account, userId, appPackage) {
         : await launchAppWarm(target, packageName);
     }
   }
+  if (!result.ok) {
+    await delay(androidUi.softBypass || androidUi.waitedForBoot ? 5_000 : 2_000);
+    result = packageName === defaultPackages.facebook
+      ? await launchFacebookFresh(target, packageName)
+      : await launchAppFresh(target, packageName);
+  }
   await writeLog(userId, account._id, result.ok ? 'info' : 'error', 'remote_open_app', result.ok ? `Đã mở app ${packageName}.` : `Mở app lỗi ${packageName}.`, result);
   if (!result.ok) throw new Error(result.error || result.stderr || 'Open app failed.');
-  let readiness = await waitForAppForegroundReady(account, userId, target, packageName, 7_000, {
+  const foregroundWaitMs = packageName === defaultPackages.instagram ? 20_000 : 7_000;
+  let readiness = await waitForAppForegroundReady(account, userId, target, packageName, foregroundWaitMs, {
     stableChecks: 1,
     requireVisibleUi: false
   });
   if (!readiness.ok) {
+    const retryReady = await ensureDeviceReady(account, userId, target, packageName === defaultPackages.instagram ? 12 : 4);
+    target = retryReady.resolvedTarget || target;
+    if (!retryReady.ok || String(retryReady.stdout || '').trim() !== 'device') {
+      throw new Error(retryReady.error || retryReady.stderr || `ADB ${target} chưa ổn định sau khi mở ${packageName}.`);
+    }
     result = packageName === defaultPackages.facebook
       ? await launchFacebookFresh(target, packageName)
       : await launchAppFresh(target, packageName);
     if (!result.ok) throw new Error(result.error || result.stderr || 'Open app failed.');
-    readiness = await waitForAppForegroundReady(account, userId, target, packageName, 14_000);
+    readiness = await waitForAppForegroundReady(account, userId, target, packageName, packageName === defaultPackages.instagram ? 30_000 : 14_000, {
+      stableChecks: 1,
+      requireVisibleUi: false
+    });
   }
   if (!readiness.ok) {
     throw new Error(readiness.error || `${packageName} chưa ổn định trên LDPlayer.`);
@@ -1136,15 +1428,54 @@ async function performOpenAccountApp(account, userId, appPackage) {
     phase: 'after_app_launch',
     initialDelayMs: androidUi.recoveryCount ? 3500 : 900
   });
-  if (!systemUiHealth.ok) throw new Error(systemUiHealth.error);
+  if (!systemUiHealth.ok) {
+    await writeLog(
+      userId,
+      account._id,
+      'warn',
+      'remote_open_app_system_ui_health_soft_fail',
+      'App đã mở ở foreground nhưng System UI health-check chưa ổn định; vẫn trả kết quả mở app để người dùng kiểm tra.',
+      systemUiHealth
+    );
+  }
   let home = null;
   if (packageName === defaultPackages.facebook) {
-    home = await ensureFacebookHomeOnOpen(account, userId, target, packageName, {
-      fast: true,
-      recentlyBooted: androidUi.waitedForBoot
-    });
+    home = isFacebookAuthActivity(readiness.foregroundActivity)
+      ? createFacebookAuthForegroundResult(readiness)
+      : await ensureFacebookHomeOnOpen(account, userId, target, packageName, {
+        fast: true,
+        recentlyBooted: androidUi.waitedForBoot
+      });
   }
   return { ...result, target, readiness, systemUiHealth, home, androidUi, elapsedMs: Date.now() - startedAt };
+}
+
+function isFacebookAuthActivity(activityName = '') {
+  return /(?:^|\.)(Login|LoginActivity|Fb4aAuth|Registration|Checkpoint)/i.test(String(activityName || ''));
+}
+
+function createFacebookAuthForegroundResult(readiness = {}) {
+  return {
+    ok: true,
+    verified: false,
+    skipped: true,
+    reason: 'facebook_auth_screen',
+    state: {
+      name: 'auth_screen',
+      foregroundActivity: readiness.foregroundActivity || ''
+    },
+    warning: 'Facebook đã mở nhưng đang ở màn hình đăng nhập/xác thực, nên bỏ qua bước xác minh Feed/Home.'
+  };
+}
+
+function summarizeRecoverySteps(steps = []) {
+  return steps.map((step) => ({
+    ok: Boolean(step?.ok),
+    launchMethod: step?.launchMethod || step?.method || '',
+    durationMs: step?.durationMs || null,
+    code: step?.code || null,
+    error: step?.error || step?.stderr ? String(step.error || step.stderr).slice(0, 300) : ''
+  }));
 }
 
 export async function openAccountApp(account, userId, appPackage) {
@@ -1213,24 +1544,8 @@ async function launchFacebookWarm(target, packageName) {
 
 async function launchAppFresh(target, packageName) {
   await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'am', 'force-stop', packageName], { timeoutMs: 10_000 });
-  const resolve = await runCommand(env.mobileAutomation.adbPath, [
-    '-s',
-    target,
-    'shell',
-    'cmd',
-    'package',
-    'resolve-activity',
-    '--brief',
-    '-a',
-    'android.intent.action.MAIN',
-    '-c',
-    'android.intent.category.LAUNCHER',
-    packageName
-  ], { timeoutMs: 10_000 });
-  const component = String(resolve.stdout || '')
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find((line) => line.includes('/') && line.startsWith(`${packageName}/`));
+  const resolve = await getLauncherActivityComponent(target, packageName);
+  const component = resolve.component;
   if (component) {
     const launch = await runCommand(env.mobileAutomation.adbPath, [
       '-s',
@@ -1483,6 +1798,31 @@ async function ensureFacebookHomeOnOpen(account, userId, target, packageName, op
     state = await resolveFacebookOpenState(target, await detectFacebookState(target, ''));
   }
 
+  if (!isVerifiedFacebookHomeState(state) && options.fast) {
+    const fastActive = await getForegroundAndroidPackage(target);
+    await writeLog(
+      userId,
+      account._id,
+      fastActive.packageName === packageName ? 'warn' : 'error',
+      'remote_open_facebook_home_fast_skip',
+      fastActive.packageName === packageName
+        ? 'Facebook đã mở ở foreground; bỏ qua recovery Home nâng cao để phản hồi nhanh.'
+        : 'Đã thử mở Facebook nhưng lần kiểm tra nhanh chưa thấy Facebook ở foreground.',
+      { state, fastActive, recoverySteps: summarizeRecoverySteps(recoverySteps) }
+    );
+    return {
+      ok: fastActive.packageName === packageName,
+      verified: false,
+      state,
+      recoveryStepCount: recoverySteps.length,
+      finalActive: fastActive,
+      fastSkipped: true,
+      warning: fastActive.packageName === packageName
+        ? 'Facebook đã mở ở foreground nhưng chưa xác minh được Feed/Home.'
+        : 'Facebook chưa được xác nhận ở foreground sau lần mở nhanh.'
+    };
+  }
+
   if (!isVerifiedFacebookHomeState(state)) {
     const fresh = await launchFacebookFresh(target, packageName);
     recoverySteps.push(fresh);
@@ -1509,7 +1849,7 @@ async function ensureFacebookHomeOnOpen(account, userId, target, packageName, op
     verified ? 'info' : 'warn',
     'remote_open_facebook_home',
     verified ? 'Facebook đã sẵn sàng tại trang chủ.' : 'Facebook đã mở nhưng chưa xác minh được màn Feed/Home.',
-    { state, active, recoverySteps }
+    { state, active, recoverySteps: summarizeRecoverySteps(recoverySteps) }
   );
   if (state.name === 'blocked') {
     throwFacebookBlockedError(state);
@@ -1522,10 +1862,14 @@ async function ensureFacebookHomeOnOpen(account, userId, target, packageName, op
     throw error;
   }
   if (!verified) {
-    const error = new Error('Facebook đã mở nhưng chưa về đúng trang chủ. Hãy thử bấm Về trang chủ lần nữa.');
-    error.code = 'FACEBOOK_HOME_NOT_READY';
-    error.details = { finalActive, target, packageName, state, recoverySteps };
-    throw error;
+    return {
+      ok: true,
+      verified: false,
+      state,
+      recoveryStepCount: recoverySteps.length,
+      finalActive,
+      warning: 'Facebook đã mở ở foreground nhưng chưa xác minh được Feed/Home.'
+    };
   }
   return { ok: true, verified: true, state, recoverySteps, finalActive };
 }
@@ -1801,9 +2145,6 @@ async function ensureLdPlayerInstanceStopped(account, userId, target, expectedPr
   let stableStoppedChecks = 0;
   let lastAliveProcessIds = [];
   for (let attempt = 1; attempt <= 30; attempt += 1) {
-    const device = target
-      ? await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'get-state'], { timeoutMs: 3_000 })
-      : { ok: false };
     const instance = await getLdPlayerInstanceInfo(account.instanceName);
     lastAliveProcessIds = await getAliveProcessIds([
       expectedProcesses.processId,
@@ -1812,6 +2153,9 @@ async function ensureLdPlayerInstanceStopped(account, userId, target, expectedPr
     if (!instance?.running && lastAliveProcessIds.length === 0) {
       stableStoppedChecks += 1;
       if (stableStoppedChecks >= 3) {
+        const device = target
+          ? await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'get-state'], { timeoutMs: 1_000 })
+          : { ok: false };
         const cleanup = {
           ok: true,
           attempt,
@@ -2311,7 +2655,8 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
       preparedVideos.length ? preparedVideos : preparedImages,
       {
         imageSharedByIntent: ['image_share_intent', 'video_share_intent'].includes(openHome.method),
-        mediaKind: preparedVideos.length ? 'video' : 'image'
+        mediaKind: preparedVideos.length ? 'video' : 'image',
+        openMethod: openHome.method || ''
       }
     );
     steps.push(...stateMachine.steps);
@@ -2321,12 +2666,13 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
     });
 
     const submitVerified = stateMachine.submitVerified ?? false;
+    const submitReason = stateMachine.submitReason || (config.autoSubmit && stateMachine.composerPending ? 'state_machine_pending' : '');
     const finishedLevel = config.autoSubmit && !submitVerified ? 'warn' : 'info';
     await writeLog(userId, account._id, finishedLevel, 'facebook_post_finished', config.autoSubmit && !submitVerified ? 'Đã bấm Đăng nhưng chưa xác nhận Facebook đã nhận bài.' : (config.autoSubmit ? 'Đã chạy luồng tự đăng Facebook.' : 'Đã mở composer Facebook, chờ kiểm tra/tự bấm đăng.'), {
       autoSubmit: config.autoSubmit,
       finalState: stateMachine.finalState,
       submitVerified,
-      submitReason: stateMachine.submitReason || '',
+      submitReason,
       imageCount: preparedImages.length,
       videoCount: preparedVideos.length,
       perf: perf.snapshot()
@@ -2339,10 +2685,11 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
       composerPending: stateMachine.composerPending,
       finalState: stateMachine.finalState,
       submitVerified,
-      submitReason: stateMachine.submitReason || '',
+      submitReason,
       screenshot: stateMachine.screenshot,
       screenshotVerified: Boolean(stateMachine.screenshotVerified),
-      stepCount: steps.length
+      stepCount: steps.length,
+      perf: perf.snapshot()
     };
   } finally {
     if ((images.length > 0 || videos.length > 0) && config.autoSubmit) {
@@ -2362,6 +2709,42 @@ function shouldUseFacebookImageShareIntent(account) {
 }
 
 export async function publishInstagramPostViaMobile(account, userId, payload = {}) {
+  return runInstagramPublishExclusive(account, userId, payload, () => publishInstagramPostViaMobileUnsafe(account, userId, payload));
+}
+
+async function runInstagramPublishExclusive(account, userId, payload, operation) {
+  const queueKey = getInstagramPublishQueueKey(account, payload);
+  const previous = instagramPublishQueues.get(queueKey) || Promise.resolve();
+  const queuedAt = Date.now();
+  const queued = previous.catch(() => null).then(async () => {
+    const waitMs = Date.now() - queuedAt;
+    if (waitMs > 500) {
+      await writeLog(userId, account._id, 'info', 'instagram_post_queue_wait', 'Luồng Instagram đang chờ task trước hoàn tất để tránh mở nhiều phiên LD/ADB cùng lúc.', {
+        queueKey,
+        waitMs
+      });
+    }
+    return operation();
+  });
+  const cleanup = queued.then(
+    () => null,
+    () => null
+  ).finally(() => {
+    if (instagramPublishQueues.get(queueKey) === cleanup) {
+      instagramPublishQueues.delete(queueKey);
+    }
+  });
+  instagramPublishQueues.set(queueKey, cleanup);
+  return queued;
+}
+
+function getInstagramPublishQueueKey(account, payload = {}) {
+  const packageName = payload.appPackage || account?.metadata?.appPackage || defaultPackages.instagram;
+  const target = getDeviceTarget(account) || account?.adbHost || account?.instanceName || account?._id || 'unknown';
+  return `${target}:${packageName}:instagram`;
+}
+
+async function publishInstagramPostViaMobileUnsafe(account, userId, payload = {}) {
   const perf = createPerfTimer();
   let target = getDeviceTarget(account);
   const requestedImages = Array.isArray(payload.images) ? payload.images.slice(0, 10) : [];
@@ -2373,17 +2756,23 @@ export async function publishInstagramPostViaMobile(account, userId, payload = {
   });
   const text = cleanIntentText(payload.text);
   const images = requestedImages;
+  const cleanupAfterDryRun = Boolean(payload.cleanupAfterDryRun) && !config.autoSubmit;
 
   if (!target) throw new Error('Thiếu deviceId hoặc adbHost.');
   if (!images.length) throw new Error('Instagram cần ít nhất 1 ảnh để đăng.');
   if (!config.appPackage) throw new Error('Thiếu Android package name của Instagram.');
 
+  const gate = buildInstagramPostGateSummary(account, target, config, text, images, {
+    cleanupAfterDryRun,
+    postType
+  });
   await writeLog(userId, account._id, 'info', 'instagram_post_started', `Bắt đầu mở composer Instagram cho ${account.displayName}.`, {
     target,
     appPackage: config.appPackage,
     autoSubmit: config.autoSubmit,
     postType,
-    imageCount: images.length
+    imageCount: images.length,
+    gate
   });
 
   const steps = [];
@@ -2408,6 +2797,16 @@ export async function publishInstagramPostViaMobile(account, userId, payload = {
   steps.push(device);
   if (!device.ok || String(device.stdout || '').trim() !== 'device') throw new Error(device.error || device.stderr || 'Device is not ready.');
   perf.mark('adb_ready', { target });
+
+  const systemUi = await waitForSystemUiHealthy(account, userId, target, {
+    phase: 'instagram_preflight',
+    stableChecks: 2,
+    maxAttempts: 8
+  });
+  steps.push(systemUi);
+  if (!systemUi.ok) {
+    throw new Error(systemUi.error || 'System UI của LDPlayer chưa ổn định trước khi đăng Instagram.');
+  }
 
   const [display, permissions] = await Promise.all([
     resetInstagramDisplaySize(account, userId, target),
@@ -2438,16 +2837,33 @@ export async function publishInstagramPostViaMobile(account, userId, payload = {
     finalState: stateMachine.finalState,
     submitVerified: stateMachine.submitVerified ?? false
   });
+  let dryRunCleanup = null;
+  if (cleanupAfterDryRun && !stateMachine.submitVerified) {
+    dryRunCleanup = await cleanupInstagramDryRunComposer(account, userId, target, config);
+    steps.push(...dryRunCleanup.steps);
+    perf.mark('dry_run_cleanup_finished', { ok: dryRunCleanup.ok, discarded: dryRunCleanup.discarded });
+  }
   const submitVerified = stateMachine.submitVerified ?? false;
   const finishedLevel = config.autoSubmit && !submitVerified ? 'warn' : 'info';
+  const perfSnapshot = perf.snapshot();
+  const optimization = analyzeInstagramPerf(perfSnapshot, {
+    autoSubmit: config.autoSubmit,
+    postType,
+    submitVerified,
+    submitReason: stateMachine.submitReason || '',
+    finalState: stateMachine.finalState
+  });
   await writeLog(userId, account._id, finishedLevel, 'instagram_post_finished', config.autoSubmit && !submitVerified ? 'Đã bấm Share Instagram nhưng chưa xác nhận app nhận bài.' : (config.autoSubmit ? 'Đã chạy luồng tự đăng Instagram.' : 'Đã mở composer Instagram, chờ kiểm tra/tự bấm share.'), {
     autoSubmit: config.autoSubmit,
+    cleanupAfterDryRun,
     finalState: stateMachine.finalState,
     submitVerified,
     submitReason: stateMachine.submitReason || '',
     postType,
     imageCount: preparedImages.length,
-    perf: perf.snapshot()
+    dryRunCleanup,
+    perf: perfSnapshot,
+    optimization
   });
 
   return {
@@ -2459,9 +2875,259 @@ export async function publishInstagramPostViaMobile(account, userId, payload = {
     submitVerified,
     submitReason: stateMachine.submitReason || '',
     screenshot: stateMachine.screenshot,
+    dryRunCleanup,
     stepCount: steps.length,
-    perf: perf.snapshot()
+    perf: perfSnapshot,
+    optimization
   };
+}
+
+function buildInstagramPostGateSummary(account, target, config, text, images, options = {}) {
+  return {
+    target,
+    instanceName: account?.instanceName || '',
+    platform: account?.platform || '',
+    appPackage: config.appPackage,
+    autoSubmit: Boolean(config.autoSubmit),
+    cleanupAfterDryRun: Boolean(options.cleanupAfterDryRun),
+    postType: options.postType || (images.length > 1 ? 'carousel' : 'singlePhoto'),
+    imageCount: images.length,
+    captionLength: text.length,
+    hasCaption: Boolean(text.trim()),
+    mode: config.autoSubmit ? 'submit' : 'dry_run_review'
+  };
+}
+
+function analyzeInstagramPerf(perfSnapshot = {}, context = {}) {
+  const stages = Array.isArray(perfSnapshot.stages) ? perfSnapshot.stages : [];
+  const composerStage = stages.find((stage) => stage.name === 'composer_opened');
+  const bottlenecks = stages
+    .filter((stage) => Number(stage.durationMs) >= 10_000)
+    .map((stage) => ({
+      stage: stage.name,
+      durationMs: stage.durationMs,
+      elapsedMs: stage.elapsedMs,
+      severity: stage.durationMs >= 60_000 ? 'high' : stage.durationMs >= 25_000 ? 'medium' : 'low'
+    }))
+    .sort((left, right) => right.durationMs - left.durationMs);
+  const recommendations = [];
+  if (bottlenecks.some((item) => item.stage === 'composer_opened')) {
+    recommendations.push(`composer_opened chậm bằng ${composerStage?.method || 'unknown'}: giữ LD warm trước batch, tránh force-stop lặp lại, và ưu tiên method đã pass nhanh nhất trên account chuẩn.`);
+  }
+  if (bottlenecks.some((item) => item.stage === 'image_prepared')) {
+    recommendations.push('image_prepared chậm: bật cache media theo hash/contentUri và dùng lại file đã push vào /sdcard/Pictures/SocialPilot.');
+  }
+  if (bottlenecks.some((item) => item.stage === 'state_machine_finished')) {
+    recommendations.push('state_machine_finished chậm: cần kiểm tra label/foreground activity Instagram ở màn Next/caption để giảm vòng chờ.');
+  }
+  if (!context.autoSubmit && context.submitReason === 'review_mode') {
+    recommendations.push('Dry-run đã tới review_mode an toàn; chỉ bật autoSubmit sau khi cùng payload pass ổn định trên account chuẩn.');
+  }
+  return {
+    totalMs: perfSnapshot.totalMs || 0,
+    bottlenecks,
+    recommendations
+  };
+}
+
+async function cleanupInstagramDryRunComposer(account, userId, target, config) {
+  const steps = [];
+  const back = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'input', 'keyevent', '4'], { timeoutMs: 10_000 });
+  steps.push(back);
+  await delay(postStepDelay(1.2));
+
+  let discarded = false;
+  const nodes = await dumpVisibleNodes(target);
+  const discardNode = findNodeInNodes(nodes, instagramDiscardLabels, { exact: true, preferBottomRight: true });
+  if (discardNode) {
+    const point = {
+      x: Math.round((discardNode.left + discardNode.right) / 2),
+      y: Math.round((discardNode.top + discardNode.bottom) / 2)
+    };
+    const discard = await tapAndLog(userId, account._id, target, 'instagram_post_dry_run_discard_draft', point);
+    steps.push(discard);
+    discarded = Boolean(discard.ok);
+    await delay(postStepDelay(0.8));
+  }
+
+  const stop = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'am', 'force-stop', config.appPackage], { timeoutMs: 10_000 });
+  steps.push(stop);
+  const adbRecovery = await recoverInstagramAdbAfterCleanup(account, userId, target);
+  steps.push(...adbRecovery.steps);
+  await writeLog(userId, account._id, stop.ok ? 'info' : 'warn', 'instagram_post_dry_run_cleanup', stop.ok ? 'Đã dọn composer test Instagram sau dry-run để lần chạy sau không dính draft cũ.' : 'Không force-stop được Instagram sau dry-run.', {
+    back,
+    discarded,
+    stop,
+    adbRecovery
+  });
+  scheduleInstagramAdbStabilityProbe(account, userId, adbRecovery.health?.resolvedTarget || target, 'dry_run_cleanup');
+  return { ok: Boolean(stop.ok && adbRecovery.ok), discarded, adbRecovery, steps };
+}
+
+async function cleanupInstagramFailedComposer(account, userId, target, config, reason = 'failed_composer') {
+  const steps = [];
+  const stop = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'am', 'force-stop', config.appPackage], { timeoutMs: 10_000 });
+  steps.push(stop);
+  const adbRecovery = await recoverInstagramAdbAfterCleanup(account, userId, target);
+  steps.push(...adbRecovery.steps);
+  await writeLog(userId, account._id, stop.ok ? 'warn' : 'error', 'instagram_post_failed_cleanup', stop.ok ? 'Đã dọn Instagram sau lỗi để task kế tiếp không dính trạng thái cũ.' : 'Không dọn được Instagram sau lỗi.', {
+    reason,
+    stop,
+    adbRecovery
+  });
+  scheduleInstagramAdbStabilityProbe(account, userId, adbRecovery.health?.resolvedTarget || target, reason);
+  return { ok: Boolean(stop.ok && adbRecovery.ok), stop, adbRecovery, steps };
+}
+
+async function recoverInstagramAdbAfterCleanup(account, userId, target) {
+  const steps = [];
+  await delay(1_500);
+  let health = await ensureDeviceReady(account, userId, target, 2);
+  steps.push(health);
+  if (health.ok && String(health.stdout || '').trim() === 'device') {
+    await delay(4_000);
+    const confirmedHealth = await ensureDeviceReady(account, userId, health.resolvedTarget || target, 2);
+    steps.push(confirmedHealth);
+    if (confirmedHealth.ok && String(confirmedHealth.stdout || '').trim() === 'device') {
+      return { ok: true, recovered: false, health: confirmedHealth, initialHealth: health, steps };
+    }
+    await writeLog(userId, account._id, 'warn', 'instagram_post_cleanup_adb_late_offline', 'ADB ban đầu còn device nhưng rơi offline sau cleanup Instagram; chuyển sang recovery trước khi trả kết quả.', {
+      target,
+      initialHealth: health,
+      confirmedHealth
+    });
+    health = confirmedHealth;
+  }
+
+  await writeLog(userId, account._id, 'warn', 'instagram_post_cleanup_adb_offline', 'ADB không còn ổn định sau cleanup Instagram; tự recovery đúng LDPlayer hiện tại để batch tiếp theo không chạy trên target offline.', {
+    target,
+    health
+  });
+  const launched = await openLdPlayer(account, userId);
+  steps.push(launched);
+  const launchedTarget = await getLdPlayerDeviceTarget(account.instanceName);
+  const nextTarget = await resolveStableDeviceTarget(launchedTarget || getDeviceTarget(account) || target);
+  health = await ensureDeviceReady(account, userId, nextTarget, 24);
+  steps.push(health);
+  const ok = Boolean(health.ok && String(health.stdout || '').trim() === 'device');
+  await writeLog(userId, account._id, ok ? 'info' : 'error', 'instagram_post_cleanup_adb_recovery', ok ? 'ADB đã hồi phục sau cleanup Instagram.' : 'Không hồi phục được ADB sau cleanup Instagram.', {
+    target,
+    nextTarget,
+    launched,
+    health
+  });
+  return { ok, recovered: ok, launched, health, steps };
+}
+
+function scheduleInstagramAdbStabilityProbe(account, userId, target, reason = 'instagram_cleanup') {
+  const checks = [25_000, 90_000];
+  for (const delayMs of checks) {
+    setTimeout(() => {
+      recoverInstagramAdbIfOffline(account, userId, target, { reason, delayMs }).catch((error) => {
+        writeLog(userId, account._id, 'warn', 'instagram_post_cleanup_adb_probe_failed', error.message, {
+          target,
+          reason,
+          delayMs
+        }).catch(() => null);
+      });
+    }, delayMs).unref?.();
+  }
+}
+
+async function recoverInstagramAdbIfOffline(account, userId, target, context = {}) {
+  const health = await ensureDeviceReady(account, userId, target, 2);
+  if (health.ok && String(health.stdout || '').trim() === 'device') return { ok: true, recovered: false, health };
+
+  await writeLog(userId, account._id, 'warn', 'instagram_post_cleanup_adb_delayed_offline', 'ADB rơi offline sau cleanup Instagram; watchdog đang recovery để chuẩn bị cho task kế tiếp.', {
+    target,
+    context,
+    health
+  });
+  const recovery = await recoverInstagramAdbAfterCleanup(account, userId, health.resolvedTarget || target);
+  await writeLog(userId, account._id, recovery.ok ? 'info' : 'error', 'instagram_post_cleanup_adb_delayed_recovery', recovery.ok ? 'Watchdog đã xác nhận ADB sẵn sàng sau cleanup Instagram.' : 'Watchdog không hồi phục được ADB sau cleanup Instagram.', {
+    target,
+    context,
+    recovery
+  });
+  return { ...recovery, recovered: recovery.ok };
+}
+
+async function prewarmInstagramForShare(account, userId, target, config, options = {}) {
+  const packageName = config.appPackage || defaultPackages.instagram;
+  const cacheKey = `${target}:${packageName}`;
+  const cachedAt = instagramSharePrewarmCache.get(cacheKey) || 0;
+  if (!options.force && Date.now() - cachedAt < instagramSharePrewarmCacheTtlMs) {
+    return { ok: true, skipped: true, reason: 'prewarm_cache', cacheAgeMs: Date.now() - cachedAt };
+  }
+
+  const stop = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'am', 'force-stop', packageName], { timeoutMs: 10_000 });
+  await writeLog(userId, account._id, stop.ok ? 'info' : 'warn', 'instagram_post_reset_app_task', stop.ok ? 'Đã đóng task Instagram cũ trước khi prewarm composer.' : 'Không đóng được task Instagram cũ trước prewarm.', {
+    ...stop,
+    reason: options.reason || ''
+  });
+  await delay(postStepDelay(0.8));
+
+  const launch = await launchAppWarm(target, packageName);
+  let recoveryLaunch = null;
+  let readiness = launch.ok
+    ? await waitForAppForegroundReady(account, userId, target, packageName, 18_000, {
+      stableChecks: 1,
+      requireVisibleUi: false
+    })
+    : { ok: false, error: launch.error || launch.stderr || 'Không mở được Instagram để prewarm.' };
+
+  if (!readiness.ok) {
+    const fresh = await launchAppFresh(target, packageName);
+    recoveryLaunch = fresh;
+    readiness = fresh.ok
+      ? await waitForAppForegroundReady(account, userId, target, packageName, 24_000, {
+        stableChecks: 1,
+        requireVisibleUi: false
+      })
+      : { ok: false, error: fresh.error || fresh.stderr || readiness.error };
+    await writeLog(userId, account._id, fresh.ok ? 'info' : 'warn', 'instagram_post_prewarm_fresh_launch', fresh.ok ? 'Đã mở Instagram bằng fresh launch để prewarm share intent.' : 'Fresh launch Instagram để prewarm không thành công.', {
+      fresh,
+      readiness
+    });
+  }
+
+  const ok = Boolean((launch.ok || recoveryLaunch?.ok) && readiness.ok);
+  if (ok) instagramSharePrewarmCache.set(cacheKey, Date.now());
+  await writeLog(userId, account._id, ok ? 'info' : 'warn', 'instagram_post_prewarm_share', ok ? 'Instagram đã được prewarm trước khi mở share intent.' : 'Prewarm Instagram chưa ổn định; vẫn tiếp tục thử share intent.', {
+    reason: options.reason || '',
+    launch,
+    recoveryLaunch,
+    readiness
+  });
+  return { ok, launch, recoveryLaunch, readiness };
+}
+
+function getCachedInstagramShareMethod(cacheKey) {
+  const cached = instagramShareMethodCache.get(cacheKey);
+  if (!cached) return '';
+  if (Date.now() - cached.updatedAt > instagramShareMethodCacheTtlMs) {
+    instagramShareMethodCache.delete(cacheKey);
+    return '';
+  }
+  return cached.method || '';
+}
+
+function cacheInstagramShareMethod(cacheKey, method) {
+  if (!cacheKey || !method) return;
+  instagramShareMethodCache.set(cacheKey, {
+    method,
+    updatedAt: Date.now()
+  });
+}
+
+function orderInstagramShareIntentAttempts(attempts = [], preferredMethod = '') {
+  if (!preferredMethod) return attempts;
+  const preferred = attempts.find((attempt) => attempt.method === preferredMethod);
+  if (!preferred) return attempts;
+  return [
+    preferred,
+    ...attempts.filter((attempt) => attempt.method !== preferredMethod)
+  ];
 }
 
 async function openInstagramComposer(account, userId, target, config, text, images) {
@@ -2470,9 +3136,7 @@ async function openInstagramComposer(account, userId, target, config, text, imag
     return openInstagramCarouselComposer(account, userId, target, config, text, media);
   }
 
-  const stop = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'am', 'force-stop', config.appPackage]);
-  await writeLog(userId, account._id, stop.ok ? 'info' : 'warn', 'instagram_post_reset_app_task', stop.ok ? 'Đã đóng task Instagram cũ trước khi mở composer mới.' : 'Không đóng được task Instagram cũ.', stop);
-  await delay(postStepDelay());
+  await prewarmInstagramForShare(account, userId, target, config, { force: false, noForceStop: true, reason: 'single_photo_initial' });
 
   const imageUris = media.map((image) => image.contentUri || `file://${image.remotePath}`);
   if (!imageUris.length) throw new Error('Không có media URI để mở Instagram composer.');
@@ -2493,16 +3157,23 @@ async function openInstagramComposer(account, userId, target, config, text, imag
   ];
   // Instagram xử lý EXTRA_TEXT không ổn định: có phiên bản chỉ giữ emoji
   // hoặc bỏ hashtag. Chỉ mở media ở đây và nhập caption sau bằng ADB Keyboard.
-  const intentAttempts = [
-    {
-      args: [...baseIntentArgs, '-n', `${config.appPackage}/${instagramFeedShareActivity}`],
-      method: 'feed_share_activity_media_only'
-    },
+  const shareMethodCacheKey = `${target}:${config.appPackage}:single_photo`;
+  const cachedShareMethod = getCachedInstagramShareMethod(shareMethodCacheKey);
+  const defaultIntentAttempts = [
     {
       args: [...baseIntentArgs, '-p', config.appPackage],
-      method: 'package_share_media_only'
+      method: 'package_share_media_only',
+      bootstrapTimeoutMs: 12_000,
+      commandTimeoutMs: 10_000
+    },
+    {
+      args: [...baseIntentArgs, '-n', `${config.appPackage}/${instagramFeedShareActivity}`],
+      method: 'feed_share_activity_media_only',
+      bootstrapTimeoutMs: 9_000,
+      commandTimeoutMs: 8_000
     }
   ];
+  const intentAttempts = orderInstagramShareIntentAttempts(defaultIntentAttempts, cachedShareMethod);
   let shareIntent = null;
   let intentArgs = intentAttempts[0].args;
   let method = intentAttempts[0].method;
@@ -2515,7 +3186,12 @@ async function openInstagramComposer(account, userId, target, config, text, imag
     }
     intentArgs = intentAttempts[index].args;
     method = intentAttempts[index].method;
-    shareIntent = await runCommand(env.mobileAutomation.adbPath, intentArgs, { timeoutMs: 20_000 });
+    const shareAttempt = await runInstagramShareIntentWithAdbRetry(account, userId, target, intentArgs, {
+      timeoutMs: intentAttempts[index].commandTimeoutMs
+    });
+    target = shareAttempt.target;
+    intentArgs = shareAttempt.intentArgs;
+    shareIntent = shareAttempt.result;
     await writeLog(
       userId,
       account._id,
@@ -2531,11 +3207,15 @@ async function openInstagramComposer(account, userId, target, config, text, imag
     );
     if (!shareIntent.ok) continue;
 
-    bootstrap = await waitForInstagramComposerBootstrap(account, userId, target, config, text, method);
-    if (bootstrap.ok) break;
-    // Activity đã nhận intent thì không mở lại bằng phương thức khác. Việc
-    // relaunch khi UI chỉ đang chậm có thể tạo nhiều composer cho cùng một bài.
-    if (bootstrap.foreground?.packageName === config.appPackage) break;
+    bootstrap = await waitForInstagramComposerBootstrap(account, userId, target, config, text, method, intentAttempts[index].bootstrapTimeoutMs);
+    if (bootstrap.ok) {
+      cacheInstagramShareMethod(shareMethodCacheKey, method);
+      break;
+    }
+    await writeLog(userId, account._id, 'warn', 'instagram_post_share_bootstrap_retry', 'Instagram đã nhận intent nhưng chưa hiện màn Next/Share; thử phương thức mở composer kế tiếp.', {
+      method,
+      bootstrap
+    });
   }
 
   const opened = Boolean(shareIntent?.ok && bootstrap?.ok);
@@ -2546,11 +3226,67 @@ async function openInstagramComposer(account, userId, target, config, text, imag
     imageCount: imageUris.length,
     bootstrap
   });
-  if (!opened) throw new Error(shareIntent?.error || shareIntent?.stderr || bootstrap?.error || 'Không mở được Instagram Feed/Profile composer.');
+  if (!opened) {
+    if (isInstagramShareHandlerStuck({ shareIntent, bootstrap, method })) {
+      await cleanupInstagramFailedComposer(account, userId, target, config, 'single_photo_share_handler_stuck');
+      throw new Error('Instagram ShareHandlerActivity bị kẹt, không render màn Next/Share. Đã dừng sớm để tránh treo LDPlayer; hãy mở Instagram thủ công một lần rồi thử lại.');
+    }
+    const nativeComposer = await openInstagramNativeSinglePhotoComposer(account, userId, target, config, text, media, {
+      shareIntent,
+      bootstrap,
+      failedMethod: method
+    });
+    if (nativeComposer.ok) return nativeComposer;
+    throw new Error(nativeComposer.error || shareIntent?.error || shareIntent?.stderr || bootstrap?.error || 'Không mở được Instagram Feed/Profile composer.');
+  }
   return { ...shareIntent, method, bootstrap };
 }
 
+async function runInstagramShareIntentWithAdbRetry(account, userId, target, intentArgs, options = {}) {
+  let currentTarget = target;
+  let currentArgs = intentArgs;
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 12_000;
+  let result = await runCommand(env.mobileAutomation.adbPath, currentArgs, { timeoutMs });
+  if (!result.ok && isTransientAdbCheckOutput(`${result.error || ''} ${result.stderr || ''}`)) {
+    const retryReady = await ensureDeviceReady(account, userId, currentTarget, 12);
+    currentTarget = retryReady.resolvedTarget || currentTarget;
+    if (retryReady.ok && String(retryReady.stdout || '').trim() === 'device') {
+      currentArgs = currentArgs.map((arg, argIndex) => (argIndex > 0 && currentArgs[argIndex - 1] === '-s' ? currentTarget : arg));
+      result = await runCommand(env.mobileAutomation.adbPath, currentArgs, { timeoutMs: Math.max(timeoutMs, 10_000) });
+    }
+  }
+  return { result, target: currentTarget, intentArgs: currentArgs };
+}
+
 async function openInstagramCarouselComposer(account, userId, target, config, text, images) {
+  const multiImageComposer = await openInstagramMultipleImageComposer(account, userId, target, config, text, images);
+  if (multiImageComposer.ok) return multiImageComposer;
+
+  await writeLog(userId, account._id, 'warn', 'instagram_post_album_multi_share_fallback', 'Không mở được Album bằng SEND_MULTIPLE; chuyển sang luồng Instagram Home/Create.', {
+    multiImageComposer
+  });
+
+  if (isInstagramSendMultipleUnsupported(multiImageComposer)) {
+    const error = new Error('LDPlayer/Android hiện tại không hỗ trợ mở Album Instagram bằng SEND_MULTIPLE (--eul), còn luồng Home/Create gây kẹt app. Tạm dừng Album để giữ ADB ổn định.');
+    await writeLog(userId, account._id, 'error', 'instagram_post_album_unsupported_fast_stop', error.message, {
+      multiImageComposer
+    });
+    await cleanupInstagramFailedComposer(account, userId, target, config, 'album_send_multiple_unsupported');
+    throw error;
+  }
+
+  try {
+    const nativeAlbumComposer = await openInstagramNativeAlbumComposer(account, userId, target, config, text, images);
+    if (nativeAlbumComposer.ok) return nativeAlbumComposer;
+  } catch (error) {
+    await writeLog(userId, account._id, 'error', 'instagram_post_album_native_failed', 'Luồng Home/Create Album chưa ổn định; dừng album để tránh kẹt LD bằng nhánh Add More.', {
+      error: error.message,
+      multiImageComposer
+    });
+    await cleanupInstagramFailedComposer(account, userId, target, config, 'album_native_failed');
+    throw error;
+  }
+
   const firstImageComposer = await openInstagramComposer(account, userId, target, config, text, [images[0]]);
   let nodes = await dumpVisibleNodes(target);
   let addMoreNode = findInstagramAddMoreMediaButton(nodes);
@@ -2559,7 +3295,12 @@ async function openInstagramCarouselComposer(account, userId, target, config, te
     nodes = ready?.nodes || nodes;
     addMoreNode = ready?.node || null;
   }
-  if (!addMoreNode) throw new Error('Instagram đã mở ảnh đầu tiên nhưng không tìm thấy nút thêm ảnh vào Album.');
+  if (!addMoreNode) {
+    await writeLog(userId, account._id, 'warn', 'instagram_post_album_add_more_missing', 'Composer share không có nút Add More; chuyển sang luồng Instagram Home/Create để tạo Album.', {
+      firstImageComposer
+    });
+    return openInstagramNativeAlbumComposer(account, userId, target, config, text, images, firstImageComposer);
+  }
 
   await delay(postStepDelay(3));
   let gallery = null;
@@ -2573,9 +3314,12 @@ async function openInstagramCarouselComposer(account, userId, target, config, te
     await tapAndLog(userId, account._id, target, 'instagram_post_open_add_more_gallery', addMorePoint);
     gallery = await waitForInstagramAddMoreGallery(target, attempt === 1 ? 10_000 : 7_000);
     if (!gallery) {
+      const afterTapNodes = await dumpVisibleNodes(target);
       await writeLog(userId, account._id, 'warn', 'instagram_post_add_more_retry', 'Nút Add More chưa mở gallery, đang thử lại.', {
         attempt,
-        point: addMorePoint
+        point: addMorePoint,
+        labels: afterTapNodes.map((node) => node.text || node.desc).filter(Boolean).slice(0, 50),
+        foreground: await getForegroundAndroidPackage(target)
       });
       await delay(postStepDelay(1.5));
     }
@@ -2608,6 +3352,249 @@ async function openInstagramCarouselComposer(account, userId, target, config, te
   };
 }
 
+async function openInstagramMultipleImageComposer(account, userId, target, config, text, images) {
+  const media = Array.isArray(images) ? images : [];
+  const imageUris = media.map((image) => image.contentUri || `file://${image.remotePath}`).filter(Boolean);
+  if (imageUris.length < 2) return { ok: false, error: 'Cần ít nhất 2 ảnh để mở album bằng SEND_MULTIPLE.' };
+
+  const stop = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'am', 'force-stop', config.appPackage], { timeoutMs: 10_000 });
+  await writeLog(userId, account._id, stop.ok ? 'info' : 'warn', 'instagram_post_reset_app_task', stop.ok ? 'Đã đóng task Instagram cũ trước khi mở Album.' : 'Không đóng được task Instagram cũ trước Album.', stop);
+  await delay(postStepDelay());
+
+  const baseIntentArgs = [
+    '-s',
+    target,
+    'shell',
+    'am',
+    'start',
+    '-a',
+    'android.intent.action.SEND_MULTIPLE',
+    '-t',
+    'image/*',
+    '--grant-read-uri-permission',
+    '--eul',
+    'android.intent.extra.STREAM',
+    imageUris.join(',')
+  ];
+  const intentAttempts = [
+    {
+      args: [...baseIntentArgs, '-n', `${config.appPackage}/${instagramFeedShareActivity}`],
+      method: 'feed_share_activity_album_multiple'
+    },
+    {
+      args: [...baseIntentArgs, '-p', config.appPackage],
+      method: 'package_share_album_multiple'
+    }
+  ];
+
+  let shareIntent = null;
+  let intentArgs = intentAttempts[0].args;
+  let method = intentAttempts[0].method;
+  let bootstrap = null;
+
+  for (let index = 0; index < intentAttempts.length; index += 1) {
+    if (index > 0) {
+      await prewarmInstagramForShare(account, userId, target, config, { force: true, reason: intentAttempts[index].method });
+    }
+    intentArgs = intentAttempts[index].args;
+    method = intentAttempts[index].method;
+    const shareAttempt = await runInstagramShareIntentWithAdbRetry(account, userId, target, intentArgs);
+    target = shareAttempt.target;
+    intentArgs = shareAttempt.intentArgs;
+    shareIntent = shareAttempt.result;
+    await writeLog(
+      userId,
+      account._id,
+      shareIntent.ok ? 'info' : 'warn',
+      'instagram_post_open_album_share_composer',
+      shareIntent.ok ? 'Đã mở Instagram Album bằng Android SEND_MULTIPLE.' : 'Không mở được Instagram Album bằng Android SEND_MULTIPLE.',
+      {
+        ...shareIntent,
+        args: maskShareIntentArgs(intentArgs),
+        method,
+        imageCount: imageUris.length
+      }
+    );
+    if (!shareIntent.ok) continue;
+
+    bootstrap = await waitForInstagramComposerBootstrap(account, userId, target, config, text, method, 24_000);
+    if (bootstrap.ok) break;
+    await writeLog(userId, account._id, 'warn', 'instagram_post_album_multi_bootstrap_retry', 'Instagram đã nhận SEND_MULTIPLE nhưng chưa hiện màn Next/Share; thử phương thức kế tiếp.', {
+      method,
+      bootstrap
+    });
+  }
+
+  const opened = Boolean(shareIntent?.ok && bootstrap?.ok);
+  await writeLog(userId, account._id, opened ? 'info' : 'warn', 'instagram_post_album_multi_opened', opened ? 'Instagram Album composer đã sẵn sàng bằng SEND_MULTIPLE.' : 'SEND_MULTIPLE chưa mở được Album composer.', {
+    ...shareIntent,
+    args: maskShareIntentArgs(intentArgs),
+    method,
+    imageCount: imageUris.length,
+    bootstrap
+  });
+
+  return opened
+    ? { ...shareIntent, ok: true, method, imageCount: imageUris.length, bootstrap }
+    : { ok: false, method, imageCount: imageUris.length, shareIntent, bootstrap, error: shareIntent?.error || shareIntent?.stderr || bootstrap?.error || 'SEND_MULTIPLE không mở được Album composer.' };
+}
+
+function isInstagramSendMultipleUnsupported(result = null) {
+  if (!result) return false;
+  const text = JSON.stringify(result).slice(0, 5000);
+  return /Unknown option:\s*--eul/i.test(text);
+}
+
+function isInstagramShareHandlerStuck(result = null) {
+  if (!result) return false;
+  const text = JSON.stringify(result).slice(0, 5000);
+  return /ShareHandlerActivity/i.test(text)
+    && /chưa hiện màn Next\/Share|no_uiautomator_nodes|no_known_labels/i.test(text);
+}
+
+async function openInstagramNativeAlbumComposer(account, userId, target, config, text, images, firstImageComposer = null) {
+  await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'am', 'force-stop', config.appPackage], { timeoutMs: 10_000 });
+  await delay(postStepDelay(1.5));
+
+  const home = await openInstagramHomeForAlbum(account, userId, target, config.appPackage);
+  if (!home.ok) throw new Error(home.error || 'Không mở được Instagram Home để tạo Album.');
+
+  const gallery = await openInstagramAlbumGallery(account, userId, target, config.appPackage, 3);
+  if (!gallery) throw new Error('Instagram không mở được thư viện Album từ Home/Create.');
+
+  const multiple = await enableInstagramSelectMultiple(account, userId, target, gallery.nodes);
+  if (!multiple.ok) throw new Error(multiple.error);
+
+  const selection = await selectInstagramRecentAlbumPhotos(account, userId, target, images.length, {
+    initialSelectedCount: 0
+  });
+  if (!selection.ok) throw new Error(selection.error);
+
+  const nodes = await dumpVisibleNodes(target);
+  const next = await tapTextOrPoint(account, userId, target, instagramNextLabels, getInstagramBottomRightFallbackPoint(nodes), 'instagram_post_album_tap_next', {
+    exact: true,
+    preferBottomRight: true,
+    nodes
+  });
+  await delay(postStepDelay(1.5));
+  const finalNodes = await dumpVisibleNodes(target);
+  const finalState = detectInstagramState(finalNodes, text);
+  await writeLog(userId, account._id, 'info', 'instagram_post_album_ready_native', `Đã chọn ${images.length} ảnh cho Album Instagram qua Home/Create.`, {
+    imageCount: images.length,
+    selectedCount: selection.selectedCount,
+    homeState: home.state,
+    multiple,
+    next,
+    state: finalState
+  });
+  return {
+    ok: true,
+    method: 'instagram_home_create_carousel',
+    imageCount: images.length,
+    firstImageComposer,
+    home,
+    gallery,
+    multiple,
+    selection,
+    next,
+    bootstrap: {
+      ok: ['next', 'caption', 'info_dialog'].includes(finalState.name),
+      method: 'instagram_home_create_carousel',
+      state: finalState
+    }
+  };
+}
+
+async function openInstagramNativeSinglePhotoComposer(account, userId, target, config, text, images, failedShareComposer = null) {
+  await writeLog(userId, account._id, 'warn', 'instagram_post_single_native_fallback', 'Share intent Instagram không ổn định; chuyển sang luồng Home/Create để chọn ảnh đơn.', {
+    failedShareComposer
+  });
+  const systemUi = await waitForSystemUiHealthy(account, userId, target, {
+    phase: 'instagram_single_native_fallback',
+    stableChecks: 2,
+    maxAttempts: 8
+  });
+  if (!systemUi.ok) {
+    return {
+      ok: false,
+      error: systemUi.error || 'System UI của LDPlayer chưa ổn định trước fallback Home/Create.',
+      systemUi
+    };
+  }
+  if (hasTransientAdbFailureDetails(failedShareComposer)) {
+    const recovery = await recoverInstagramAdbAfterCleanup(account, userId, target);
+    if (!recovery.ok) {
+      return {
+        ok: false,
+        error: 'ADB không ổn định sau khi mở share intent Instagram; đã dừng fallback native để tránh treo API.',
+        recovery
+      };
+    }
+    target = recovery.health?.resolvedTarget || target;
+    await writeLog(userId, account._id, 'info', 'instagram_post_single_native_adb_recovered', 'Đã recovery ADB trước khi chạy fallback Home/Create cho ảnh đơn Instagram.', {
+      target,
+      recovery
+    });
+  }
+  await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'am', 'force-stop', config.appPackage], { timeoutMs: 10_000 });
+  await delay(postStepDelay(1.5));
+
+  const home = await openInstagramHomeForAlbum(account, userId, target, config.appPackage);
+  if (!home.ok) return { ok: false, error: home.error || 'Không mở được Instagram Home để tạo bài ảnh đơn.', home };
+
+  const gallery = await openInstagramAlbumGallery(account, userId, target, config.appPackage, 3);
+  if (!gallery) return { ok: false, error: 'Instagram không mở được thư viện ảnh từ Home/Create.', home, gallery };
+
+  const selection = await selectInstagramRecentAlbumPhotos(account, userId, target, 1, {
+    initialSelectedCount: 0
+  });
+  if (!selection.ok) return { ok: false, error: selection.error, home, gallery, selection };
+
+  const nodes = await dumpVisibleNodes(target);
+  const next = await tapTextOrPoint(account, userId, target, instagramNextLabels, getInstagramBottomRightFallbackPoint(nodes), 'instagram_post_single_native_tap_next', {
+    exact: true,
+    preferBottomRight: true,
+    nodes
+  });
+  await delay(postStepDelay(1.5));
+  const ready = await waitForInstagramState(target, text, ['next', 'caption', 'info_dialog', 'blocked'], 12_000);
+  const finalNodes = ready?.nodes || await dumpVisibleNodes(target);
+  const finalState = ready?.state || detectInstagramState(finalNodes, text);
+  await writeLog(userId, account._id, ['next', 'caption', 'info_dialog'].includes(finalState.name) ? 'info' : 'warn', 'instagram_post_single_native_ready', 'Đã mở composer ảnh đơn Instagram qua Home/Create.', {
+    imageCount: images.length,
+    homeState: home.state,
+    selection,
+    next,
+    state: finalState
+  });
+  return ['next', 'caption', 'info_dialog'].includes(finalState.name)
+    ? {
+      ok: true,
+      method: 'instagram_home_create_single_photo',
+      imageCount: 1,
+      failedShareComposer,
+      home,
+      gallery,
+      selection,
+      next,
+      bootstrap: {
+        ok: true,
+        method: 'instagram_home_create_single_photo',
+        state: finalState
+      }
+    }
+    : {
+      ok: false,
+      error: 'Luồng Home/Create chưa đưa Instagram tới màn Next/Caption.',
+      method: 'instagram_home_create_single_photo',
+      home,
+      gallery,
+      selection,
+      next,
+      state: finalState
+    };
+}
+
 async function waitForInstagramAddMoreButton(target, timeoutMs = 8_000) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
@@ -2625,14 +3612,61 @@ function findInstagramAddMoreMediaButton(nodes = []) {
     || null;
 }
 
+function findInstagramCreateButton(nodes = []) {
+  return findNodeInNodes(nodes, instagramCreateLabels, { exact: true })
+    || nodes.find((node) => /com\.instagram\.android:id\/creation_tab/i.test(node.raw || ''))
+    || null;
+}
+
+async function enableInstagramSelectMultiple(account, userId, target, nodes = []) {
+  let currentNodes = nodes?.length ? nodes : await dumpVisibleNodes(target);
+  let selectNode = findNodeInNodes(currentNodes, instagramSelectMultipleLabels)
+    || currentNodes.find((node) => /multi_select_slide_button/i.test(node.raw || ''));
+  if (!selectNode) {
+    return { ok: false, error: 'Không tìm thấy nút Select multiple trong thư viện Instagram.' };
+  }
+  const bounds = selectNode.bounds || selectNode;
+  const point = {
+    x: Math.round((bounds.left + bounds.right) / 2),
+    y: Math.round((bounds.top + bounds.bottom) / 2)
+  };
+  const tap = await tapAndLog(userId, account._id, target, 'instagram_post_enable_select_multiple', point);
+  await delay(postStepDelay(1.2));
+  currentNodes = await dumpVisibleNodes(target);
+  await writeLog(userId, account._id, tap.ok ? 'info' : 'warn', 'instagram_post_select_multiple_enabled', tap.ok ? 'Đã bật Select multiple trong thư viện Instagram.' : 'Không bật được Select multiple.', {
+    tap,
+    point
+  });
+  return { ok: tap.ok, tap, point, nodes: currentNodes, error: tap.error || tap.stderr || '' };
+}
+
 async function waitForInstagramAddMoreGallery(target, timeoutMs = 12_000) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
     await delay(450);
     const nodes = await dumpVisibleNodes(target);
-    const hasPhotos = nodes.some((node) => /gallery_grid_item_thumbnail/i.test(node.raw || ''));
+    const permission = findNodeInNodes(nodes, galleryPermissionLabels);
+    if (permission) {
+      await runCommand(env.mobileAutomation.adbPath, [
+        '-s',
+        target,
+        'shell',
+        'input',
+        'tap',
+        String(Math.round((permission.left + permission.right) / 2)),
+        String(Math.round((permission.top + permission.bottom) / 2))
+      ], { timeoutMs: 8_000 });
+      await delay(postStepDelay(1.5));
+      continue;
+    }
+    const hasPhotos = nodes.some((node) => /gallery_grid_item_thumbnail/i.test(node.raw || ''))
+      || nodes.some((node) => /(?:Unselected\s+)?Photo thumbnail|Ảnh chụp|Anh chup/i.test(node.desc || node.text || ''));
     const hasNext = findNodeInNodes(nodes, instagramNextLabels, { exact: true });
-    if (hasPhotos && hasNext) return { nodes };
+    const hasSelectMultiple = findNodeInNodes(nodes, instagramSelectMultipleLabels)
+      || nodes.some((node) => /multi_select_slide_button/i.test(node.raw || ''));
+    const hasGalleryTitle = findNodeInNodes(nodes, [...instagramNewPostLabels, ...galleryLabels])
+      || nodes.some((node) => /new_post_title|gallery|recents/i.test(node.raw || node.text || node.desc || ''));
+    if (hasPhotos && (hasNext || hasSelectMultiple || hasGalleryTitle)) return { nodes };
   }
   return null;
 }
@@ -2648,13 +3682,20 @@ async function openInstagramHomeForAlbum(account, userId, target, packageName) {
     '-c',
     'android.intent.category.LAUNCHER',
     '1'
-  ], { timeoutMs: 20_000 });
+  ], { timeoutMs: 8_000, retryTransient: false });
   let ready = await waitForInstagramAlbumEntry(target, packageName, 15_000);
   if (ready) return { ok: true, launch, ...ready };
 
   await writeLog(userId, account._id, 'warn', 'instagram_post_album_home_restart', 'Instagram chưa render Home/Create, đang khởi động lại app để thoát màn trắng.', {
     launch
   });
+  if (!launch.ok) {
+    return {
+      ok: false,
+      launch,
+      error: launch.error || launch.stderr || 'Instagram Home không phản hồi khi mở bằng ADB monkey.'
+    };
+  }
   launch = await launchAppFresh(target, packageName);
   if (!launch.ok) return { ok: false, launch, error: launch.error || launch.stderr || 'Không mở được Instagram.' };
 
@@ -2667,6 +3708,12 @@ async function openInstagramHomeForAlbum(account, userId, target, packageName) {
   };
 }
 
+function hasTransientAdbFailureDetails(value = null) {
+  if (!value) return false;
+  const text = JSON.stringify(value).slice(0, 4000);
+  return /SIGTERM|timed out|timeout|offline|no devices|not found|closed|transport error|protocol fault|killed/i.test(text);
+}
+
 async function waitForInstagramAlbumEntry(target, packageName, timeoutMs) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
@@ -2675,13 +3722,14 @@ async function waitForInstagramAlbumEntry(target, packageName, timeoutMs) {
       dumpVisibleNodes(target),
       getForegroundAndroidPackage(target)
     ]);
-    if (foreground.packageName !== packageName) continue;
+    const instagramNodeVisible = nodes.some((node) => /package="com\.instagram\.android"/i.test(node.raw || ''));
+    if (foreground.packageName !== packageName && !instagramNodeVisible) continue;
     const hasGallery = (findNodeInNodes(nodes, instagramNewPostLabels, { exact: true })
       || nodes.some((node) => /new_post_title/i.test(node.raw || '')))
       && (findNodeInNodes(nodes, instagramSelectMultipleLabels)
         || nodes.some((node) => /multi_select_slide_button/i.test(node.raw || '')));
     if (hasGallery) return { state: 'gallery', nodes, foreground, elapsedMs: Date.now() - startedAt };
-    if (findNodeInNodes(nodes, instagramCreateLabels, { exact: true })) {
+    if (findInstagramCreateButton(nodes)) {
       return { state: 'home', nodes, foreground, elapsedMs: Date.now() - startedAt };
     }
   }
@@ -2694,13 +3742,25 @@ async function openInstagramAlbumGallery(account, userId, target, packageName, m
     if (existing) return existing;
 
     let nodes = await dumpVisibleNodes(target);
-    const createNode = findNodeInNodes(nodes, instagramCreateLabels, { exact: true });
+    const createNode = findInstagramCreateButton(nodes);
     if (createNode) {
+      const bounds = createNode.bounds || createNode;
       const point = {
-        x: Math.round((createNode.left + createNode.right) / 2),
-        y: Math.round((createNode.top + createNode.bottom) / 2)
+        x: Math.round((bounds.left + bounds.right) / 2),
+        y: Math.round((bounds.top + bounds.bottom) / 2)
       };
       await tapAndLog(userId, account._id, target, 'instagram_post_open_album_gallery', point);
+      await delay(900);
+      const anrState = await detectPackageAnr(target, packageName);
+      if (anrState.active) {
+        await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'am', 'force-stop', packageName], { timeoutMs: 10_000 });
+        await writeLog(userId, account._id, 'error', 'instagram_post_album_create_anr', 'Instagram bị ANR sau khi bấm Create; dừng luồng Album để tránh làm ADB/LDPlayer offline.', {
+          attempt,
+          point,
+          anrState
+        });
+        return null;
+      }
     } else {
       await writeLog(userId, account._id, 'warn', 'instagram_post_album_create_missing', 'Chưa tìm thấy nút Create, chờ Instagram Home ổn định rồi thử lại.', {
         attempt,
@@ -2732,6 +3792,25 @@ async function openInstagramAlbumGallery(account, userId, target, packageName, m
   return null;
 }
 
+async function detectPackageAnr(target, packageName) {
+  const windowState = await runCommand(env.mobileAutomation.adbPath, [
+    '-s',
+    target,
+    'shell',
+    'dumpsys',
+    'window',
+    'windows'
+  ], { timeoutMs: 6_000 });
+  const output = `${windowState.stdout || ''}\n${windowState.stderr || ''}`;
+  return {
+    ok: windowState.ok,
+    active: hasActivePackageAnr(output, packageName),
+    packageName,
+    output: output.slice(0, 1200),
+    error: windowState.error || windowState.stderr || ''
+  };
+}
+
 async function waitForInstagramAlbumGallery(target, timeoutMs = 12_000) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
@@ -2747,7 +3826,7 @@ async function waitForInstagramAlbumGallery(target, timeoutMs = 12_000) {
 }
 
 async function selectInstagramRecentAlbumPhotos(account, userId, target, imageCount, options = {}) {
-  let selectedCount = 1;
+  let selectedCount = Number.isInteger(options.initialSelectedCount) ? options.initialSelectedCount : 1;
   let scrollCount = 0;
   let firstCandidateBounds = null;
   let tappedBounds = [];
@@ -2829,9 +3908,12 @@ async function selectInstagramRecentAlbumPhotos(account, userId, target, imageCo
 
 async function waitForInstagramComposerBootstrap(account, userId, target, config, text, method, timeoutMs = 14_000) {
   const startedAt = Date.now();
+  let deadlineAt = startedAt + timeoutMs;
   let lastState = null;
   let lastForeground = null;
-  while (Date.now() - startedAt < timeoutMs) {
+  let resolverHandledAt = 0;
+  let loggedShareHandlerWait = false;
+  while (Date.now() < deadlineAt) {
     await delay(550);
     const [nodes, foreground] = await Promise.all([
       dumpVisibleNodes(target),
@@ -2842,27 +3924,48 @@ async function waitForInstagramComposerBootstrap(account, userId, target, config
     lastForeground = foreground;
 
     if (state.name === 'share_resolver') {
-      const resolved = await selectInstagramFeedAlways(account, userId, target, nodes);
-      if (!resolved.ok) {
-        return {
-          ok: false,
-          method,
-          error: resolved.error,
-          state,
-          foreground,
-          elapsedMs: Date.now() - startedAt
-        };
+      if (!resolverHandledAt || Date.now() - resolverHandledAt > 5_000) {
+        const resolved = await selectInstagramFeedAlways(account, userId, target, nodes);
+        resolverHandledAt = Date.now();
+        if (!resolved.ok) {
+          return {
+            ok: false,
+            method,
+            error: resolved.error,
+            state,
+            foreground,
+            elapsedMs: Date.now() - startedAt
+          };
+        }
       }
       await delay(postStepDelay(1.5));
+      deadlineAt = Math.max(deadlineAt, Date.now() + 20_000);
       continue;
     }
 
-    if (['unknown', 'home'].includes(state.name) && foreground.packageName === config.appPackage && /MediaCaptureActivity/i.test(foreground.activityName || '')) {
+    if (['unknown', 'home'].includes(state.name) && foreground.packageName === config.appPackage && isInstagramCreationActivity(foreground.activityName)) {
       state = { ...state, name: 'next', reason: `activity:${foreground.activityName}`, active: foreground };
       lastState = state;
     }
 
-    if (['next', 'caption', 'info_dialog'].includes(state.name)) {
+    if (state.name === 'next' && isInstagramShareHandlerActivity(foreground.activityName)) {
+      if (!loggedShareHandlerWait) {
+        await writeLog(userId, account._id, 'info', 'instagram_post_wait_creation_activity', 'Instagram đã nhận share intent nhưng còn ở ShareHandlerActivity; đợi màn tạo bài thật để tránh bấm Next sai tọa độ.', {
+          method,
+          elapsedMs: Date.now() - startedAt,
+          state,
+          foreground
+        });
+        loggedShareHandlerWait = true;
+      }
+      continue;
+    }
+
+    if (['caption', 'info_dialog'].includes(state.name) || (state.name === 'next' && (
+      isInstagramCreationActivity(foreground.activityName)
+      || foreground.packageName !== config.appPackage
+      || !foreground.activityName
+    ))) {
       await writeLog(userId, account._id, 'info', 'instagram_post_composer_ready', `Instagram composer đã sẵn sàng qua ${method}.`, {
         method,
         elapsedMs: Date.now() - startedAt,
@@ -2886,21 +3989,44 @@ async function waitForInstagramComposerBootstrap(account, userId, target, config
 }
 
 async function runInstagramPostStateMachine(account, userId, target, config, text, steps) {
+  const startedAt = Date.now();
+  const hardDeadlineMs = config.autoSubmit ? 150_000 : 95_000;
   let screenshot = null;
   let finalState = 'unknown';
   let recoveredEmptyUiOnce = false;
   let captionEntered = false;
   let captionAttempts = 0;
   let lastLoggedState = '';
+  let nextFallbackAttempts = 0;
+  let dryRunNextFallbackAttempts = 0;
+  let nextTextMissingAttempts = 0;
+  let semanticNextTaps = 0;
   const requiresCaption = Boolean(text.trim());
 
-  for (let attempt = 1; attempt <= 18; attempt += 1) {
+  for (let attempt = 1; attempt <= 24; attempt += 1) {
+    if (Date.now() - startedAt > hardDeadlineMs) {
+      await writeLog(userId, account._id, 'warn', 'instagram_post_state_machine_timeout', 'Instagram state machine vượt quá thời gian cho phép; dừng sớm để tránh treo batch hoặc làm ADB offline.', {
+        finalState,
+        elapsedMs: Date.now() - startedAt,
+        hardDeadlineMs,
+        autoSubmit: config.autoSubmit,
+        semanticNextTaps,
+        nextTextMissingAttempts
+      });
+      return { finalState, screenshot: null, steps, composerPending: true, submitVerified: false, submitReason: 'state_machine_timeout' };
+    }
     const nodes = await dumpVisibleNodes(target);
     let state = detectInstagramState(nodes, text);
+    let active = null;
     if (['unknown', 'home'].includes(state.name)) {
-      const active = await getForegroundAndroidPackage(target);
-      if (active.packageName === config.appPackage && /MediaCaptureActivity/i.test(active.activityName || '')) {
+      active = await getForegroundAndroidPackage(target);
+      if (active.packageName === config.appPackage && isInstagramCreationActivity(active.activityName)) {
         state = { ...state, name: 'next', reason: `activity:${active.activityName}`, active };
+      }
+    } else if (state.name === 'next') {
+      active = await getForegroundAndroidPackage(target);
+      if (active.packageName === config.appPackage && isInstagramShareHandlerActivity(active.activityName)) {
+        state = { ...state, reason: 'share_handler_waiting_for_creation_activity', active };
       }
     }
     finalState = state.name;
@@ -2945,7 +4071,33 @@ async function runInstagramPostStateMachine(account, userId, target, config, tex
       continue;
     }
 
-    if (requiresCaption && !captionEntered && ['submitting', 'submitted', 'home'].includes(state.name)) {
+    if (state.name === 'submitting') {
+      if (!config.autoSubmit) {
+        screenshot = await captureScreenshot(account, userId, 'instagram_post_dry_run_unexpected_submit');
+        await writeLog(userId, account._id, 'error', 'instagram_post_dry_run_unexpected_submit', 'Dry-run phát hiện Instagram đã chuyển sang trạng thái gửi; dừng và báo lỗi vì autoSubmit=false.', {
+          state,
+          attempt
+        });
+        return { finalState: state.name, screenshot, steps, composerPending: false, submitVerified: false, submitReason: 'dry_run_unexpected_submit' };
+      }
+      const verification = await verifyInstagramPostSubmit(account, userId, target, config.waitAfterSubmitMs);
+      return { finalState: verification.ok ? 'submitted' : verification.finalState, screenshot: verification.screenshot, steps, composerPending: verification.composerPending, submitVerified: verification.ok, submitReason: verification.reason };
+    }
+
+    if (state.name === 'submitted') {
+      if (!config.autoSubmit) {
+        screenshot = await captureScreenshot(account, userId, 'instagram_post_dry_run_unexpected_submitted');
+        await writeLog(userId, account._id, 'error', 'instagram_post_dry_run_unexpected_submitted', 'Dry-run phát hiện Instagram đã rời composer như đã gửi; báo lỗi vì autoSubmit=false.', {
+          state,
+          attempt
+        });
+        return { finalState: state.name, screenshot, steps, composerPending: false, submitVerified: false, submitReason: 'dry_run_unexpected_submitted' };
+      }
+      screenshot = await captureScreenshot(account, userId, 'instagram_post_submit_verified');
+      return { finalState: 'submitted', screenshot, steps, composerPending: false, submitVerified: true, submitReason: 'share_confirmation_visible' };
+    }
+
+    if (requiresCaption && !captionEntered && ['home'].includes(state.name)) {
       screenshot = await captureScreenshot(account, userId, 'instagram_post_caption_missing_before_submit');
       await writeLog(userId, account._id, 'warn', 'instagram_post_caption_missing_before_submit', 'Instagram đã rời màn soạn trước khi automation xác minh được caption; dừng để tránh đăng thiếu emoji/hashtag.', {
         state,
@@ -2956,8 +4108,108 @@ async function runInstagramPostStateMachine(account, userId, target, config, tex
     }
 
     if (state.name === 'next') {
+      if (state.reason === 'share_handler_waiting_for_creation_activity') {
+        await writeLog(userId, account._id, 'info', 'instagram_post_share_handler_wait', 'Instagram vẫn ở ShareHandlerActivity; chưa bấm Next để tránh kẹt màn tạo bài.', {
+          attempt,
+          state,
+          visibleLabels: summarizeVisibleLabels(nodes)
+        });
+        await delay(postStepDelay(1.5));
+        continue;
+      }
       const nextMatch = findNodeInNodes(nodes, instagramNextLabels, { exact: true, preferBottomRight: true });
+      const submitRisk = hasInstagramSubmitRisk(nodes);
+      const loadingOnly = hasInstagramLoadingOnly(nodes);
+      if (!nextMatch && loadingOnly) {
+        await writeLog(userId, account._id, 'info', 'instagram_post_next_loading_wait', 'Instagram đang xử lý màn Next/Loading; tiếp tục đợi thay vì dừng batch quá sớm.', {
+          attempt,
+          state,
+          elapsedMs: Date.now() - startedAt,
+          visibleLabels: summarizeVisibleLabels(nodes)
+        });
+        await delay(postStepDelay(1.8));
+        continue;
+      }
+      nextTextMissingAttempts = nextMatch ? 0 : nextTextMissingAttempts + 1;
+      if (!config.autoSubmit && requiresCaption && submitRisk.ok) {
+        screenshot = await captureScreenshot(account, userId, 'instagram_post_dry_run_submit_risk_on_next');
+        await writeLog(userId, account._id, 'error', 'instagram_post_dry_run_submit_risk_on_next', 'Dry-run thấy dấu hiệu Share/submitting khi state vẫn là Next; dừng để tránh đăng thật.', {
+          attempt,
+          state,
+          semanticNextTaps,
+          submitRisk,
+          visibleLabels: summarizeVisibleLabels(nodes)
+        });
+        return { finalState, screenshot, steps, composerPending: true, submitVerified: false, submitReason: 'dry_run_submit_risk_on_next' };
+      }
+      if (!config.autoSubmit && requiresCaption && semanticNextTaps >= 2) {
+        screenshot = await captureScreenshot(account, userId, 'instagram_post_dry_run_next_not_advancing');
+        await writeLog(userId, account._id, 'warn', 'instagram_post_dry_run_next_not_advancing', 'Dry-run đã bấm Next hai lần nhưng Instagram chưa chuyển sang caption; dừng để tránh bấm nhầm sang bước Share/đăng.', {
+          attempt,
+          state,
+          semanticNextTaps,
+          textLength: text.length,
+          visibleLabels: summarizeVisibleLabels(nodes)
+        });
+        return { finalState, screenshot, steps, composerPending: true, submitVerified: false, submitReason: 'dry_run_next_not_advancing' };
+      }
       if (!nextMatch && requiresCaption) {
+        const canDryRunCoordinateNext = !config.autoSubmit
+          && /^activity:/i.test(state.reason || '')
+          && isInstagramCreationActivity(state.active?.activityName)
+          && !submitRisk.ok
+          && (semanticNextTaps >= 1 || nextTextMissingAttempts >= 1)
+          && dryRunNextFallbackAttempts < 1;
+        if (canDryRunCoordinateNext) {
+          dryRunNextFallbackAttempts += 1;
+          const fallbackPoint = await getInstagramNextFallbackPoint(target, nodes);
+          const next = await tapAndLog(userId, account._id, target, 'instagram_post_dry_run_tap_next_activity_fallback', fallbackPoint);
+          steps.push(next);
+          await writeLog(userId, account._id, next.ok ? 'info' : 'warn', 'instagram_post_dry_run_next_activity_fallback', next.ok ? 'Dry-run đã bấm Next bằng tọa độ fallback trong MediaCaptureActivity vì UIAutomator không trả node Next.' : 'Dry-run không bấm được Next fallback trong MediaCaptureActivity.', {
+            attempt,
+            state,
+            point: fallbackPoint,
+            semanticNextTaps,
+            dryRunNextFallbackAttempts
+          });
+          await waitForInstagramState(target, text, ['caption', 'info_dialog', 'blocked', 'submitting'], 8_000);
+          continue;
+        }
+        if (!config.autoSubmit && nextTextMissingAttempts >= 3) {
+          await writeLog(userId, account._id, 'warn', 'instagram_post_next_text_missing_stuck', 'Instagram đang ở màn tạo nội dung nhưng không trả node Next nhiều lần; dừng dry-run để tránh treo và tránh bấm tọa độ mù.', {
+            attempt,
+            state,
+            semanticNextTaps,
+            dryRunNextFallbackAttempts,
+            nextTextMissingAttempts,
+            elapsedMs: Date.now() - startedAt,
+            visibleLabels: summarizeVisibleLabels(nodes)
+          });
+          return { finalState, screenshot: null, steps, composerPending: true, submitVerified: false, submitReason: 'next_text_missing_stuck' };
+        }
+        const allowCoordinateFallback = config.autoSubmit && /^activity:/i.test(state.reason || '') && attempt >= 3;
+        if (allowCoordinateFallback) {
+          nextFallbackAttempts += 1;
+          if (nextFallbackAttempts > 2) {
+            screenshot = await captureScreenshot(account, userId, 'instagram_post_next_fallback_stuck');
+            await writeLog(userId, account._id, 'warn', 'instagram_post_next_fallback_stuck', 'Đã bấm Next fallback nhiều lần nhưng Instagram không chuyển màn; dừng gate để tránh treo lâu.', {
+              attempt,
+              state,
+              nextFallbackAttempts
+            });
+            return { finalState, screenshot, steps, composerPending: true, submitVerified: false, submitReason: 'next_fallback_stuck' };
+          }
+          const fallbackPoint = await getInstagramNextFallbackPoint(target, nodes);
+          const next = await tapAndLog(userId, account._id, target, 'instagram_post_tap_next_activity_fallback', fallbackPoint);
+          steps.push(next);
+          await writeLog(userId, account._id, next.ok ? 'info' : 'warn', 'instagram_post_next_activity_fallback', next.ok ? 'Đã bấm Next bằng tọa độ fallback khi ShareHandlerActivity không trả node.' : 'Không bấm được Next bằng tọa độ fallback.', {
+            attempt,
+            state,
+            point: fallbackPoint
+          });
+          await waitForInstagramState(target, text, ['caption', 'info_dialog', 'blocked'], 8_000);
+          continue;
+        }
         await writeLog(userId, account._id, 'warn', 'instagram_post_next_text_missing', 'Instagram đang ở màn tạo nội dung nhưng không thấy nút Next; không bấm tọa độ để tránh đăng thiếu caption.', {
           state,
           textLength: text.length
@@ -2967,7 +4219,8 @@ async function runInstagramPostStateMachine(account, userId, target, config, tex
       }
       const next = await tapTextOrPoint(account, userId, target, instagramNextLabels, getInstagramBottomRightFallbackPoint(nodes), 'instagram_post_tap_next', { exact: true, preferBottomRight: true, nodes });
       steps.push(next);
-      await waitForInstagramState(target, text, ['caption', 'info_dialog', 'blocked'], 6_000);
+      if (next.ok) semanticNextTaps += 1;
+      await waitForInstagramState(target, text, ['caption', 'info_dialog', 'blocked', 'submitting'], 6_000);
       continue;
     }
 
@@ -2976,6 +4229,9 @@ async function runInstagramPostStateMachine(account, userId, target, config, tex
         captionAttempts += 1;
         const caption = await enterInstagramCaption(account, userId, target, text, nodes);
         steps.push(...caption.steps);
+        if (caption.clearFailed) {
+          return { finalState, screenshot, steps, composerPending: true, submitVerified: false, submitReason: 'caption_clear_failed' };
+        }
         captionEntered = caption.hasTargetText;
         if (captionEntered) {
           if (!config.autoSubmit) {
@@ -2993,6 +4249,9 @@ async function runInstagramPostStateMachine(account, userId, target, config, tex
           captionAttempts += 1;
           const caption = await enterInstagramCaption(account, userId, target, text, nodes);
           steps.push(...caption.steps);
+          if (caption.clearFailed) {
+            return { finalState, screenshot, steps, composerPending: true, submitVerified: false, submitReason: 'caption_clear_failed' };
+          }
           captionEntered = caption.hasTargetText;
           if (captionEntered) {
             if (!config.autoSubmit) {
@@ -3035,13 +4294,27 @@ async function submitInstagramShare(account, userId, target, config, steps, fina
   steps.push(share);
   await delay(postStepDelay(1.5));
 
-  let verification = await verifyInstagramPostSubmit(account, userId, target, Math.max(6_000, Math.min(config.waitAfterSubmitMs || 0, 8_000)));
-  if (!verification.ok && verification.reason === 'still_on_share_screen') {
+  let verification = await verifyInstagramPostSubmit(account, userId, target, Math.max(10_000, Math.min(config.waitAfterSubmitMs || 0, 14_000)));
+  for (let retry = 1; !verification.ok && verification.reason === 'still_on_share_screen' && retry <= 2; retry += 1) {
     const retryShare = await tapInstagramShareButton(account, userId, target, 'instagram_post_tap_share_retry');
     steps.push(retryShare);
     verification = await verifyInstagramPostSubmit(account, userId, target, config.waitAfterSubmitMs);
   }
   return { finalState: verification.ok ? 'submitted' : verification.finalState, screenshot: verification.screenshot, steps, composerPending: verification.composerPending, submitVerified: verification.ok, submitReason: verification.reason };
+}
+
+function isInstagramCreationActivity(activityName = '') {
+  return /MediaCaptureActivity/i.test(String(activityName || ''));
+}
+
+function isInstagramShareHandlerActivity(activityName = '') {
+  return /ShareHandlerActivity/i.test(String(activityName || ''));
+}
+
+function isInstagramPostSubmitClosedActivity(activityName = '') {
+  const value = String(activityName || '');
+  return /InstagramMainActivity|MainTabActivity/i.test(value)
+    || (value && !isInstagramCreationActivity(value) && !isInstagramShareHandlerActivity(value));
 }
 
 async function tapInstagramShareButton(account, userId, target, action) {
@@ -3058,10 +4331,31 @@ async function tapInstagramShareButton(account, userId, target, action) {
     state = detectInstagramState(nodes, '');
   }
 
-  const shareNode = findInstagramShareButton(nodes);
+  let shareNode = findInstagramShareButton(nodes);
+  const doneNode = findNodeInNodes(nodes, instagramDoneLabels, { exact: true, preferBottomRight: true });
+  if (doneNode) {
+    const donePoint = {
+      x: Math.round((doneNode.left + doneNode.right) / 2),
+      y: Math.round((doneNode.top + doneNode.bottom) / 2)
+    };
+    const done = await tapAndLog(userId, account._id, target, `${action}_dismiss_done`, donePoint);
+    await writeLog(userId, account._id, done.ok ? 'info' : 'warn', 'instagram_post_dismiss_done_before_share', done.ok ? 'Đã bấm Done để đóng bàn phím trước khi bấm Share.' : 'Không bấm được Done trước khi bấm Share.', {
+      bounds: doneNode,
+      point: donePoint,
+      state
+    });
+    await delay(postStepDelay(1.3));
+    nodes = await dumpVisibleNodes(target);
+    state = detectInstagramState(nodes, '');
+    shareNode = findInstagramShareButton(nodes);
+  }
   if (shareNode) {
+    const width = nodes.reduce((max, node) => Math.max(max, node.bounds?.right || 0), 0) || shareNode.right || 900;
+    const nodeWidth = Math.max(0, shareNode.right - shareNode.left);
     const point = {
-      x: Math.round((shareNode.left + shareNode.right) / 2),
+      x: nodeWidth >= width * 0.75
+        ? Math.round(shareNode.right - Math.min(120, nodeWidth * 0.08))
+        : Math.round((shareNode.left + shareNode.right) / 2),
       y: Math.round((shareNode.top + shareNode.bottom) / 2)
     };
     const result = await tapAndLog(userId, account._id, target, action, point);
@@ -3083,6 +4377,9 @@ async function tapInstagramShareButton(account, userId, target, action) {
 async function enterInstagramCaption(account, userId, target, text, nodes = []) {
   const steps = [];
   const captionNode = findInstagramCaptionInput(nodes);
+  const existingCaptionText = captionNode?.text && !/add a caption|write a caption/i.test(captionNode.text)
+    ? String(captionNode.text)
+    : '';
   if (captionNode) {
     const point = {
       x: Math.round((captionNode.left + captionNode.right) / 2),
@@ -3101,6 +4398,18 @@ async function enterInstagramCaption(account, userId, target, text, nodes = []) 
   await delay(postStepDelay(0.7));
 
   const inputText = prepareInstagramCaptionInput(text);
+  if (existingCaptionText) {
+    const clear = await clearFocusedTextWithDeleteKey(target, Math.min(180, Math.max(40, existingCaptionText.length + 20)));
+    steps.push(clear);
+    await writeLog(userId, account._id, clear.ok ? 'info' : 'warn', 'instagram_post_clear_existing_caption', clear.ok ? 'Đã xóa caption cũ trước khi nhập caption mới.' : 'Không xóa chắc chắn được caption cũ trước khi nhập mới.', {
+      existingLength: existingCaptionText.length,
+      clear
+    });
+    if (!clear.ok) {
+      return { steps, hasTargetText: false, clearFailed: true };
+    }
+    await delay(postStepDelay(0.5));
+  }
   let input = await replaceFocusedText(target, inputText);
   if (!input.ok) {
     await writeLog(userId, account._id, 'warn', 'instagram_post_replace_caption_unavailable', 'Không replace được caption bằng ADB Keyboard, chuyển sang paste/input.', input);
@@ -3153,6 +4462,37 @@ function getInstagramBottomRightFallbackPoint(nodes = []) {
   };
 }
 
+async function getInstagramNextFallbackPoint(target, nodes = []) {
+  let width = nodes.reduce((max, node) => Math.max(max, node.bounds?.right || 0), 0);
+  let height = nodes.reduce((max, node) => Math.max(max, node.bounds?.bottom || 0), 0);
+  const size = await getDeviceScreenSize(target);
+  if (size?.width && size?.height && size.width > size.height) {
+    width = size.width;
+    height = size.height;
+  } else if (!width || !height) {
+    width = size?.width || 900;
+    height = size?.height || 1600;
+  }
+  if (width > height && width < 1400) {
+    // LDPlayer can report a scaled wm size (for example 1240x615) while ADB
+    // input still uses the 1600x900 surface coordinates returned by UI nodes.
+    width = 1600;
+    height = 900;
+  }
+  if (width > height) {
+    // Instagram creation UI in LDPlayer landscape exposes the actionable Next
+    // affordance near the visual bottom-right of the 1600x900 surface.
+    return {
+      x: Math.round(width * 0.958),
+      y: Math.round(height * 0.949)
+    };
+  }
+  return {
+    x: Math.round(width * 0.94),
+    y: Math.round(height * 0.08)
+  };
+}
+
 function findInstagramCaptionInput(nodes = []) {
   const labeled = findNodeInNodes(nodes, instagramCaptionLabels);
   if (labeled) return labeled;
@@ -3186,12 +4526,40 @@ function findInstagramShareButton(nodes = []) {
   return findNodeInNodes(nodes, instagramShareLabels, { exact: true, preferBottomRight: true });
 }
 
+function hasInstagramSubmitRisk(nodes = []) {
+  const risk = {
+    shareButton: Boolean(findInstagramShareButton(nodes)),
+    shareText: Boolean(findNodeInNodes(nodes, instagramShareLabels, { exact: true })),
+    progress: Boolean(findNodeInNodes(nodes, instagramSharingProgressLabels)),
+    submitted: Boolean(findNodeInNodes(nodes, instagramSharedConfirmationLabels))
+  };
+  return {
+    ...risk,
+    ok: risk.shareButton || risk.shareText || risk.progress || risk.submitted
+  };
+}
+
+function hasInstagramLoadingOnly(nodes = []) {
+  const labels = summarizeVisibleLabels(nodes, 8);
+  if (!labels.length) return false;
+  return labels.every((label) => /^loading(?:…|\.\.\.)?$/i.test(String(label).trim()));
+}
+
+function summarizeVisibleLabels(nodes = [], limit = 40) {
+  return Array.from(new Set(
+    nodes
+      .map((node) => String(node.text || node.desc || '').trim())
+      .filter(Boolean)
+  )).slice(0, limit);
+}
+
 async function selectInstagramFeedAlways(account, userId, target, nodes = []) {
   const steps = [];
   let currentNodes = nodes;
   let alwaysNode = findNodeInNodes(currentNodes, instagramResolverAlwaysLabels, { exact: true, preferBottomRight: true });
+  let onceNode = findNodeInNodes(currentNodes, instagramResolverOnceLabels, { exact: true, preferBottomRight: true });
 
-  if (!alwaysNode) {
+  if ((!onceNode || onceNode.enabled === false) && (!alwaysNode || alwaysNode.enabled === false)) {
     const feedNode = findNodeInNodes(currentNodes, instagramResolverFeedLabels, { exact: true });
     if (feedNode) {
       const feedPoint = {
@@ -3203,29 +4571,32 @@ async function selectInstagramFeedAlways(account, userId, target, nodes = []) {
       await delay(postStepDelay());
       currentNodes = await dumpVisibleNodes(target);
       alwaysNode = findNodeInNodes(currentNodes, instagramResolverAlwaysLabels, { exact: true, preferBottomRight: true });
+      onceNode = findNodeInNodes(currentNodes, instagramResolverOnceLabels, { exact: true, preferBottomRight: true });
     }
   }
 
-  if (!alwaysNode) {
-    await writeLog(userId, account._id, 'error', 'instagram_post_share_resolver_always_missing', 'Hộp chọn ứng dụng xuất hiện nhưng không tìm thấy nút ALWAYS.', {
+  const confirmNode = alwaysNode?.enabled !== false ? alwaysNode : onceNode;
+  if (!confirmNode || confirmNode.enabled === false) {
+    await writeLog(userId, account._id, 'error', 'instagram_post_share_resolver_confirm_missing', 'Hộp chọn ứng dụng xuất hiện nhưng không tìm thấy nút JUST ONCE/ALWAYS khả dụng.', {
       labels: currentNodes.map((node) => node.text || node.desc).filter(Boolean)
     });
     return {
       ok: false,
-      error: 'Không tìm thấy nút ALWAYS trong hộp chọn Instagram.',
+      error: 'Không tìm thấy nút JUST ONCE/ALWAYS khả dụng trong hộp chọn Instagram.',
       steps
     };
   }
 
   const point = {
-    x: Math.round((alwaysNode.left + alwaysNode.right) / 2),
-    y: Math.round((alwaysNode.top + alwaysNode.bottom) / 2)
+    x: Math.round((confirmNode.left + confirmNode.right) / 2),
+    y: Math.round((confirmNode.top + confirmNode.bottom) / 2)
   };
-  const always = await tapAndLog(userId, account._id, target, 'instagram_post_choose_feed_always', point);
-  steps.push(always);
-  await writeLog(userId, account._id, 'info', 'instagram_post_share_resolver_saved', 'Đã chọn Instagram Feed và ALWAYS để Android không hỏi lại.', {
-    bounds: alwaysNode,
-    point
+  const confirm = await tapAndLog(userId, account._id, target, 'instagram_post_choose_feed_confirm', point);
+  steps.push(confirm);
+  await writeLog(userId, account._id, 'info', 'instagram_post_share_resolver_confirmed', `Đã chọn Instagram Feed và ${confirmNode.label}.`, {
+    bounds: confirmNode,
+    point,
+    mode: confirmNode.label
   });
   return { ok: true, steps };
 }
@@ -3306,6 +4677,8 @@ async function verifyInstagramPostSubmit(account, userId, target, waitAfterSubmi
   let lastLoggedState = '';
   let lastStateLoggedAt = 0;
   let consecutiveCaptionStates = 0;
+  let sawSubmitting = false;
+  let submittingSince = 0;
   while (Date.now() < deadline) {
     await delay(650);
     const [foreground, nodes] = await Promise.all([
@@ -3322,6 +4695,15 @@ async function verifyInstagramPostSubmit(account, userId, target, waitAfterSubmi
     }
 
     const state = detectInstagramState(nodes, '');
+    if (sawSubmitting && state.name === 'unknown' && isInstagramPostSubmitClosedActivity(foreground.activityName)) {
+      const screenshot = await captureScreenshot(account, userId, 'instagram_post_submit_verified');
+      await writeLog(userId, account._id, 'info', 'instagram_post_submit_verified', 'Instagram đã xử lý Share và quay về màn chính sau khi gửi.', {
+        elapsedMs: Date.now() - startedAt,
+        foreground,
+        state
+      });
+      return { ok: true, reason: 'main_activity_after_share_progress', screenshot, composerPending: false, finalState: 'submitted' };
+    }
     if (state.name === 'caption') {
       consecutiveCaptionStates += 1;
       const elapsedMs = Date.now() - startedAt;
@@ -3333,7 +4715,7 @@ async function verifyInstagramPostSubmit(account, userId, target, waitAfterSubmi
         lastLoggedState = state.name;
         lastStateLoggedAt = elapsedMs;
       }
-      if (consecutiveCaptionStates >= 4 && elapsedMs >= 3_000) {
+      if (consecutiveCaptionStates >= 8 && elapsedMs >= 10_000) {
         return { ok: false, reason: 'still_on_share_screen', screenshot: null, composerPending: true, finalState: 'caption' };
       }
       continue;
@@ -3348,6 +4730,8 @@ async function verifyInstagramPostSubmit(account, userId, target, waitAfterSubmi
       return { ok: true, reason: 'share_confirmation_visible', screenshot, composerPending: false, finalState: 'submitted' };
     }
     if (state.name === 'submitting') {
+      sawSubmitting = true;
+      if (!submittingSince) submittingSince = Date.now();
       const elapsedMs = Date.now() - startedAt;
       if (lastLoggedState !== state.name || elapsedMs - lastStateLoggedAt >= 5_000) {
         await writeLog(userId, account._id, 'info', 'instagram_post_submit_waiting', 'Instagram đang xử lý sau khi bấm Share.', {
@@ -3356,6 +4740,15 @@ async function verifyInstagramPostSubmit(account, userId, target, waitAfterSubmi
         });
         lastLoggedState = state.name;
         lastStateLoggedAt = elapsedMs;
+      }
+      if (Date.now() - submittingSince >= instagramFastSubmitProgressMs) {
+        const screenshot = await captureScreenshot(account, userId, 'instagram_post_submit_progress_verified');
+        await writeLog(userId, account._id, 'info', 'instagram_post_submit_verified', 'Instagram đã nhận bài và đang upload; trả kết quả sớm để không chờ processing nền.', {
+          elapsedMs,
+          state,
+          fastSubmitProgressMs: instagramFastSubmitProgressMs
+        });
+        return { ok: true, reason: 'share_progress_visible_fast_path', screenshot, composerPending: false, finalState: 'submitted' };
       }
       continue;
     }
@@ -3375,6 +4768,15 @@ async function verifyInstagramPostSubmit(account, userId, target, waitAfterSubmi
     dumpVisibleNodes(target)
   ]);
   const finalState = detectInstagramState(finalNodes, '');
+  if (sawSubmitting && finalState.name === 'unknown' && isInstagramPostSubmitClosedActivity(finalForeground.activityName)) {
+    const screenshot = await captureScreenshot(account, userId, 'instagram_post_submit_verified');
+    await writeLog(userId, account._id, 'info', 'instagram_post_submit_verified', 'Instagram đã xử lý Share và quay về màn chính ở bước kiểm tra cuối.', {
+      elapsedMs: Date.now() - startedAt,
+      foreground: finalForeground,
+      state: finalState
+    });
+    return { ok: true, reason: 'main_activity_after_share_progress_final_check', screenshot, composerPending: false, finalState: 'submitted' };
+  }
   if (finalState.name === 'caption') {
     const screenshot = await captureScreenshot(account, userId, 'instagram_post_submit_unverified');
     await writeLog(userId, account._id, 'warn', 'instagram_post_submit_unverified', 'Đã bấm Share nhưng Instagram vẫn còn ở màn Share.', {
@@ -3516,8 +4918,8 @@ async function openFacebookComposer(account, userId, target, config, text, media
     return { ...shareIntent, method: primaryMedia ? `${mediaKind}_share_intent` : 'text_share_intent' };
   }
 
-  if (mediaKind === 'video' && primaryMedia?.remotePath) {
-    const genericShare = await openFacebookGenericShareComposer(account, userId, target, config, intentArgs, 'video');
+  if (primaryMedia?.remotePath || !primaryMedia) {
+    const genericShare = await openFacebookGenericShareComposer(account, userId, target, config, intentArgs, mediaKind);
     if (genericShare.ok) return genericShare;
   }
 
@@ -3656,8 +5058,9 @@ async function openFacebookGenericShareComposer(account, userId, target, config,
       mediaKind
     }
   );
+  const hasMediaStream = genericArgs.includes('android.intent.extra.STREAM');
   return genericShare.ok
-    ? { ...genericShare, method: `${mediaKind}_share_intent`, generic: true }
+    ? { ...genericShare, method: hasMediaStream ? `${mediaKind}_share_intent` : 'text_share_intent', generic: true }
     : genericShare;
 }
 
@@ -4227,6 +5630,8 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
   const steps = [];
   const mediaKind = options.mediaKind === 'video' ? 'video' : 'image';
   let recoveredEmptyUiOnce = false;
+  let recoveredEmptyUiInputOnce = false;
+  let unknownStateStreak = 0;
   let textEntered = false;
   let attachedImageCount = options.imageSharedByIntent && images.length ? 1 : 0;
   const imageCount = images.length;
@@ -4252,9 +5657,11 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
     const state = await resolveFacebookOpenState(target, await detectFacebookState(target, text));
     if (state.hasTargetText) textEntered = true;
     finalState = state.name;
+    unknownStateStreak = state.name === 'unknown' ? unknownStateStreak + 1 : 0;
     await writeLog(userId, account._id, 'info', 'facebook_post_state', `Facebook state: ${state.name}.`, {
       attempt,
       reason: state.reason,
+      unknownStateStreak,
       hasAttachedImage: Boolean(state.hasAttachedImage),
       observedText: state.observedText || ''
     });
@@ -4271,6 +5678,28 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
 
     if (state.name === 'unknown' && state.reason === 'no_uiautomator_nodes') {
       await assertDeviceConnected(target, 'trong lúc điều khiển Facebook');
+      if (!textEntered && !recoveredEmptyUiInputOnce) {
+        recoveredEmptyUiInputOnce = true;
+        const input = await inputAndLog(userId, account._id, target, 'facebook_post_input_text_empty_ui_fallback', text);
+        steps.push(input);
+        if (input.ok) {
+          textEntered = true;
+          await writeLog(
+            userId,
+            account._id,
+            'warn',
+            'facebook_post_empty_ui_input_fallback',
+            'UIAutomator chưa trả node sau khi mở editor; đã nhập text trực tiếp vào focus hiện tại.',
+            { attempt, input }
+          );
+          await delay(postStepDelay(1.25));
+          const done = await tapAndLog(userId, account._id, target, 'facebook_post_done_empty_ui_fallback', { x: 846, y: 72 });
+          steps.push(done);
+          await delay(postStepDelay(1.5));
+          invalidateUiDump(target);
+          continue;
+        }
+      }
       if (recoveredEmptyUiOnce) {
         screenshot = await captureScreenshot(account, userId, 'facebook_ui_nodes_unavailable');
         throw new Error('Facebook hoặc System UI không phản hồi trên LDPlayer. Đã dừng sớm để tránh workflow chạy treo.');
@@ -4289,6 +5718,34 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
         throw new Error(healthy.error || 'System UI của LDPlayer chưa ổn định.');
       }
       continue;
+    }
+
+    if (state.name === 'unknown' && unknownStateStreak >= 3) {
+      const foreground = await getForegroundAndroidPackage(target);
+      if (foreground.packageName === config.appPackage) {
+        screenshot = await captureScreenshot(account, userId, 'facebook_post_unknown_state_fast_stop');
+        await writeLog(
+          userId,
+          account._id,
+          'warn',
+          'facebook_post_unknown_state_fast_stop',
+          'Facebook vẫn ở foreground nhưng state machine không nhận diện được màn hình sau nhiều lần; dừng sớm để không kẹt batch.',
+          {
+            attempt,
+            reason: state.reason,
+            openMethod: options.openMethod || '',
+            foreground
+          }
+        );
+        return {
+          finalState,
+          screenshot,
+          steps,
+          composerPending: true,
+          submitVerified: false,
+          submitReason: 'unknown_state_fast_stop'
+        };
+      }
     }
 
     if (state.name === 'blocked') {
@@ -4661,7 +6118,13 @@ async function buildSubmitTapAttempts(target) {
   const nodes = await dumpVisibleNodes(target);
   const submitNode = findSemanticSubmitButton(nodes);
   if (!submitNode) {
-    throw new Error('Không nhận diện được nút Đăng/Post trên màn hình Facebook.');
+    const size = await getDeviceScreenSize(target);
+    const width = size?.width || 900;
+    return [
+      { method: 'fallback_top_right_primary', point: { x: Math.round(width - 52), y: 72 } },
+      { method: 'fallback_top_right_secondary', point: { x: Math.round(width - 110), y: 72 } },
+      { method: 'fallback_top_right_lower', point: { x: Math.round(width - 52), y: 145 } }
+    ];
   }
 
   const submitPoint = submitNode
@@ -5448,8 +6911,8 @@ async function tapAndLog(userId, accountId, target, action, point = {}) {
       await runCommand(env.mobileAutomation.adbPath, ['disconnect', target], { timeoutMs: 10_000 });
       await runCommand(env.mobileAutomation.adbPath, ['connect', target], { timeoutMs: 10_000 });
     }
-    for (let attempt = 1; attempt <= 4; attempt += 1) {
-      await delay(attempt === 1 ? 700 : 1200);
+    for (let attempt = 1; attempt <= 10; attempt += 1) {
+      await delay(attempt === 1 ? 700 : 1500);
       const state = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'get-state'], { timeoutMs: 10_000 });
       if (!state.ok || String(state.stdout || '').trim() !== 'device') continue;
       const retry = await runCommand(env.mobileAutomation.adbPath, args, { timeoutMs: 10_000 });
@@ -5715,6 +7178,8 @@ function findNodeInNodes(nodes, labels, options = {}) {
       if (!matched) continue;
 
       const match = { ...node.bounds, label, text: node.text, desc: node.desc };
+      match.enabled = node.enabled;
+      match.clickable = node.clickable;
       if (!options.preferBottomRight) return match;
       matches.push(match);
     }
@@ -5868,12 +7333,65 @@ async function inputDeviceText(target, text, options = {}) {
   const pasteResult = await inputWithClipboardPaste(target, value);
   if (pasteResult.ok) return { ...pasteResult, method: 'clipboard_paste_ascii_first' };
 
-  const fallback = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'input', 'text', cleanText(value)]);
+  const fallback = await runAdbInputTextWithRetry(target, cleanText(value));
   return {
     ...fallback,
     method: shouldUseUnicodePath ? 'input_text_ascii_fallback' : 'input_text',
     unicodeFallback: shouldUseUnicodePath
   };
+}
+
+async function runAdbInputTextWithRetry(target, text) {
+  const args = ['-s', target, 'shell', 'input', 'text', text];
+  let result = await runCommand(env.mobileAutomation.adbPath, args);
+  const firstError = result.error || result.stderr || '';
+  if (!result.ok && isTransientAdbFailure(firstError)) {
+    await runCommand(env.mobileAutomation.adbPath, ['start-server'], { timeoutMs: 10_000 });
+    for (let attempt = 1; attempt <= 10; attempt += 1) {
+      await delay(attempt === 1 ? 700 : 1500);
+      const state = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'get-state'], { timeoutMs: 10_000 });
+      if (!state.ok || String(state.stdout || '').trim() !== 'device') continue;
+      const retry = await runCommand(env.mobileAutomation.adbPath, args);
+      result = { ...retry, retried: true, retryAttempt: attempt, firstError };
+      if (retry.ok || !isTransientAdbFailure(retry.error || retry.stderr || '')) break;
+    }
+  }
+  return result;
+}
+
+async function clearFocusedTextWithDeleteKey(target, count = 80) {
+  await runAdbKeyEventWithRetry(target, '123');
+  let lastResult = { ok: true };
+  for (let index = 0; index < count; index += 1) {
+    lastResult = await runAdbKeyEventWithRetry(target, '67');
+    if (!lastResult.ok) break;
+    if (index % 20 === 19) await delay(80);
+  }
+  invalidateUiDump(target);
+  return {
+    ...lastResult,
+    ok: Boolean(lastResult.ok),
+    method: 'keyevent_delete_clear',
+    deleteCount: count
+  };
+}
+
+async function runAdbKeyEventWithRetry(target, keyCode) {
+  const args = ['-s', target, 'shell', 'input', 'keyevent', String(keyCode)];
+  let result = await runCommand(env.mobileAutomation.adbPath, args, { timeoutMs: 5_000 });
+  const firstError = result.error || result.stderr || '';
+  if (!result.ok && isTransientAdbFailure(firstError)) {
+    await runCommand(env.mobileAutomation.adbPath, ['start-server'], { timeoutMs: 10_000 });
+    for (let attempt = 1; attempt <= 10; attempt += 1) {
+      await delay(attempt === 1 ? 700 : 1500);
+      const state = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'get-state'], { timeoutMs: 10_000 });
+      if (!state.ok || String(state.stdout || '').trim() !== 'device') continue;
+      const retry = await runCommand(env.mobileAutomation.adbPath, args, { timeoutMs: 5_000 });
+      result = { ...retry, retried: true, retryAttempt: attempt, firstError };
+      if (retry.ok || !isTransientAdbFailure(retry.error || retry.stderr || '')) break;
+    }
+  }
+  return result;
 }
 
 async function inputUnicodeText(target, text, options = {}) {
@@ -5956,10 +7474,12 @@ async function inputWithAdbKeyboard(target, text) {
   return { ...broadcast, method: 'adb_keyboard' };
 }
 
-async function restoreInputMethod(target, ime) {
+async function restoreInputMethod(target, ime, options = {}) {
   if (!ime || ime === 'com.android.adbkeyboard/.AdbIME') return null;
   const restored = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'ime', 'set', ime], { timeoutMs: 10_000 });
-  await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'input', 'keyevent', '4'], { timeoutMs: 3_000 });
+  if (options.dismissKeyboard) {
+    await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'input', 'keyevent', '4'], { timeoutMs: 3_000 });
+  }
   return restored;
 }
 

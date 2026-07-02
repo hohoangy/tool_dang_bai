@@ -1,12 +1,13 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
-import { AlertTriangle, BarChart3, CalendarClock, CheckCircle2, ChevronLeft, ChevronRight, Clock3, Eye, FileText, Gauge, Home, Image, Keyboard, ListChecks, Loader2, LogOut, Moon, MousePointer2, Play, RefreshCcw, Save, Send, ShieldCheck, Smartphone, Sparkles, Sun, Terminal, Timer, Trash2, Undo2, Users, Video, Wifi, XCircle, Zap } from 'lucide-vue-next';
+import { AlertTriangle, BarChart3, CalendarClock, CheckCircle2, ChevronLeft, ChevronRight, Clock3, Eye, FileText, Gauge, Home, Image, Instagram as InstagramIcon, Keyboard, ListChecks, Loader2, LogOut, Moon, MousePointer2, Play, RefreshCcw, Save, Send, ShieldCheck, Smartphone, Sparkles, Sun, Terminal, Timer, Trash2, Undo2, Users, Video, Wifi, XCircle, Zap } from 'lucide-vue-next';
 import { http } from '../api/http';
 import BaseCard from '../components/BaseCard.vue';
 import FacebookActivityIcon from '../components/FacebookActivityIcon.vue';
 import { useAuthStore } from '../stores/auth';
 import { useUiStore } from '../stores/ui';
+import { activeLdPlayerSlots, getLdPlayerSlot, isActiveLdPlayerAccount } from '../utils/ldplayer-account';
 
 const ui = useUiStore();
 const auth = useAuthStore();
@@ -57,7 +58,7 @@ const maxInstagramAlbumPhotos = 10;
 const maxVideoSizeMb = 100;
 const draftStorageKey = 'socialpilot-platform-composer-drafts';
 const platformDraftStoragePrefix = `${draftStorageKey}-`;
-const runtimeStatusIntervalMs = 5_000;
+const runtimeStatusIntervalMs = 15_000;
 const runtimeStatusMissLimit = 3;
 let runtimeStatusTimer = null;
 let runtimeStatusRequestId = 0;
@@ -73,50 +74,49 @@ const platforms = [
     packageName: 'com.facebook.katana',
     status: 'ready',
     description: 'Mo composer, nhap text, gan anh va dang truc tiep bang Facebook app trong LDPlayer.'
+  },
+  {
+    id: 'instagram',
+    label: 'Instagram',
+    iconLabel: '◎',
+    iconClass: 'bg-gradient-to-br from-[#F58529] via-[#DD2A7B] to-[#8134AF] text-white',
+    packageName: 'com.instagram.android',
+    status: 'ready',
+    description: 'Dang anh don hoac album qua Instagram app trong LDPlayer.'
   }
 ];
 
+const defaultLoginSteps = {
+  usernameTap: { x: 540, y: 760 },
+  passwordTap: { x: 540, y: 900 },
+  submitTap: { x: 540, y: 1060 }
+};
+
+function createDefaultMobileAccount(platform, index = 1) {
+  const platformLabel = platform === 'instagram' ? 'Instagram' : 'Facebook';
+  const appPackage = platform === 'instagram' ? 'com.instagram.android' : 'com.facebook.katana';
+  const instanceName = index === 1 ? 'LDPlayer' : `LDPlayer-${index - 1}`;
+  return {
+    platform,
+    displayName: `${platformLabel} Account ${String(index).padStart(2, '0')}`,
+    accountHandle: '',
+    instanceName,
+    adbHost: '',
+    deviceId: `emulator-${5554 + ((index - 1) * 2)}`,
+    status: 'ready',
+    notes: `Default LDPlayer profile ${index} for direct ${platformLabel} posting tests.`,
+    metadata: {
+      appPackage,
+      username: '',
+      password: '',
+      loginSteps: defaultLoginSteps
+    }
+  };
+}
+
 const defaultMobileAccounts = {
-  facebook: {
-    platform: 'facebook',
-    displayName: 'Facebook Account 01',
-    accountHandle: '',
-    instanceName: 'LDPlayer',
-    adbHost: '',
-    deviceId: 'emulator-5554',
-    status: 'ready',
-    notes: 'Default LDPlayer profile for direct Facebook posting tests.',
-    metadata: {
-      appPackage: 'com.facebook.katana',
-      username: '',
-      password: '',
-      loginSteps: {
-        usernameTap: { x: 540, y: 760 },
-        passwordTap: { x: 540, y: 900 },
-        submitTap: { x: 540, y: 1060 }
-      }
-    }
-  },
-  instagram: {
-    platform: 'instagram',
-    displayName: 'Instagram Account 01',
-    accountHandle: '',
-    instanceName: 'LDPlayer',
-    adbHost: '',
-    deviceId: 'emulator-5554',
-    status: 'ready',
-    notes: 'Default LDPlayer profile for direct Instagram posting tests.',
-    metadata: {
-      appPackage: 'com.instagram.android',
-      username: '',
-      password: '',
-      loginSteps: {
-        usernameTap: { x: 540, y: 760 },
-        passwordTap: { x: 540, y: 900 },
-        submitTap: { x: 540, y: 1060 }
-      }
-    }
-  }
+  facebook: activeLdPlayerSlots.map((index) => createDefaultMobileAccount('facebook', index)),
+  instagram: activeLdPlayerSlots.map((index) => createDefaultMobileAccount('instagram', index))
 };
 
 const post = reactive({
@@ -308,8 +308,7 @@ const facebookActivityLabel = computed(() => {
   if (posting.value) return `Đang đăng bài lên ${selectedPlatform.value.label}`;
   return '';
 });
-const showFacebookActivityOverlay = computed(() => selectedPlatformId.value === 'facebook'
-  && (facebookOpening.value || posting.value || queueRunning.value));
+const showFacebookActivityOverlay = computed(() => facebookOpening.value || posting.value || queueRunning.value);
 const facebookSessionStatusLabel = computed(() => {
   if (facebookRuntimeWaiting.value) return `Đang chờ ${formatInstanceLabel(selectedAccount.value)}`;
   if (facebookAppInForeground.value) return `Đang mở ${selectedPlatform.value.label}`;
@@ -519,6 +518,9 @@ const operationalPostRunActions = new Set([
   'instagram_post_submit_unverified',
   'instagram_post_caption_missing_before_submit',
   'instagram_post_state_machine_pending',
+  'instagram_post_album_unsupported_fast_stop',
+  'instagram_post_album_native_failed',
+  'instagram_post_failed_cleanup',
   'instagram_post_failed'
 ]);
 const recentPostRuns = computed(() => latestLogs.value
@@ -609,6 +611,18 @@ const postRunActionLabels = {
     title: 'Chưa tới được màn đăng Feed',
     detail: 'Automation chưa đưa Instagram về đúng trạng thái đăng trang cá nhân/feed.'
   },
+  instagram_post_album_unsupported_fast_stop: {
+    title: 'Album Instagram chưa hỗ trợ trên LD này',
+    detail: 'Android trong LDPlayer không hỗ trợ SEND_MULTIPLE cho nhiều ảnh; tool đã dừng sớm để giữ ADB ổn định.'
+  },
+  instagram_post_album_native_failed: {
+    title: 'Album Instagram chưa mở được',
+    detail: 'Luồng Home/Create Album chưa ổn định trên LDPlayer hiện tại.'
+  },
+  instagram_post_failed_cleanup: {
+    title: 'Đã dọn Instagram sau lỗi',
+    detail: 'Tool đã force-stop Instagram và kiểm tra ADB để chuẩn bị cho lượt chạy tiếp theo.'
+  },
   instagram_post_state: {
     title: 'Đang đọc trạng thái Instagram',
     detail: 'Tool đang nhận diện màn hình hiện tại.'
@@ -689,7 +703,7 @@ const queueStats = computed(() => {
 });
 const primaryActionLabel = computed(() => {
   if (queueRunning.value) return 'Đang đăng hàng loạt';
-  if (posting.value) return isReviewMode.value ? 'Đang kiểm tra' : 'Đang đăng Facebook';
+  if (posting.value) return isReviewMode.value ? 'Đang kiểm tra' : `Đang đăng ${selectedPlatform.value.label}`;
   if (isReviewMode.value) return 'Mở kiểm tra';
   if (isBulkMode.value) return `Bắt đầu đăng (${selectedQueueAccounts.value.length})`;
   if (isScheduleMode.value) return 'Lưu lịch';
@@ -848,7 +862,7 @@ async function load() {
 }
 
 function applyMobileAccounts(data) {
-  const nextAccounts = data.accounts || [];
+  const nextAccounts = (data.accounts || []).filter(isActiveLdPlayerAccount);
   accounts.value = nextAccounts;
   logs.value = data.logs || [];
   if (nextAccounts[0] && !nextAccounts.some((account) => account._id === selectedAccountId.value)) {
@@ -877,23 +891,19 @@ function formatInstanceLabel(account) {
     return `LDPlayer ${String(((emulatorIndex - 5554) / 2) + 1).padStart(2, '0')}`;
   }
   const instanceNumber = Number(account?.instanceName?.match(/-(\d+)$/)?.[1]);
-  if (Number.isInteger(instanceNumber)) return `LDPlayer ${String(instanceNumber).padStart(2, '0')}`;
+  if (Number.isInteger(instanceNumber)) return `LDPlayer ${String(instanceNumber + 1).padStart(2, '0')}`;
   return account?.instanceName === 'LDPlayer' ? 'LDPlayer 01' : (account?.instanceName || 'LDPlayer');
 }
 
 function getAccountOrder(account) {
-  const target = account?.deviceId || '';
-  const emulatorIndex = Number(target.match(/^emulator-(\d+)$/)?.[1]);
-  if (Number.isInteger(emulatorIndex) && emulatorIndex >= 5554) {
-    return ((emulatorIndex - 5554) / 2) + 1;
-  }
-  if (account?.instanceName === 'LDPlayer') return 1;
-  const instanceNumber = Number(account?.instanceName?.match(/-(\d+)$/)?.[1]);
-  return Number.isInteger(instanceNumber) ? instanceNumber : Number.MAX_SAFE_INTEGER;
+  return getLdPlayerSlot(account);
 }
 
 function formatAccountDisplayName(account) {
   const displayName = String(account?.displayName || '').trim();
+  if (account?.platform === 'instagram') {
+    return displayName || `Instagram Account ${String(getAccountOrder(account)).padStart(2, '0')}`;
+  }
   if (account?.platform !== 'facebook') return displayName || 'Profile chưa đặt tên';
 
   const accountNumber = displayName.match(/facebook\s*(?:account)?\s*0*(\d+)/i)?.[1]
@@ -913,11 +923,28 @@ function isAuthError(error) {
 }
 
 async function ensureDefaultProfile() {
-  if (accounts.value.some((account) => account.platform === selectedPlatformId.value)) return;
-  const { data } = await http.post('/mobile/accounts', defaultMobileAccounts[selectedPlatformId.value] || defaultMobileAccounts.facebook);
-  accounts.value = [data.account, ...accounts.value];
-  selectedAccountId.value = data.account._id;
-  ui.notify('Da tao LDPlayer profile mac dinh.');
+  const defaults = defaultMobileAccounts[selectedPlatformId.value] || defaultMobileAccounts.facebook;
+  const platformAccounts = accounts.value.filter((account) => account.platform === selectedPlatformId.value);
+  const existingTargets = new Set(platformAccounts.map((account) => account.deviceId || account.instanceName));
+  const missingDefaults = defaults.filter((account) => !existingTargets.has(account.deviceId) && !existingTargets.has(account.instanceName));
+  if (!missingDefaults.length) return;
+
+  const createdAccounts = [];
+  for (const account of missingDefaults) {
+    const { data } = await http.post('/mobile/accounts', account);
+    createdAccounts.push(data.account);
+  }
+  accounts.value = [...createdAccounts, ...accounts.value];
+  if (!selectedAccountId.value || !accounts.value.some((account) => account._id === selectedAccountId.value)) {
+    selectedAccountId.value = createdAccounts[0]?._id || '';
+  }
+  if (!selectedQueueAccountIds.value.length) {
+    selectedQueueAccountIds.value = accounts.value
+      .filter((account) => account.platform === selectedPlatformId.value)
+      .slice(0, 1)
+      .map((account) => account._id);
+  }
+  ui.notify(`Đã tạo thêm ${createdAccounts.length} profile ${selectedPlatform.value.label}.`);
 }
 
 async function remoteLaunch() {
@@ -1019,7 +1046,7 @@ async function waitForSelectedAccountRuntimeReady(accountId, attempts = 4) {
 
 async function syncSelectedAccountRuntimeStatus(options = {}) {
   const account = selectedAccount.value;
-  if (!account || posting.value || queueRunning.value) return false;
+  if (!account || facebookOpening.value || posting.value || queueRunning.value) return false;
   if (runtimeStatusChecking.value) {
     return Boolean(
       selectedRuntimeStatus.value?.deviceReady
@@ -1189,7 +1216,7 @@ async function runPostWorkflow() {
   try {
     workflowStage.value = 'preflight';
     workflowStage.value = 'posting';
-    const { data } = await submitFacebookForAccount(
+    const { data } = await submitPostForAccount(
       selectedAccount.value,
       !isReviewMode.value,
       submitWaitMs.value
@@ -1213,7 +1240,8 @@ async function runPostWorkflow() {
     await load();
   } catch (error) {
     workflowStage.value = 'failed';
-    ui.notify(error.message, 'error');
+    ui.notify(getHttpErrorMessage(error), 'error');
+    await load();
   } finally {
     posting.value = false;
   }
@@ -1268,7 +1296,7 @@ async function runQueueWorkflow() {
             ? `Đang đăng và chờ tải ${uploadedPhotoCount.value} ảnh`
             : 'Đang đăng bài'
         });
-        const { data } = await submitFacebookForAccount(account, true, queueSubmitWaitMs);
+        const { data } = await submitPostForAccount(account, true, queueSubmitWaitMs);
         postResult.value = data.result;
         screenshot.value = data.result.screenshot || screenshot.value;
 
@@ -1360,7 +1388,7 @@ async function prepareQueueEnvironment() {
   await wait(100);
 }
 
-async function submitFacebookForAccount(account, autoSubmit, waitAfterSubmitMs = 0) {
+async function submitPostForAccount(account, autoSubmit, waitAfterSubmitMs = 0) {
   const uniqueImages = Array.from(
     new Map(
       post.media
@@ -1373,9 +1401,10 @@ async function submitFacebookForAccount(account, autoSubmit, waitAfterSubmitMs =
     .slice(0, 1);
   const publishImages = isFacebookVideoMode.value
     ? []
-    : await prepareFacebookPublishImages(uniqueImages);
+    : await preparePlatformPublishImages(uniqueImages);
+  const publishEndpoint = selectedPlatformId.value === 'instagram' ? 'instagram' : 'facebook';
 
-  return http.post(`/mobile/accounts/${account._id}/facebook/post`, {
+  return http.post(`/mobile/accounts/${account._id}/${publishEndpoint}/post`, {
     text: finalPostText.value.trim(),
     appPackage: selectedPlatform.value.packageName,
     autoSubmit,
@@ -1398,11 +1427,11 @@ async function submitFacebookForAccount(account, autoSubmit, waitAfterSubmitMs =
   });
 }
 
-async function prepareFacebookPublishImages(images) {
-  // Facebook native album layout is controlled by upload order, not by an
-  // editable layout API. Keep every uploaded image separate and send them in
-  // the same order the user arranged in the composer. This avoids turning a
-  // multi-photo post into one flattened collage image.
+async function preparePlatformPublishImages(images) {
+  // Facebook/Instagram native album layout is controlled by upload order, not
+  // by an editable layout API. Keep every uploaded image separate and send
+  // them in the same order the user arranged in the composer. This avoids
+  // turning a multi-photo post into one flattened collage image.
   return images;
 }
 
@@ -2067,6 +2096,13 @@ function formatDate(value) {
   return new Intl.DateTimeFormat('vi-VN', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(value));
 }
 
+function getHttpErrorMessage(error) {
+  return error?.response?.data?.error?.message
+    || error?.response?.data?.message
+    || error?.message
+    || 'Workflow trả lỗi chưa xác định.';
+}
+
 function formatPostRun(log) {
   const mapped = postRunActionLabels[log.action];
   if (log.action === 'facebook_post_finished' && log.level !== 'info') {
@@ -2210,7 +2246,7 @@ watch(selectedPlatformId, async () => {
           class="w-full max-w-md rounded-2xl border border-white/10 bg-zinc-950/95 p-5 text-white shadow-2xl"
         >
           <div class="flex items-center gap-3">
-            <FacebookActivityIcon size="md" />
+            <FacebookActivityIcon size="md" :platform="selectedPlatformId" />
             <div class="min-w-0 flex-1">
               <div class="flex items-center justify-between gap-3">
                 <p class="truncate text-sm font-black">{{ queueOverlayTitle }}</p>
@@ -2255,7 +2291,7 @@ watch(selectedPlatformId, async () => {
           </div>
         </div>
         <div v-else class="flex min-w-64 flex-col items-center rounded-2xl border border-white/10 bg-zinc-950/90 px-8 py-7 text-center text-white shadow-2xl">
-          <FacebookActivityIcon size="lg" />
+          <FacebookActivityIcon size="lg" :platform="selectedPlatformId" />
           <p class="mt-5 text-base font-black">{{ facebookActivityLabel }}</p>
           <p class="mt-1 text-xs text-zinc-400">Vui lòng giữ nguyên cửa sổ trong khi hệ thống xử lý</p>
           <div class="mt-5 h-1 w-36 overflow-hidden rounded-full bg-white/10">
@@ -2293,7 +2329,8 @@ watch(selectedPlatformId, async () => {
                 platform.iconClass
               ]"
             >
-              {{ platform.iconLabel }}
+              <InstagramIcon v-if="platform.id === 'instagram'" class="h-4 w-4" />
+              <template v-else>{{ platform.iconLabel }}</template>
             </span>
             <span>{{ platform.label }}</span>
           </button>
@@ -2951,7 +2988,7 @@ watch(selectedPlatformId, async () => {
                     maxlength="100"
                     placeholder="Ví dụ: Khuyến mãi cuối tuần"
                   />
-                  <span class="mt-1 block text-[11px] text-zinc-500">Chỉ dùng để nhận diện trong công cụ, không đăng lên Facebook.</span>
+                  <span class="mt-1 block text-[11px] text-zinc-500">Chỉ dùng để nhận diện trong công cụ, không đăng lên {{ selectedPlatform.label }}.</span>
                 </label>
 
                 <div v-if="selectedPlatformId === 'facebook'" class="flex flex-wrap items-center border-b border-zinc-200 pb-3 dark:border-zinc-700">
@@ -3021,7 +3058,7 @@ watch(selectedPlatformId, async () => {
 
                 <div v-if="post.media.length" class="space-y-3">
                   <div
-                    v-if="selectedPlatformId === 'facebook' && canArrangePhotos"
+                    v-if="canArrangePhotos"
                     class="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-2.5 dark:border-zinc-700 dark:bg-zinc-900"
                   >
                     <div class="flex min-w-0 items-center gap-2.5">
@@ -3029,12 +3066,16 @@ watch(selectedPlatformId, async () => {
                         <ListChecks class="h-4 w-4" />
                       </span>
                       <div class="min-w-0">
-                        <p class="text-xs font-black text-zinc-800 dark:text-zinc-100">Sắp xếp ảnh Facebook</p>
-                        <p class="truncate text-[11px] text-zinc-500">Kéo ảnh để đổi thứ tự · Preview mô phỏng bố cục Facebook</p>
+                        <p class="text-xs font-black text-zinc-800 dark:text-zinc-100">
+                          {{ selectedPlatformId === 'instagram' ? 'Sắp xếp album Instagram' : 'Sắp xếp ảnh Facebook' }}
+                        </p>
+                        <p class="truncate text-[11px] text-zinc-500">
+                          {{ selectedPlatformId === 'instagram' ? 'Kéo ảnh để đổi thứ tự carousel · Instagram sẽ đăng album native' : 'Kéo ảnh để đổi thứ tự · Preview mô phỏng bố cục Facebook' }}
+                        </p>
                       </div>
                     </div>
                     <span class="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-[11px] font-black text-emerald-600 dark:text-emerald-300">
-                      {{ previewPhotos.length }} ảnh native
+                      {{ previewPhotos.length }} {{ selectedPlatformId === 'instagram' ? 'ảnh album' : 'ảnh native' }}
                     </span>
                   </div>
                   <div

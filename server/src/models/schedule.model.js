@@ -43,9 +43,19 @@ export const Schedule = createModel({
   },
   async populate(rows, field) {
     if (field !== 'postId') return rows;
-    return Promise.all(rows.map(async (schedule) => {
-      schedule.postId = await Post.findById(schedule.postId);
+    const postIds = Array.from(new Set(
+      rows
+        .map((schedule) => typeof schedule.postId === 'object' ? schedule.postId?._id : schedule.postId)
+        .filter(Boolean)
+    ));
+    if (!postIds.length) return rows;
+
+    const posts = await Post.find({ _id: { $in: postIds } });
+    const postsById = new Map(posts.map((post) => [post._id, post]));
+    return rows.map((schedule) => {
+      const postId = typeof schedule.postId === 'object' ? schedule.postId?._id : schedule.postId;
+      schedule.postId = postsById.get(postId) || null;
       return schedule;
-    }));
+    });
   }
 });

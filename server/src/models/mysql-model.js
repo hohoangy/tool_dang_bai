@@ -75,8 +75,13 @@ class QueryBuilder {
       limit: this.limitValue
     });
 
-    if (this.populateField && !this.single) {
-      result = await this.model.populate(result, this.populateField);
+    if (this.populateField && result) {
+      if (this.single) {
+        const [populated] = await this.model.populate([result], this.populateField);
+        result = populated || null;
+      } else {
+        result = await this.model.populate(result, this.populateField);
+      }
     }
 
     result = applySelect(result, this.selectSpec);
