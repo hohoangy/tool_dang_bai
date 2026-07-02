@@ -101,7 +101,13 @@ const addMorePhotoLabels = [
 ];
 const galleryPermissionLabels = ['Cho phép truy cập', 'Allow access'];
 const galleryNextLabels = ['Tiếp', 'Next', 'Xong', 'Done'];
-const selectedImageLabels = ['Ảnh chụp vào ngày', 'Photo taken on'];
+const selectedImageLabels = [
+  'Ảnh chụp vào ngày',
+  'Ảnh, mục',
+  'chụp vào ngày',
+  'Photo taken on',
+  'Photo, item'
+];
 const attachedImageLabels = ['Gỡ ảnh', 'Chỉnh sửa ảnh', 'mở rộng ảnh', 'Remove photo', 'Edit photo', 'expand photo'];
 const attachedVideoLabels = ['Video', 'Sửa video', 'Gỡ video', 'Edit video', 'Remove video'];
 const attachedMediaLabels = [...attachedImageLabels, ...attachedVideoLabels];
@@ -5822,6 +5828,14 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
         continue;
       }
 
+      const repaired = await repairFacebookCaptionIfNeeded(account, userId, target, text, state);
+      if (repaired.changed) {
+        steps.push(...repaired.steps);
+        textEntered = true;
+        await delay(postStepDelay(1.25));
+        continue;
+      }
+
       if (!config.autoSubmit) {
         screenshot = await captureScreenshot(account, userId, 'facebook_post_ready_to_post');
         return { finalState, screenshot, steps, composerPending: false };
@@ -5887,6 +5901,14 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
           continue;
         }
 
+        const repaired = await repairFacebookCaptionIfNeeded(account, userId, target, text, state);
+        if (repaired.changed) {
+          steps.push(...repaired.steps);
+          textEntered = true;
+          await delay(postStepDelay(1.25));
+          continue;
+        }
+
         if (!config.autoSubmit) {
           screenshot = await captureScreenshot(account, userId, 'facebook_post_composer_ready');
           return { finalState, screenshot, steps, composerPending: false };
@@ -5939,6 +5961,83 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
     finalState
   });
   return { finalState, screenshot, steps, composerPending: true };
+}
+
+async function repairFacebookCaptionIfNeeded(account, userId, target, text, state = {}) {
+  const expected = cleanClipboardText(text).trim();
+  if (!expected) return { changed: false, steps: [] };
+
+  const nodes = await dumpVisibleNodes(target);
+  const verification = verifyCompleteCaption(nodes, expected);
+  if (verification.ok) return { changed: false, steps: [], verification };
+
+  const steps = [];
+  const textNode = findFacebookComposerTextNode(nodes, state);
+  const focusPoint = textNode
+    ? {
+      x: Math.round((textNode.left + textNode.right) / 2),
+      y: Math.round((textNode.top + textNode.bottom) / 2)
+    }
+    : { x: 450, y: 385 };
+
+  const focus = await tapAndLog(userId, account._id, target, 'facebook_post_repair_caption_focus', focusPoint);
+  steps.push(focus);
+  await delay(postStepDelay(1.1));
+
+  const replace = await replaceFocusedText(target, expected);
+  await writeLog(
+    userId,
+    account._id,
+    replace.ok ? 'info' : 'error',
+    'facebook_post_repair_caption',
+    replace.ok ? 'Đã nhập lại caption bằng Unicode-safe input.' : 'Không nhập lại được caption Unicode.',
+    {
+      ...replace,
+      verification,
+      focusPoint,
+      textNode
+    }
+  );
+  steps.push(replace);
+  if (!replace.ok) throw new Error(replace.error || replace.stderr || 'Không nhập lại được caption Unicode.');
+
+  await delay(postStepDelay(1.1));
+  const editorState = await detectFacebookState(target, expected);
+  if (editorState.name === 'text_editor') {
+    const done = await tapTextOrPoint(account, userId, target, doneLabels, { x: 846, y: 72 }, 'facebook_post_done_repaired_caption', { exact: true });
+    steps.push(done);
+    await delay(postStepDelay(1.25));
+  }
+
+  const repairedNodes = await dumpVisibleNodes(target);
+  const repairedVerification = verifyCompleteCaption(repairedNodes, expected);
+  await writeLog(
+    userId,
+    account._id,
+    repairedVerification.ok ? 'info' : 'warn',
+    'facebook_post_repair_caption_verified',
+    repairedVerification.ok ? 'Đã xác nhận caption Unicode đúng sau khi nhập lại.' : 'Caption vẫn chưa khớp hoàn toàn sau khi nhập lại.',
+    repairedVerification
+  );
+
+  return {
+    changed: true,
+    steps,
+    verification: repairedVerification
+  };
+}
+
+function findFacebookComposerTextNode(nodes = [], state = {}) {
+  const editText = nodes.find((node) => node.className.includes('EditText') && normalizeSearchText(node.text));
+  if (editText) return { ...editText.bounds, text: editText.text, desc: editText.desc, className: editText.className };
+
+  const observed = normalizeSearchText(state.observedText || '');
+  if (observed) {
+    const match = nodes.find((node) => normalizeSearchText(`${node.text} ${node.desc}`).includes(observed));
+    if (match) return { ...match.bounds, text: match.text, desc: match.desc, className: match.className };
+  }
+
+  return null;
 }
 
 async function waitForFacebookMediaComposer(target, text, mediaKind = 'image', timeoutMs = 12_000) {
@@ -6593,6 +6692,13 @@ async function attachFacebookImages(account, userId, target, imageCount = 1, tex
     }
 
     imageMatch = await waitForAnyText(target, selectedImageLabels, openAttempt === 1 ? 10_000 : 7_000);
+    if (!imageMatch) {
+      const nodes = await dumpVisibleNodes(target);
+      const cells = getGalleryImageCells(nodes);
+      if (cells.length) {
+        imageMatch = cells[0];
+      }
+    }
     if (!imageMatch && openAttempt < 3) {
       const composerGallery = await findVisibleTextBounds(target, openGalleryLabels, { exact: true });
       const pickerAlreadyOpen = composerGallery && composerGallery.top < 300;
@@ -6824,6 +6930,15 @@ async function detectFacebookState(target, text, existingNodes = null) {
   }
   if (findNodeInNodes(nodes, loginBlockLabels)) return { name: 'blocked', reason: 'login_or_checkpoint', hasTargetText };
 
+  if (isFacebookGalleryPicker(nodes)) {
+    return {
+      name: 'gallery_picker',
+      reason: 'gallery_cells_visible',
+      hasTargetText,
+      hasAttachedImage: false
+    };
+  }
+
   const doneNode = findNodeInNodes(nodes, doneLabels, { exact: true });
   const hasDone = Boolean(doneNode && doneNode.top < 180);
   const hasTextEditor = Boolean(findNodeInNodes(nodes, textEditorLabels));
@@ -6899,6 +7014,14 @@ async function detectFacebookState(target, text, existingNodes = null) {
   if (findNodeInNodes(nodes, facebookHomeLabels)) return { name: 'home', reason: 'home_navigation_visible', hasTargetText, hasAttachedImage };
 
   return { name: 'unknown', reason: 'no_known_labels', hasTargetText, hasAttachedImage };
+}
+
+function isFacebookGalleryPicker(nodes = []) {
+  const hasGalleryHeader = Boolean(
+    findNodeInNodes(nodes, ['Chọn album', ...galleryLabels])
+    || findNodeInNodes(nodes, postTitleLabels)
+  );
+  return hasGalleryHeader && getGalleryImageCells(nodes).length > 0;
 }
 
 async function tapAndLog(userId, accountId, target, action, point = {}) {
@@ -7214,7 +7337,7 @@ function screenHasText(nodes, text) {
 
 function verifyCompleteCaption(nodes, text) {
   const expected = cleanClipboardText(text).trim();
-  if (!expected) return { ok: true, missingText: [], missingHashtags: [], missingEmoji: [] };
+  if (!expected) return { ok: true, missingText: [], missingHashtags: [], missingEmoji: [], rawTextMatches: true };
 
   const rawHaystack = nodes
     .map((node) => `${node.text || ''} ${node.desc || ''}`)
@@ -7253,20 +7376,62 @@ function verifyCompleteCaption(nodes, text) {
     const compactPart = part.replace(/\s+/g, '');
     return !normalizedHaystack.includes(part) && !compactHaystack.includes(compactPart);
   });
+  const rawTextMatches = captionRawTextMatches(rawHaystack, expected);
+  const hasEncodingDamage = captionHasEncodingDamage(nodes, expected);
 
   return {
     ok: missingText.length === 0
       && missingHashtags.length === 0
       && missingEmoji.length === 0
-      && conflictingHashtags.length === 0,
+      && conflictingHashtags.length === 0
+      && rawTextMatches
+      && !hasEncodingDamage,
     missingText,
     missingHashtags,
     missingEmoji,
     conflictingHashtags,
     actualHashtags,
     expectedHashtagCount: hashtags.length,
-    expectedEmojiCount: emoji.length
+    expectedEmojiCount: emoji.length,
+    rawTextMatches,
+    hasEncodingDamage
   };
+}
+
+function captionHasEncodingDamage(nodes = [], expected = '') {
+  if (!hasUnicodeText(expected)) return false;
+  const expectedNormalized = normalizeSearchText(expected);
+  if (!expectedNormalized) return false;
+
+  return nodes.some((node) => {
+    const value = `${node.text || ''} ${node.desc || ''}`.trim();
+    if (!value || !/[�]/.test(value)) return false;
+    const normalized = normalizeSearchText(value);
+    return normalized.includes(expectedNormalized.slice(0, Math.min(18, expectedNormalized.length)))
+      || normalized.includes('#canarytest')
+      || normalized.includes('emoji')
+      || normalized.includes('canary review');
+  });
+}
+
+function captionRawTextMatches(rawHaystack = '', expected = '') {
+  const meaningfulParts = cleanClipboardText(expected)
+    .normalize('NFC')
+    .split(/\s*\n+\s*/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => part.replace(/\s+/g, ' '));
+  if (!meaningfulParts.length) return true;
+
+  const normalizedHaystack = String(rawHaystack || '')
+    .normalize('NFC')
+    .replace(/\uFE0F/g, '')
+    .replace(/\s+/g, ' ');
+
+  return meaningfulParts.every((part) => {
+    const withoutVariationSelectors = part.replace(/\uFE0F/g, '');
+    return normalizedHaystack.includes(withoutVariationSelectors);
+  });
 }
 
 async function waitForAnyText(target, labels, timeoutMs = 5000, options = {}) {

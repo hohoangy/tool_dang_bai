@@ -7,7 +7,7 @@ import BaseCard from '../components/BaseCard.vue';
 import FacebookActivityIcon from '../components/FacebookActivityIcon.vue';
 import { useAuthStore } from '../stores/auth';
 import { useUiStore } from '../stores/ui';
-import { activeLdPlayerSlots, getLdPlayerSlot, isActiveLdPlayerAccount } from '../utils/ldplayer-account';
+import { activeLdPlayerSlots, getLdPlayerSlot, uniqueActiveLdPlayerAccounts } from '../utils/ldplayer-account';
 
 const ui = useUiStore();
 const auth = useAuthStore();
@@ -862,7 +862,7 @@ async function load() {
 }
 
 function applyMobileAccounts(data) {
-  const nextAccounts = (data.accounts || []).filter(isActiveLdPlayerAccount);
+  const nextAccounts = uniqueActiveLdPlayerAccounts(data.accounts || []);
   accounts.value = nextAccounts;
   logs.value = data.logs || [];
   if (nextAccounts[0] && !nextAccounts.some((account) => account._id === selectedAccountId.value)) {

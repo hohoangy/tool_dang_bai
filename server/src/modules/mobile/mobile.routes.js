@@ -30,7 +30,7 @@ import {
   runMobileLogin,
   sanitizeAccount
 } from '../../services/mobile/login-automation.service.js';
-import { isActiveLdPlayerAccount } from '../../services/mobile/ldplayer-account.service.js';
+import { uniqueActiveLdPlayerAccounts } from '../../services/mobile/ldplayer-account.service.js';
 
 export const mobileRoutes = Router();
 
@@ -140,7 +140,7 @@ const instagramPostSchema = z.object({
 
 mobileRoutes.get('/accounts', requireAuth, asyncHandler(async (req, res) => {
   let accounts = await MobileAccount.find({ userId: req.user._id }).sort({ updatedAt: -1 });
-  accounts = accounts.filter(isActiveLdPlayerAccount);
+  accounts = uniqueActiveLdPlayerAccounts(accounts);
   if (!accounts.length) {
     const metadata = normalizeMetadata(defaultMobileAccount.metadata);
     const account = await MobileAccount.create({

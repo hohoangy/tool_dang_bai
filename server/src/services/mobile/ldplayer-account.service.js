@@ -20,3 +20,23 @@ export function isActiveLdPlayerAccount(account) {
   if (!['facebook', 'instagram'].includes(account?.platform)) return true;
   return activeLdPlayerSlots.includes(getLdPlayerSlot(account));
 }
+
+export function getLdPlayerAccountKey(account) {
+  if (!['facebook', 'instagram'].includes(account?.platform)) return account?._id || account?.id || '';
+  return `${account.platform}:${getLdPlayerSlot(account)}`;
+}
+
+export function uniqueActiveLdPlayerAccounts(accounts = []) {
+  const output = [];
+  const seen = new Set();
+
+  for (const account of accounts) {
+    if (!isActiveLdPlayerAccount(account)) continue;
+    const key = getLdPlayerAccountKey(account);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    output.push(account);
+  }
+
+  return output;
+}
