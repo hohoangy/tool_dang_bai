@@ -56,6 +56,7 @@ const composerLabels = [
 ];
 
 const submitLabels = ['Đăng', 'Dang', 'Post', 'POST', 'Share', 'Publish'];
+const facebookComposerNextLabels = ['Tiếp', 'Tiep', 'Next'];
 const postedConfirmationLabels = [
   'Đã chia sẻ bài viết của bạn',
   'Da chia se bai viet cua ban',
@@ -2600,7 +2601,7 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
       preparedImages = await prepareFacebookImages(account, userId, target, images, { cleanup: false });
       perf.mark('image_prepared', { imageCount: preparedImages.length });
       await assertDeviceConnected(target, 'trước khi mở Facebook composer');
-      const useDirectImageShare = shouldUseFacebookImageShareIntent(account);
+      const useDirectImageShare = shouldUseFacebookImageShareIntent(account, text);
       openHome = await openFacebookComposer(account, userId, target, config, text, useDirectImageShare ? preparedImages : [], 'image');
       perf.mark('composer_opened', { method: openHome.method || '', directImageShare: useDirectImageShare });
       if (useDirectImageShare && openHome.method === 'image_share_intent') {
@@ -2706,12 +2707,20 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
   }
 }
 
-function shouldUseFacebookImageShareIntent(account) {
+function shouldUseFacebookImageShareIntent(account, text = '') {
   const instanceName = String(account?.instanceName || '');
   // LDPlayer-3 has repeatedly stalled after Facebook accepts an image share
   // intent. Keep this instance on the slower gallery path; other instances use
   // the faster direct share path and still have a fallback if validation fails.
-  return !/LDPlayer-3/i.test(instanceName);
+  if (/LDPlayer-3/i.test(instanceName)) return false;
+
+  // Facebook's Android image share path often corrupts Vietnamese/emoji
+  // captions. Open the text composer first for Unicode captions, then attach
+  // media from the gallery to avoid the failed direct-share validation pass.
+  const caption = cleanClipboardText(text);
+  if (hasUnicodeText(caption) || caption.includes('\n')) return false;
+
+  return true;
 }
 
 export async function publishInstagramPostViaMobile(account, userId, payload = {}) {
@@ -5819,7 +5828,8 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
           text,
           {
             preserveExisting: attachedImageCount > 0,
-            galleryStartOffset: attachedImageCount
+            galleryStartOffset: attachedImageCount,
+            currentState: state
           }
         );
         steps.push(...attachment.steps);
@@ -5839,6 +5849,13 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
       if (!config.autoSubmit) {
         screenshot = await captureScreenshot(account, userId, 'facebook_post_ready_to_post');
         return { finalState, screenshot, steps, composerPending: false };
+      }
+
+      if (state.nextPoint) {
+        const next = await tapAndLog(userId, account._id, target, 'facebook_post_tap_next', state.nextPoint);
+        steps.push(next);
+        await delay(postStepDelay(1.5));
+        continue;
       }
 
       const submitted = await submitFacebookPost(
@@ -5892,7 +5909,8 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
             text,
             {
               preserveExisting: attachedImageCount > 0,
-              galleryStartOffset: attachedImageCount
+              galleryStartOffset: attachedImageCount,
+              currentState: state
             }
           );
           steps.push(...attachment.steps);
@@ -5912,6 +5930,12 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
         if (!config.autoSubmit) {
           screenshot = await captureScreenshot(account, userId, 'facebook_post_composer_ready');
           return { finalState, screenshot, steps, composerPending: false };
+        }
+        if (state.nextPoint) {
+          const next = await tapAndLog(userId, account._id, target, 'facebook_post_tap_next_from_composer', state.nextPoint);
+          steps.push(next);
+          await delay(postStepDelay(1.5));
+          continue;
         }
         const submitted = await submitFacebookPost(
           account,
@@ -6613,7 +6637,10 @@ function findPostingProgressNode(nodes) {
 async function attachFacebookImages(account, userId, target, imageCount = 1, text = '', options = {}) {
   const steps = [];
   const count = Math.max(1, Math.min(Number(imageCount) || 1, 4));
-  let currentState = await waitForFacebookAttachableComposer(account, userId, target, text);
+  const providedState = options.currentState || null;
+  let currentState = ['ready_to_post', 'composer', 'text_editor', 'stale_composer'].includes(providedState?.name)
+    ? providedState
+    : await waitForFacebookAttachableComposer(account, userId, target, text);
   if (currentState.name === 'text_editor') {
     const done = await tapTextOrPoint(
       account,
@@ -6946,12 +6973,13 @@ async function detectFacebookState(target, text, existingNodes = null) {
 
   const postTitleNode = findNodeInNodes(nodes, postTitleLabels);
   const hasPostTitle = Boolean(postTitleNode && postTitleNode.top < 180);
-  const submitNode = findSemanticSubmitButton(nodes)
-    || findNodeInNodes(nodes, submitLabels, { exact: true, preferBottomRight: true });
   const screenBottom = nodes.reduce((maximum, node) => Math.max(maximum, Number(node.bottom) || 0), 0);
   const screenRight = nodes.reduce((maximum, node) => Math.max(maximum, Number(node.right) || 0), 0);
   const composerActionThreshold = Math.max(500, Math.round(screenBottom * 0.78));
   const composerActionRightThreshold = Math.round(screenRight * 0.65);
+  const submitNode = findSemanticSubmitButton(nodes)
+    || findNodeInNodes(nodes, submitLabels, { exact: true, preferBottomRight: true });
+  const nextNode = findNodeInNodes(nodes, facebookComposerNextLabels, { exact: true, preferBottomRight: true });
   // Feed can expose unrelated "Post/Đăng" buttons near the top. A real
   // composer submit button is either accompanied by the composer title or is
   // positioned in the lower-right action area of the portrait composer.
@@ -6962,10 +6990,19 @@ async function detectFacebookState(target, text, existingNodes = null) {
       && submitNode.right >= composerActionRightThreshold
     )
   ));
+  const hasComposerNext = Boolean(nextNode
+    && nextNode.bottom >= composerActionThreshold
+    && nextNode.right >= composerActionRightThreshold);
   const submitPoint = submitNode
     ? {
       x: Math.round((submitNode.left + submitNode.right) / 2),
       y: Math.round((submitNode.top + submitNode.bottom) / 2)
+    }
+    : null;
+  const nextPoint = nextNode
+    ? {
+      x: Math.round((nextNode.left + nextNode.right) / 2),
+      y: Math.round((nextNode.top + nextNode.bottom) / 2)
     }
     : null;
   const hasAttachedImage = Boolean(findNodeInNodes(nodes, attachedMediaLabels));
@@ -6978,7 +7015,8 @@ async function detectFacebookState(target, text, existingNodes = null) {
       hasTargetText,
       hasAttachedImage,
       observedText,
-      submitPoint
+      submitPoint,
+      nextPoint: hasComposerNext ? nextPoint : null
     };
   }
   if (hasPostTitle && !hasTargetText && (hasAttachedImage || hasComposerText)) {
@@ -6996,11 +7034,19 @@ async function detectFacebookState(target, text, existingNodes = null) {
       reason: hasSubmit ? 'submit_visible' : 'post_title_with_text',
       hasTargetText,
       hasAttachedImage,
-      submitPoint
+      submitPoint,
+      nextPoint: hasComposerNext ? nextPoint : null
     };
   }
   if (hasPostTitle) {
-    return { name: 'composer', reason: 'post_title_visible', hasTargetText, hasAttachedImage, submitPoint };
+    return {
+      name: 'composer',
+      reason: 'post_title_visible',
+      hasTargetText,
+      hasAttachedImage,
+      submitPoint,
+      nextPoint: hasComposerNext ? nextPoint : null
+    };
   }
 
   // Facebook may keep the accessibility label "Close menu" in the composer
@@ -7378,15 +7424,17 @@ function verifyCompleteCaption(nodes, text) {
   });
   const rawTextMatches = captionRawTextMatches(rawHaystack, expected);
   const hasEncodingDamage = captionHasEncodingDamage(nodes, expected);
+  const effectiveMissingText = rawTextMatches ? [] : missingText;
 
   return {
-    ok: missingText.length === 0
+    ok: effectiveMissingText.length === 0
       && missingHashtags.length === 0
       && missingEmoji.length === 0
       && conflictingHashtags.length === 0
       && rawTextMatches
       && !hasEncodingDamage,
-    missingText,
+    missingText: effectiveMissingText,
+    rawMissingText: missingText,
     missingHashtags,
     missingEmoji,
     conflictingHashtags,
