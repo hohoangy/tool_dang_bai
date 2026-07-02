@@ -20,6 +20,7 @@ const instagramDisplaySizeCache = new Map();
 const instagramSharePrewarmCache = new Map();
 const instagramShareMethodCache = new Map();
 const facebookMediaRoot = '/sdcard/Pictures/SocialPilot';
+const facebookMediaCacheRoot = '/sdcard/Pictures/SocialPilotCache';
 const instagramPermissionCacheTtlMs = 10 * 60 * 1000;
 const uiDumpCacheTtlMs = 350;
 const androidUiReadyCacheTtlMs = 12_000;
@@ -2533,6 +2534,7 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
       preparedVideos = await prepareFacebookVideos(account, userId, target, videos);
       perf.mark('video_prepared', { videoCount: preparedVideos.length });
       await assertDeviceConnected(target, 'trước khi mở Facebook composer');
+      await resetFacebookAppBeforeComposer(account, userId, target, config.appPackage, steps);
       openHome = await openFacebookComposer(account, userId, target, config, text, preparedVideos, 'video');
       perf.mark('composer_opened', { method: openHome.method || '' });
       if (openHome.method !== 'video_share_intent') {
@@ -2580,6 +2582,8 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
       }
     } else if (images.length > 1) {
       const pipelineStartedAt = Date.now();
+      await assertDeviceConnected(target, 'trước khi mở Facebook composer');
+      await resetFacebookAppBeforeComposer(account, userId, target, config.appPackage, steps);
       [preparedImages, openHome] = await Promise.all([
         prepareFacebookImages(account, userId, target, images, { cleanup: true }),
         openFacebookComposer(account, userId, target, config, text, [], 'image')
@@ -2601,6 +2605,7 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
       preparedImages = await prepareFacebookImages(account, userId, target, images, { cleanup: false });
       perf.mark('image_prepared', { imageCount: preparedImages.length });
       await assertDeviceConnected(target, 'trước khi mở Facebook composer');
+      await resetFacebookAppBeforeComposer(account, userId, target, config.appPackage, steps);
       const useDirectImageShare = shouldUseFacebookImageShareIntent(account, text);
       openHome = await openFacebookComposer(account, userId, target, config, text, useDirectImageShare ? preparedImages : [], 'image');
       perf.mark('composer_opened', { method: openHome.method || '', directImageShare: useDirectImageShare });
@@ -2721,6 +2726,30 @@ function shouldUseFacebookImageShareIntent(account, text = '') {
   if (hasUnicodeText(caption) || caption.includes('\n')) return false;
 
   return true;
+}
+
+async function resetFacebookAppBeforeComposer(account, userId, target, appPackage, steps = []) {
+  const reset = await runCommand(env.mobileAutomation.adbPath, [
+    '-s',
+    target,
+    'shell',
+    'am',
+    'force-stop',
+    appPackage
+  ], { timeoutMs: 8_000 });
+  steps.push(reset);
+  await writeLog(
+    userId,
+    account._id,
+    reset.ok ? 'info' : 'warn',
+    'facebook_post_reset_app_before_composer',
+    reset.ok
+      ? 'Đã reset nhanh Facebook trước khi mở composer để tránh dính draft cũ.'
+      : 'Không reset được Facebook trước composer; tiếp tục mở composer theo trạng thái hiện tại.',
+    reset
+  );
+  if (reset.ok) await delay(550);
+  return reset;
 }
 
 export async function publishInstagramPostViaMobile(account, userId, payload = {}) {
@@ -5174,7 +5203,7 @@ async function prepareFacebookMediaSession(account, userId, target, options = {}
     steps.push(...cleanup.steps);
   }
   const sessionId = `${Date.now()}-${randomUUID().slice(0, 8)}`;
-  const remoteDir = `${facebookMediaRoot}/${sessionId}`;
+  const remoteDir = options.persistentCacheDir ? facebookMediaCacheRoot : `${facebookMediaRoot}/${sessionId}`;
 
   let mkdir = null;
   for (let attempt = 1; attempt <= 4; attempt += 1) {
@@ -5212,7 +5241,10 @@ async function prepareFacebookMediaSession(account, userId, target, options = {}
 }
 
 async function prepareFacebookImages(account, userId, target, images, options = {}) {
-  const mediaSession = await prepareFacebookMediaSession(account, userId, target, options);
+  const mediaSession = await prepareFacebookMediaSession(account, userId, target, {
+    persistentCacheDir: true,
+    ...options
+  });
   const baseTimestamp = Date.now() - images.length * 2000;
   const descriptors = images.map((image, index) => createFacebookImageDescriptor(
     image,
@@ -5648,6 +5680,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
   let recoveredEmptyUiInputOnce = false;
   let unknownStateStreak = 0;
   let textEntered = false;
+  let composerNextTaps = 0;
   let attachedImageCount = options.imageSharedByIntent && images.length ? 1 : 0;
   const imageCount = images.length;
   let screenshot = null;
@@ -5854,6 +5887,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
       if (state.nextPoint) {
         const next = await tapAndLog(userId, account._id, target, 'facebook_post_tap_next', state.nextPoint);
         steps.push(next);
+        composerNextTaps += 1;
         await delay(postStepDelay(1.5));
         continue;
       }
@@ -5934,6 +5968,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
         if (state.nextPoint) {
           const next = await tapAndLog(userId, account._id, target, 'facebook_post_tap_next_from_composer', state.nextPoint);
           steps.push(next);
+          composerNextTaps += 1;
           await delay(postStepDelay(1.5));
           continue;
         }
@@ -5959,6 +5994,28 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
     }
 
     if (state.name === 'home') {
+      if (config.autoSubmit && composerNextTaps > 0 && attachedImageCount >= imageCount) {
+        const verification = await verifyFacebookPostSubmit(
+          account,
+          userId,
+          target,
+          text,
+          config.waitAfterSubmitMs,
+          imageCount,
+          mediaKind,
+          true
+        );
+        return {
+          finalState: verification?.ok ? 'submitted' : verification?.finalState,
+          screenshot: verification?.screenshot,
+          screenshotVerified: Boolean(verification?.screenshotVerified),
+          steps,
+          composerPending: verification?.composerPending ?? false,
+          submitVerified: Boolean(verification?.ok),
+          submitReason: verification?.reason || 'home_after_next'
+        };
+      }
+
       const composerTap = await tapTextOrPoint(account, userId, target, composerLabels, config.composerTap, 'facebook_post_tap_composer');
       steps.push(composerTap);
       await delay(postStepDelay(1.25));
