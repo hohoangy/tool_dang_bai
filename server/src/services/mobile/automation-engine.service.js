@@ -6173,7 +6173,8 @@ async function waitForFacebookMediaComposer(target, text, mediaKind = 'image', t
 async function submitFacebookPost(account, userId, target, config, text, steps, action, mediaCount = 0, knownSubmitPoint = null, mediaKind = 'image') {
   const submitAttempts = knownSubmitPoint
     ? [
-      { method: 'state_detection', point: knownSubmitPoint }
+      { method: 'state_detection', point: knownSubmitPoint },
+      { method: 'state_detection_retry_same_point', point: knownSubmitPoint }
     ]
     : await buildSubmitTapAttempts(target);
   let submitAccepted = false;
