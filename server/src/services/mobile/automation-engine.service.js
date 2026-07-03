@@ -120,6 +120,8 @@ const shareFeedLabels = ['Feed'];
 const shareOnceLabels = ['JUST ONCE'];
 const postTitleLabels = ['Bài viết mới', 'Bai viet moi', 'Create post'];
 const textEditorLabels = ['Thêm văn bản', 'Them van ban', 'Add text'];
+const facebookFeelingPickerLabels = ['Bạn đang cảm thấy thế nào?', 'Ban dang cam thay the nao?', 'How are you feeling?'];
+const facebookFeelingPickerTabLabels = ['Cảm xúc', 'Cam xuc', 'Hoạt động', 'Hoat dong', 'Feeling', 'Activity'];
 const loginBlockLabels = ['Log in', 'Đăng nhập', 'Dang nhap', 'Choose a way to confirm your account', 'Confirm your account', 'Session Expired'];
 const rememberedAccountContinueLabels = ['Tiếp tục', 'Tiep tuc', 'Continue'];
 const facebookHomeLabels = ['Trang chủ', 'Trang chu', 'Home'];
@@ -5824,6 +5826,13 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
       continue;
     }
 
+    if (state.name === 'feeling_picker') {
+      const back = await keyEventAndLog(userId, account._id, target, 'facebook_post_close_feeling_picker', '4');
+      steps.push(back);
+      await delay(postStepDelay(1.25));
+      continue;
+    }
+
     if (state.name === 'stale_composer') {
       const editor = await tapTextOrPoint(
         account,
@@ -6762,22 +6771,35 @@ async function attachFacebookImages(account, userId, target, imageCount = 1, tex
       x: 51,
       y: currentState.nextPoint.y
     };
+  const fallbackGalleryPoints = !galleryMatch && canUseComposerMediaFallback
+    ? [
+      galleryPoint,
+      { x: 105, y: galleryPoint.y },
+      { x: 160, y: galleryPoint.y },
+      { x: 51, y: Math.max(1200, galleryPoint.y - 78) },
+      { x: 105, y: Math.max(1200, galleryPoint.y - 78) }
+    ]
+    : [galleryPoint];
   if (!galleryMatch && canUseComposerMediaFallback) {
     await writeLog(userId, account._id, 'warn', 'facebook_post_add_media_coordinate_fallback', 'Facebook không trả label nút media; dùng tọa độ dưới trái của composer đã xác minh caption.', {
       state: currentState,
-      point: galleryPoint
+      point: galleryPoint,
+      fallbackPoints: fallbackGalleryPoints
     });
   }
   let imageMatch = null;
   let shouldTapGallery = true;
   for (let openAttempt = 1; openAttempt <= 5 && !imageMatch; openAttempt += 1) {
+    const openPoint = galleryMatch
+      ? galleryPoint
+      : (fallbackGalleryPoints[Math.min(openAttempt - 1, fallbackGalleryPoints.length - 1)] || galleryPoint);
     if (shouldTapGallery) {
       const gallery = await tapAndLog(
         userId,
         account._id,
         target,
         openAttempt === 1 ? 'facebook_post_open_gallery' : `facebook_post_open_gallery_retry_${openAttempt}`,
-        galleryPoint
+        openPoint
       );
       steps.push(gallery);
       await delay(openAttempt === 1 ? 1_200 : 1_800);
@@ -6806,6 +6828,14 @@ async function attachFacebookImages(account, userId, target, imageCount = 1, tex
       continue;
     }
 
+    if (isFacebookFeelingPicker(nodesAfterGalleryTap)) {
+      const back = await keyEventAndLog(userId, account._id, target, 'facebook_post_close_feeling_picker_after_media_tap', '4');
+      steps.push(back);
+      shouldTapGallery = true;
+      await delay(postStepDelay(1.25));
+      continue;
+    }
+
     const permission = await findVisibleTextBounds(target, galleryPermissionLabels);
     if (permission) {
       const allow = await tapTextOrPoint(account, userId, target, galleryPermissionLabels, { x: 450, y: 965 }, 'facebook_post_allow_gallery');
@@ -6821,7 +6851,7 @@ async function attachFacebookImages(account, userId, target, imageCount = 1, tex
         imageMatch = cells[0];
       }
     }
-    if (!imageMatch && openAttempt < 3) {
+    if (!imageMatch && openAttempt < 5) {
       const composerGallery = await findVisibleTextBounds(target, openGalleryLabels, { exact: true });
       const pickerAlreadyOpen = composerGallery && composerGallery.top < 300;
       shouldTapGallery = !pickerAlreadyOpen;
@@ -7051,6 +7081,13 @@ async function detectFacebookState(target, text, existingNodes = null) {
     return { name: 'discard_dialog', reason: 'discard_post_visible', hasTargetText };
   }
   if (findNodeInNodes(nodes, loginBlockLabels)) return { name: 'blocked', reason: 'login_or_checkpoint', hasTargetText };
+  if (isFacebookFeelingPicker(nodes)) {
+    return {
+      name: 'feeling_picker',
+      reason: 'feeling_activity_picker_visible',
+      hasTargetText
+    };
+  }
 
   if (isFacebookGalleryPicker(nodes)) {
     return {
@@ -7165,6 +7202,14 @@ function isFacebookGalleryPicker(nodes = []) {
   return hasGalleryHeader && getGalleryImageCells(nodes).length > 0;
 }
 
+function isFacebookFeelingPicker(nodes = []) {
+  const hasHeader = Boolean(findNodeInNodes(nodes, facebookFeelingPickerLabels));
+  const tabCount = facebookFeelingPickerTabLabels
+    .filter((label) => Boolean(findNodeInNodes(nodes, [label], { exact: true })))
+    .length;
+  return hasHeader || tabCount >= 2;
+}
+
 async function tapAndLog(userId, accountId, target, action, point = {}) {
   const args = ['-s', target, 'shell', 'input', 'tap', String(point.x), String(point.y)];
   let result = await runCommand(env.mobileAutomation.adbPath, args, { timeoutMs: 10_000 });
@@ -7186,6 +7231,22 @@ async function tapAndLog(userId, accountId, target, action, point = {}) {
   }
   invalidateUiDump(target);
   await writeLog(userId, accountId, result.ok ? 'info' : 'error', action, result.ok ? `Tap ${point.x},${point.y}.` : `Tap lỗi ${point.x},${point.y}.`, result);
+  if (!result.ok) throw new Error(result.error || result.stderr || `${action} failed.`);
+  await delay(actionDelay(action));
+  return result;
+}
+
+async function keyEventAndLog(userId, accountId, target, action, keyCode) {
+  const result = await runCommand(env.mobileAutomation.adbPath, [
+    '-s',
+    target,
+    'shell',
+    'input',
+    'keyevent',
+    String(keyCode)
+  ], { timeoutMs: 10_000 });
+  invalidateUiDump(target);
+  await writeLog(userId, accountId, result.ok ? 'info' : 'error', action, result.ok ? `Đã gửi phím ${keyCode}.` : `Gửi phím lỗi ${keyCode}.`, result);
   if (!result.ok) throw new Error(result.error || result.stderr || `${action} failed.`);
   await delay(actionDelay(action));
   return result;
