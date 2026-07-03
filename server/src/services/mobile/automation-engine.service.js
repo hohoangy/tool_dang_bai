@@ -5987,7 +5987,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
         return submitted;
       }
 
-      const bodyTap = await tapTextOrPoint(account, userId, target, composerLabels, { x: 450, y: 360 }, 'facebook_post_open_text_editor');
+      const bodyTap = await tapTextOrPoint(account, userId, target, composerLabels, { x: 450, y: 218 }, 'facebook_post_open_text_editor');
       steps.push(bodyTap);
       await delay(postStepDelay(1.25));
       continue;
@@ -6740,7 +6740,11 @@ async function attachFacebookImages(account, userId, target, imageCount = 1, tex
     ? [...addMorePhotoLabels, ...galleryLabels]
     : galleryLabels;
   const galleryMatch = await waitForAnyText(target, openGalleryLabels, 5_000, { exact: true });
-  if (!galleryMatch) {
+  const canUseComposerMediaFallback = !galleryMatch
+    && ['ready_to_post', 'composer'].includes(currentState.name)
+    && currentState.hasTargetText
+    && currentState.nextPoint;
+  if (!galleryMatch && !canUseComposerMediaFallback) {
     const screenshot = await captureScreenshot(account, userId, 'facebook_post_add_media_missing');
     await writeLog(userId, account._id, 'error', 'facebook_post_add_media_missing', 'Không tìm thấy nút thêm file phương tiện trong Facebook composer.', {
       state: currentState,
@@ -6749,13 +6753,24 @@ async function attachFacebookImages(account, userId, target, imageCount = 1, tex
     });
     throw new Error('Không tìm thấy nút thêm file phương tiện trong Facebook composer.');
   }
-  const galleryPoint = {
-    x: Math.round((galleryMatch.left + galleryMatch.right) / 2),
-    y: Math.round((galleryMatch.top + galleryMatch.bottom) / 2)
-  };
+  const galleryPoint = galleryMatch
+    ? {
+      x: Math.round((galleryMatch.left + galleryMatch.right) / 2),
+      y: Math.round((galleryMatch.top + galleryMatch.bottom) / 2)
+    }
+    : {
+      x: 51,
+      y: currentState.nextPoint.y
+    };
+  if (!galleryMatch && canUseComposerMediaFallback) {
+    await writeLog(userId, account._id, 'warn', 'facebook_post_add_media_coordinate_fallback', 'Facebook không trả label nút media; dùng tọa độ dưới trái của composer đã xác minh caption.', {
+      state: currentState,
+      point: galleryPoint
+    });
+  }
   let imageMatch = null;
   let shouldTapGallery = true;
-  for (let openAttempt = 1; openAttempt <= 3 && !imageMatch; openAttempt += 1) {
+  for (let openAttempt = 1; openAttempt <= 5 && !imageMatch; openAttempt += 1) {
     if (shouldTapGallery) {
       const gallery = await tapAndLog(
         userId,
@@ -6768,6 +6783,29 @@ async function attachFacebookImages(account, userId, target, imageCount = 1, tex
       await delay(openAttempt === 1 ? 1_200 : 1_800);
     }
 
+    let nodesAfterGalleryTap = await dumpVisibleNodes(target);
+    const systemAnr = detectSystemUiAnr(nodesAfterGalleryTap);
+    if (systemAnr) {
+      const recovered = await recoverSystemUiAnr(account, userId, target, {
+        name: 'system_anr',
+        reason: 'android_system_ui_not_responding',
+        ...systemAnr
+      });
+      steps.push(recovered);
+      if (!recovered.ok) {
+        const screenshot = await captureScreenshot(account, userId, 'facebook_post_gallery_system_anr');
+        await writeLog(userId, account._id, 'error', 'facebook_post_gallery_system_anr', 'System UI che màn chọn ảnh và không hồi phục được.', {
+          systemAnr,
+          recovered,
+          screenshot
+        });
+        throw new Error('System UI của LDPlayer không phản hồi khi mở thư viện ảnh.');
+      }
+      shouldTapGallery = true;
+      await delay(postStepDelay(1.25));
+      continue;
+    }
+
     const permission = await findVisibleTextBounds(target, galleryPermissionLabels);
     if (permission) {
       const allow = await tapTextOrPoint(account, userId, target, galleryPermissionLabels, { x: 450, y: 965 }, 'facebook_post_allow_gallery');
@@ -6777,8 +6815,8 @@ async function attachFacebookImages(account, userId, target, imageCount = 1, tex
 
     imageMatch = await waitForAnyText(target, selectedImageLabels, openAttempt === 1 ? 10_000 : 7_000);
     if (!imageMatch) {
-      const nodes = await dumpVisibleNodes(target);
-      const cells = getGalleryImageCells(nodes);
+      nodesAfterGalleryTap = await dumpVisibleNodes(target);
+      const cells = getGalleryImageCells(nodesAfterGalleryTap);
       if (cells.length) {
         imageMatch = cells[0];
       }
