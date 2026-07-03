@@ -1209,7 +1209,11 @@ async function performOpenAccountApp(account, userId, appPackage) {
     throw new Error(ready.error || ready.stderr || `ADB ${target} chưa sẵn sàng.`);
   }
 
-  const androidUiAttempts = packageName === defaultPackages.instagram ? 12 : 2;
+  const androidUiAttempts = packageName === defaultPackages.instagram
+    ? 12
+    : packageName === defaultPackages.facebook
+      ? 8
+      : 2;
   let androidUi = await ensureAndroidUiReady(account, userId, target, androidUiAttempts);
   if (!androidUi.ok) {
     await writeLog(
@@ -5679,7 +5683,6 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
   const steps = [];
   const mediaKind = options.mediaKind === 'video' ? 'video' : 'image';
   let recoveredEmptyUiOnce = false;
-  let recoveredEmptyUiInputOnce = false;
   let unknownStateStreak = 0;
   let textEntered = false;
   let composerNextTaps = 0;
@@ -5728,37 +5731,23 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
 
     if (state.name === 'unknown' && state.reason === 'no_uiautomator_nodes') {
       await assertDeviceConnected(target, 'trong lúc điều khiển Facebook');
-      if (!textEntered && !recoveredEmptyUiInputOnce) {
-        recoveredEmptyUiInputOnce = true;
-        const input = await inputAndLog(userId, account._id, target, 'facebook_post_input_text_empty_ui_fallback', text);
-        steps.push(input);
-        if (input.ok) {
-          textEntered = true;
-          await writeLog(
-            userId,
-            account._id,
-            'warn',
-            'facebook_post_empty_ui_input_fallback',
-            'UIAutomator chưa trả node sau khi mở editor; đã nhập text trực tiếp vào focus hiện tại.',
-            { attempt, input }
-          );
-          await delay(postStepDelay(1.25));
-          const done = await tapAndLog(userId, account._id, target, 'facebook_post_done_empty_ui_fallback', { x: 846, y: 72 });
-          steps.push(done);
-          await delay(postStepDelay(1.5));
-          invalidateUiDump(target);
-          continue;
-        }
-      }
       if (recoveredEmptyUiOnce) {
         screenshot = await captureScreenshot(account, userId, 'facebook_ui_nodes_unavailable');
         throw new Error('Facebook hoặc System UI không phản hồi trên LDPlayer. Đã dừng sớm để tránh workflow chạy treo.');
       }
       recoveredEmptyUiOnce = true;
+      await writeLog(
+        userId,
+        account._id,
+        'warn',
+        'facebook_post_empty_ui_recovery',
+        'UIAutomator chưa trả node; tạm dừng nhập liệu và chờ System UI/Facebook ổn định lại.',
+        { attempt, textEntered }
+      );
       const healthy = await waitForSystemUiHealthy(account, userId, target, {
         phase: 'facebook_empty_ui_recovery',
         stableChecks: 2,
-        maxAttempts: 4,
+        maxAttempts: 8,
         initialDelayMs: 600
       });
       steps.push(healthy);
