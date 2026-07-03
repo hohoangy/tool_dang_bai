@@ -45,7 +45,7 @@ const defaultLoginSteps = {
 };
 
 const defaultPostSteps = {
-  composerTap: { x: 390, y: 145 }
+  composerTap: { x: 450, y: 218 }
 };
 
 const composerLabels = [
@@ -2310,9 +2310,13 @@ function buildAutomationConfig(account, override = {}) {
 
 function buildPostConfig(account, override = {}) {
   const metadata = account.metadata || {};
+  const configuredComposerTap = override.composerTap || metadata.postSteps?.composerTap || defaultPostSteps.composerTap;
+  const composerTap = configuredComposerTap?.x === 390 && configuredComposerTap?.y === 145
+    ? defaultPostSteps.composerTap
+    : configuredComposerTap;
   return {
     appPackage: override.appPackage || metadata.appPackage || defaultPackages[account.platform] || defaultPackages.facebook,
-    composerTap: override.composerTap || metadata.postSteps?.composerTap || defaultPostSteps.composerTap,
+    composerTap,
     autoSubmit: Boolean(override.autoSubmit),
     waitAfterSubmitMs: Math.max(0, Math.min(Number(override.waitAfterSubmitMs) || 0, 180_000))
   };
@@ -6359,7 +6363,7 @@ async function verifyFacebookPostSubmit(
   let lastState = null;
   const mediaMinimumVerificationMs = mediaKind === 'video'
     ? 90_000
-    : (mediaCount > 0 ? 45_000 : 8_000);
+    : (mediaCount > 0 ? 32_000 : 8_000);
   const verificationWindowMs = Math.max(mediaMinimumVerificationMs, waitAfterSubmitMs || 0);
   const verificationStartedAt = Date.now();
   const verificationDeadline = verificationStartedAt + verificationWindowMs;
@@ -6377,9 +6381,9 @@ async function verifyFacebookPostSubmit(
     });
   }
 
-  const maxVerificationAttempts = mediaKind === 'video' ? 180 : (mediaCount > 0 ? 120 : 40);
+  const maxVerificationAttempts = mediaKind === 'video' ? 180 : (mediaCount > 0 ? 90 : 32);
   for (let attempt = 1; attempt <= maxVerificationAttempts; attempt += 1) {
-    await delay(attempt === 1 ? 900 : 1_000);
+    await delay(attempt === 1 ? 450 : (mediaKind === 'video' ? 1_000 : 650));
     const nodes = await dumpVisibleNodes(target);
     const confirmation = findNodeInNodes(nodes, postedConfirmationLabels);
     if (confirmation) {
@@ -6428,6 +6432,34 @@ async function verifyFacebookPostSubmit(
     }
 
     if (!['ready_to_post', 'composer', 'text_editor', 'stale_composer'].includes(lastState.name)) {
+      const expectedText = cleanClipboardText(text).trim();
+      const hasExpectedText = expectedText && screenHasText(nodes, expectedText);
+      const expectedTextInEditor = nodes.some((node) => (
+        node.className.includes('EditText')
+        && screenHasText([node], expectedText)
+      ));
+      if (lastState.name === 'home' && hasExpectedText && !expectedTextInEditor) {
+        const screenshot = await captureScreenshot(account, userId, 'facebook_published_post_verified');
+        const reason = sawPostingProgress ? 'upload_completed_and_post_visible' : 'published_post_visible';
+        await writeLog(userId, account._id, 'info', 'facebook_post_submit_verified', 'Đã tìm thấy đúng nội dung bài vừa đăng trên feed.', {
+          attempt,
+          elapsedMs: Date.now() - verificationStartedAt,
+          mediaCount,
+          mediaKind,
+          sawPostingProgress,
+          state: lastState,
+          screenshotVerified: true,
+          method: 'current_ui_nodes'
+        });
+        return {
+          ok: true,
+          reason,
+          screenshot,
+          screenshotVerified: true,
+          composerPending: false,
+          finalState: 'submitted'
+        };
+      }
       const evidence = await captureFacebookPublishedPostEvidence(account, userId, target, text);
       if (!evidence.verified) {
         if (evidence.uploadInProgress && Date.now() < uploadDeadline) {
@@ -6531,7 +6563,9 @@ async function verifyFacebookPostSubmit(
       }
 
       if (attempt === 1 || attempt % 5 === 0) {
-        await writeLog(userId, account._id, 'info', 'facebook_post_upload_progress_pending', 'Tín hiệu tải video tạm ẩn; tiếp tục chờ Facebook hoàn tất thay vì kết luận thất bại.', {
+        await writeLog(userId, account._id, 'info', 'facebook_post_upload_progress_pending', mediaKind === 'video'
+          ? 'Tín hiệu tải video tạm ẩn; tiếp tục chờ Facebook hoàn tất thay vì kết luận thất bại.'
+          : 'Tín hiệu tải ảnh tạm ẩn; tiếp tục chờ Facebook hoàn tất thay vì kết luận thất bại.', {
           attempt,
           elapsedMs: Date.now() - verificationStartedAt,
           state: lastState,
@@ -6792,7 +6826,7 @@ async function attachFacebookImages(account, userId, target, imageCount = 1, tex
         openPoint
       );
       steps.push(gallery);
-      await delay(openAttempt === 1 ? 1_200 : 1_800);
+      await delay(openAttempt === 1 ? 750 : 1_150);
     }
 
     let nodesAfterGalleryTap = await dumpVisibleNodes(target);
@@ -6833,12 +6867,18 @@ async function attachFacebookImages(account, userId, target, imageCount = 1, tex
       await delay(1_500);
     }
 
-    imageMatch = await waitForAnyText(target, selectedImageLabels, openAttempt === 1 ? 10_000 : 7_000);
+    const immediateCells = getGalleryImageCells(nodesAfterGalleryTap);
+    if (immediateCells.length) {
+      imageMatch = immediateCells[0];
+    }
     if (!imageMatch) {
-      nodesAfterGalleryTap = await dumpVisibleNodes(target);
-      const cells = getGalleryImageCells(nodesAfterGalleryTap);
-      if (cells.length) {
-        imageMatch = cells[0];
+      imageMatch = await waitForAnyText(target, selectedImageLabels, openAttempt === 1 ? 4_000 : 3_000);
+      if (!imageMatch) {
+        nodesAfterGalleryTap = await dumpVisibleNodes(target);
+        const cells = getGalleryImageCells(nodesAfterGalleryTap);
+        if (cells.length) {
+          imageMatch = cells[0];
+        }
       }
     }
     if (!imageMatch && openAttempt < 5) {
@@ -6886,9 +6926,9 @@ async function attachFacebookImages(account, userId, target, imageCount = 1, tex
     y: Math.round((nextMatch.top + nextMatch.bottom) / 2)
   });
   steps.push(next);
-  await delay(postStepDelay(1.5));
+  await delay(750);
 
-  const attached = await waitForAnyText(target, attachedImageLabels, 10_000);
+  const attached = await waitForAnyText(target, attachedImageLabels, 4_000);
   if (!attached) {
     const composerState = await detectFacebookState(target, text);
     if (['ready_to_post', 'stale_composer'].includes(composerState.name)) {
