@@ -34,6 +34,92 @@ import { uniqueActiveLdPlayerAccounts } from '../../services/mobile/ldplayer-acc
 
 export const mobileRoutes = Router();
 
+function classifyMobilePublishError(error, platform, context = {}) {
+  const rawMessage = String(error?.message || 'Workflow trả lỗi chưa xác định.');
+  const normalized = rawMessage
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+  const isFacebook = platform === 'facebook';
+  const prefix = isFacebook ? 'facebook_post' : 'instagram_post';
+  const mediaCount = Number(context.imageCount || 0) + Number(context.videoCount || 0);
+
+  const match = (...phrases) => phrases.some((phrase) => normalized.includes(phrase));
+  if (match('checkpoint', 'dang nhap', 'login', 'session expired', 'confirm your account')) {
+    return {
+      code: `${platform.toUpperCase()}_AUTH_REQUIRED`,
+      category: 'auth_required',
+      retryable: false,
+      action: `${prefix}_failed_auth_required`,
+      userMessage: `${platform === 'facebook' ? 'Facebook' : 'Instagram'} cần đăng nhập hoặc xác minh tài khoản trước khi đăng tiếp.`,
+      recoveryHint: 'Mở app trong đúng LDPlayer, xử lý login/checkpoint thủ công rồi bấm kiểm tra lại.'
+    };
+  }
+  if (match('adb', 'device is not ready', 'offline', 'no_uiautomator_nodes', 'system ui', 'khong phan hoi', 'khong san sang', 'not responding')) {
+    return {
+      code: 'LDPLAYER_UNSTABLE',
+      category: 'ldplayer_unstable',
+      retryable: true,
+      action: `${prefix}_failed_ld_unstable`,
+      userMessage: 'LDPlayer hoặc ADB chưa ổn định nên tool đã dừng để tránh đăng sai.',
+      recoveryHint: 'Restart LDPlayer/ADB, chờ app mở ổn định rồi chạy lại. Nếu lỗi lặp lại, chuyển profile này sang trạng thái tạm nghỉ.'
+    };
+  }
+  if (isFacebook && match('ghi nhan 0/', 'ghi nhan', 'selection_incomplete', 'chon anh', 'thu vien anh', 'khong mo duoc thu vien')) {
+    return {
+      code: 'FACEBOOK_GALLERY_SELECTION_UNSTABLE',
+      category: 'media_selection',
+      retryable: true,
+      action: 'facebook_post_failed_gallery_selection',
+      userMessage: `Facebook gallery chưa xác nhận đủ ${mediaCount || 'media'} đã chọn, tool dừng để tránh bấm lặp.`,
+      recoveryHint: 'Chạy lại sau khi Facebook/LDPlayer ổn định. Nếu đang đăng nhiều ảnh, thử 1 ảnh để kiểm tra gallery trước.'
+    };
+  }
+  if (isFacebook && match('khong gan duoc anh', 'gắn được ảnh', 'gan duoc anh', 'image_attach_failed', 'quyen thu vien', 'file phuong tien')) {
+    return {
+      code: 'FACEBOOK_MEDIA_ATTACH_FAILED',
+      category: 'media_attach',
+      retryable: true,
+      action: 'facebook_post_failed_media_attach',
+      userMessage: 'Facebook chưa xác nhận media đã gắn vào composer.',
+      recoveryHint: 'Kiểm tra quyền ảnh/video của Facebook trong LDPlayer và thử lại với media nhỏ hơn.'
+    };
+  }
+  if (match('khong dua duoc', 'state machine', 'khong toi duoc', 'chua toi duoc', 'unknown_state')) {
+    return {
+      code: `${platform.toUpperCase()}_UI_STATE_UNSTABLE`,
+      category: 'ui_state_unstable',
+      retryable: true,
+      action: `${prefix}_failed_ui_state`,
+      userMessage: `${platform === 'facebook' ? 'Facebook' : 'Instagram'} đổi màn hình hoặc phản hồi chậm, tool chưa nhận diện được trạng thái an toàn.`,
+      recoveryHint: 'Đưa app về Home, đóng popup nếu có, rồi chạy lại. Nếu lỗi lặp lại, restart LDPlayer.'
+    };
+  }
+
+  return {
+    code: `${platform.toUpperCase()}_PUBLISH_FAILED`,
+    category: 'publish_failed',
+    retryable: true,
+    action: `${prefix}_failed`,
+    userMessage: rawMessage,
+    recoveryHint: 'Xem nhật ký kỹ thuật và screenshot gần nhất để xác định bước dừng.'
+  };
+}
+
+function throwClassifiedPublishError(error, classification, statusCode = 400) {
+  const resolvedStatusCode = classification.category === 'ldplayer_unstable'
+    ? 503
+    : classification.category === 'auth_required'
+      ? 409
+      : statusCode;
+  const apiError = new ApiError(resolvedStatusCode, classification.userMessage, {
+    ...classification,
+    originalMessage: String(error?.message || '')
+  });
+  apiError.code = classification.code;
+  throw apiError;
+}
+
 const accountSchema = z.object({
   platform: z.enum(['facebook', 'instagram', 'x', 'youtube', 'tiktok', 'other']).default('other'),
   displayName: z.string().min(2),
@@ -290,13 +376,21 @@ mobileRoutes.post('/accounts/:id/facebook/post', requireAuth, asyncHandler(async
     const result = await publishFacebookPostViaMobile(account, req.user._id, platformInput);
     res.json({ result });
   } catch (error) {
-    await writeLog(req.user._id, account._id, 'error', 'facebook_post_failed', error.message, {
+    const imageCount = platformInput.images?.length || 0;
+    const videoCount = platformInput.videos?.length || 0;
+    const classification = classifyMobilePublishError(error, 'facebook', { imageCount, videoCount });
+    await writeLog(req.user._id, account._id, 'error', classification.action, classification.userMessage, {
       autoSubmit: platformInput.autoSubmit,
       appPackage: platformInput.appPackage,
-      imageCount: platformInput.images?.length || 0,
-      videoCount: platformInput.videos?.length || 0
+      imageCount,
+      videoCount,
+      code: classification.code,
+      category: classification.category,
+      retryable: classification.retryable,
+      recoveryHint: classification.recoveryHint,
+      originalMessage: error.message
     });
-    throw new ApiError(400, error.message);
+    throwClassifiedPublishError(error, classification);
   }
 }));
 
@@ -311,13 +405,20 @@ mobileRoutes.post('/accounts/:id/instagram/post', requireAuth, asyncHandler(asyn
     const result = await publishInstagramPostViaMobile(account, req.user._id, platformInput);
     res.json({ result });
   } catch (error) {
-    await writeLog(req.user._id, account._id, 'error', 'instagram_post_failed', error.message, {
+    const imageCount = platformInput.images?.length || 0;
+    const classification = classifyMobilePublishError(error, 'instagram', { imageCount });
+    await writeLog(req.user._id, account._id, 'error', classification.action, classification.userMessage, {
       autoSubmit: platformInput.autoSubmit,
       appPackage: platformInput.appPackage,
-      postType: (platformInput.images?.length || 0) > 1 ? 'carousel' : 'singlePhoto',
-      imageCount: platformInput.images?.length || 0
+      postType: imageCount > 1 ? 'carousel' : 'singlePhoto',
+      imageCount,
+      code: classification.code,
+      category: classification.category,
+      retryable: classification.retryable,
+      recoveryHint: classification.recoveryHint,
+      originalMessage: error.message
     });
-    throw new ApiError(400, error.message);
+    throwClassifiedPublishError(error, classification);
   }
 }));
 

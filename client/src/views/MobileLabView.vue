@@ -512,6 +512,11 @@ const operationalPostRunActions = new Set([
   'facebook_post_state_machine_pending',
   'facebook_post_image_attach_failed',
   'facebook_post_video_upload_reverted',
+  'facebook_post_failed_auth_required',
+  'facebook_post_failed_ld_unstable',
+  'facebook_post_failed_gallery_selection',
+  'facebook_post_failed_media_attach',
+  'facebook_post_failed_ui_state',
   'facebook_post_failed',
   'instagram_post_finished',
   'instagram_post_submit_verified',
@@ -521,6 +526,9 @@ const operationalPostRunActions = new Set([
   'instagram_post_album_unsupported_fast_stop',
   'instagram_post_album_native_failed',
   'instagram_post_failed_cleanup',
+  'instagram_post_failed_auth_required',
+  'instagram_post_failed_ld_unstable',
+  'instagram_post_failed_ui_state',
   'instagram_post_failed'
 ]);
 const recentPostRuns = computed(() => latestLogs.value
@@ -570,6 +578,26 @@ const postRunActionLabels = {
   facebook_post_image_attach_failed: {
     title: 'Gắn ảnh chưa thành công',
     detail: 'Tool chưa xác nhận được ảnh trong composer.'
+  },
+  facebook_post_failed_auth_required: {
+    title: 'Facebook cần xác minh tài khoản',
+    detail: 'Cần xử lý login/checkpoint trong LDPlayer trước khi đăng tiếp.'
+  },
+  facebook_post_failed_ld_unstable: {
+    title: 'LDPlayer/ADB chưa ổn định',
+    detail: 'Tool đã dừng để tránh đăng sai. Restart LDPlayer hoặc chờ ADB ổn định rồi chạy lại.'
+  },
+  facebook_post_failed_gallery_selection: {
+    title: 'Gallery chưa xác nhận ảnh',
+    detail: 'Facebook chưa ghi nhận đủ ảnh đã chọn; tool dừng để tránh bấm lặp.'
+  },
+  facebook_post_failed_media_attach: {
+    title: 'Media chưa gắn vào composer',
+    detail: 'Facebook chưa xác nhận media xuất hiện trong bài soạn.'
+  },
+  facebook_post_failed_ui_state: {
+    title: 'Facebook UI chưa ổn định',
+    detail: 'Tool chưa nhận diện được màn hình an toàn để tiếp tục.'
   },
   facebook_post_image_attached: {
     title: 'Ảnh đã sẵn sàng',
@@ -622,6 +650,18 @@ const postRunActionLabels = {
   instagram_post_failed_cleanup: {
     title: 'Đã dọn Instagram sau lỗi',
     detail: 'Tool đã force-stop Instagram và kiểm tra ADB để chuẩn bị cho lượt chạy tiếp theo.'
+  },
+  instagram_post_failed_auth_required: {
+    title: 'Instagram cần xác minh tài khoản',
+    detail: 'Cần xử lý login/checkpoint trong LDPlayer trước khi đăng tiếp.'
+  },
+  instagram_post_failed_ld_unstable: {
+    title: 'LDPlayer/ADB chưa ổn định',
+    detail: 'Tool đã dừng để tránh đăng sai. Restart LDPlayer hoặc chờ ADB ổn định rồi chạy lại.'
+  },
+  instagram_post_failed_ui_state: {
+    title: 'Instagram UI chưa ổn định',
+    detail: 'Tool chưa nhận diện được màn hình an toàn để tiếp tục.'
   },
   instagram_post_state: {
     title: 'Đang đọc trạng thái Instagram',
@@ -2097,7 +2137,11 @@ function formatDate(value) {
 }
 
 function getHttpErrorMessage(error) {
-  return error?.response?.data?.error?.message
+  const apiError = error?.response?.data?.error;
+  const hint = apiError?.details?.recoveryHint;
+  return hint
+    ? `${apiError.message} ${hint}`
+    : apiError?.message
     || error?.response?.data?.message
     || error?.message
     || 'Workflow trả lỗi chưa xác định.';
@@ -2105,21 +2149,22 @@ function getHttpErrorMessage(error) {
 
 function formatPostRun(log) {
   const mapped = postRunActionLabels[log.action];
+  const detail = log.metadata?.recoveryHint || log.message || mapped?.detail || 'Tool vừa ghi nhận một bước trong workflow đăng bài.';
   if (log.action === 'facebook_post_finished' && log.level !== 'info') {
     return {
       title: 'Bài đăng chưa được xác minh',
-      detail: log.message || 'Facebook chưa xác nhận bài đã được đăng.'
+      detail
     };
   }
   if (log.action === 'instagram_post_finished' && log.level !== 'info') {
     return {
       title: 'Bài Instagram chưa được xác minh',
-      detail: log.message || 'Instagram chưa xác nhận bài đã được chia sẻ.'
+      detail
     };
   }
   return {
     title: mapped?.title || 'Cập nhật trạng thái đăng',
-    detail: log.message || mapped?.detail || 'Tool vừa ghi nhận một bước trong workflow đăng bài.'
+    detail
   };
 }
 
