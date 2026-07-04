@@ -658,6 +658,67 @@ async function ensureDeviceReady(account, userId, target, attempts = 8) {
   return lastState || { ok: false, error: 'ADB target is not ready.' };
 }
 
+async function ensureAdbStable(account, userId, target, options = {}) {
+  const requiredStableChecks = Math.max(2, Number(options.stableChecks) || 3);
+  const maxAttempts = Math.max(requiredStableChecks, Number(options.maxAttempts) || 8);
+  const startedAt = Date.now();
+  let stableChecks = 0;
+  let lastState = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const state = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'get-state'], { timeoutMs: 4_000 });
+    lastState = state;
+    const ready = Boolean(state.ok && String(state.stdout || '').trim() === 'device');
+    stableChecks = ready ? stableChecks + 1 : 0;
+
+    if (stableChecks >= requiredStableChecks) {
+      const result = {
+        ok: true,
+        target,
+        attempt,
+        stableChecks,
+        elapsedMs: Date.now() - startedAt,
+        phase: options.phase || 'runtime'
+      };
+      if (attempt > requiredStableChecks) {
+        await writeLog(
+          userId,
+          account._id,
+          'info',
+          'adb_stable_after_retry',
+          `ADB ${target} đã ổn định sau ${attempt} lần kiểm tra.`,
+          result
+        );
+      }
+      return result;
+    }
+
+    await delay(attempt < 3 ? 500 : 900);
+  }
+
+  const output = `${lastState?.stdout || ''} ${lastState?.stderr || ''} ${lastState?.error || ''}`.trim();
+  const result = {
+    ok: false,
+    target,
+    stableChecks,
+    elapsedMs: Date.now() - startedAt,
+    phase: options.phase || 'runtime',
+    lastState,
+    error: /offline/i.test(output)
+      ? 'ADB đang offline/chập chờn. Hãy restart LDPlayer và đợi 1-2 phút trước khi đăng.'
+      : 'ADB chưa ổn định đủ để bắt đầu automation.'
+  };
+  await writeLog(
+    userId,
+    account._id,
+    'error',
+    'adb_stability_failed',
+    result.error,
+    result
+  );
+  return result;
+}
+
 async function normalizeAccountDeviceTarget(account, target = '') {
   const candidate = target || getDeviceTarget(account);
   if (!account?.instanceName || !isEmulatorTarget(candidate)) return candidate;
@@ -1144,6 +1205,97 @@ async function ensurePortraitOrientation(account, userId, target) {
     displayOverride,
     attempts
   };
+}
+
+async function runFacebookPublishPreflight(account, userId, target, config, mediaCount = 0) {
+  const startedAt = Date.now();
+  const steps = [];
+
+  const adbStable = await ensureAdbStable(account, userId, target, {
+    phase: 'facebook_publish_preflight',
+    stableChecks: 3,
+    maxAttempts: 8
+  });
+  steps.push(adbStable);
+  if (!adbStable.ok) {
+    return {
+      ok: false,
+      target,
+      steps,
+      elapsedMs: Date.now() - startedAt,
+      reason: 'adb_unstable',
+      error: adbStable.error
+    };
+  }
+
+  const systemUi = await waitForSystemUiHealthy(account, userId, target, {
+    phase: 'facebook_publish_preflight',
+    stableChecks: 2,
+    maxAttempts: mediaCount > 1 ? 8 : 5
+  });
+  steps.push(systemUi);
+  if (!systemUi.ok) {
+    return {
+      ok: false,
+      target,
+      steps,
+      elapsedMs: Date.now() - startedAt,
+      reason: 'system_ui_unstable',
+      error: systemUi.error
+    };
+  }
+
+  const storage = await ensureAndroidStorageReady(account, userId, target, 6);
+  steps.push(storage);
+  if (!storage.ok) {
+    return {
+      ok: false,
+      target,
+      steps,
+      elapsedMs: Date.now() - startedAt,
+      reason: 'storage_not_ready',
+      error: storage.error || 'Bộ nhớ ảnh của LDPlayer chưa sẵn sàng.'
+    };
+  }
+
+  const packageInstalled = await isAndroidPackageInstalled(target, config.appPackage);
+  steps.push(packageInstalled);
+  if (!packageInstalled.ok) {
+    return {
+      ok: false,
+      target,
+      steps,
+      elapsedMs: Date.now() - startedAt,
+      reason: 'facebook_package_missing',
+      error: `Không tìm thấy app Facebook (${config.appPackage}) trên LDPlayer.`
+    };
+  }
+
+  const result = {
+    ok: true,
+    target,
+    steps,
+    elapsedMs: Date.now() - startedAt,
+    mediaCount
+  };
+  await writeLog(
+    userId,
+    account._id,
+    'info',
+    'facebook_publish_preflight_ready',
+    mediaCount > 1
+      ? `LDPlayer đã ổn định để đăng ${mediaCount} media Facebook.`
+      : 'LDPlayer đã ổn định để đăng Facebook.',
+    {
+      target,
+      mediaCount,
+      elapsedMs: result.elapsedMs,
+      adbStable,
+      systemUi,
+      storage: { ok: storage.ok, cached: storage.cached || false, attempt: storage.attempt }
+    }
+  );
+  return result;
 }
 
 async function resetInstagramDisplaySize(account, userId, target) {
@@ -2551,6 +2703,30 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
   const orientation = await ensurePortraitOrientation(account, userId, target);
   steps.push(orientation);
   perf.mark('orientation_ready');
+
+  const publishPreflight = await runFacebookPublishPreflight(
+    account,
+    userId,
+    target,
+    config,
+    videos.length || images.length
+  );
+  steps.push(...publishPreflight.steps);
+  if (!publishPreflight.ok) {
+    await writeLog(
+      userId,
+      account._id,
+      'error',
+      'facebook_publish_preflight_failed',
+      publishPreflight.error || 'LDPlayer chưa đạt điều kiện ổn định để đăng Facebook.',
+      publishPreflight
+    );
+    throw new Error(publishPreflight.error || 'LDPlayer chưa đạt điều kiện ổn định để đăng Facebook.');
+  }
+  perf.mark('publish_preflight_ready', {
+    mediaCount: images.length + videos.length,
+    elapsedMs: publishPreflight.elapsedMs
+  });
 
   let preparedImages = [];
   let preparedVideos = [];
