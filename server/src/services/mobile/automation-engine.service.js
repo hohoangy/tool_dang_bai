@@ -5910,6 +5910,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
       reason: state.reason,
       unknownStateStreak,
       hasAttachedImage: Boolean(state.hasAttachedImage),
+      captionVerified: Boolean(state.captionVerified),
       observedText: state.observedText || ''
     });
 
@@ -6239,6 +6240,9 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
 async function repairFacebookCaptionIfNeeded(account, userId, target, text, state = {}) {
   const expected = cleanClipboardText(text).trim();
   if (!expected) return { changed: false, steps: [] };
+  if (state.captionVerified) {
+    return { changed: false, steps: [], verification: { ok: true, source: 'detect_facebook_state' } };
+  }
 
   const nodes = await dumpVisibleNodes(target);
   const verification = verifyCompleteCaption(nodes, expected);
@@ -7113,7 +7117,8 @@ async function attachFacebookImages(account, userId, target, imageCount = 1, tex
     throw new Error(`Facebook mới ghi nhận ${selectedCount}/${count} ảnh. Đã dừng để tránh bấm lặp.`);
   }
 
-  const nextMatch = await waitForAnyText(target, galleryNextLabels, 8_000, { exact: true, preferBottomRight: true });
+  const galleryNextTimeoutMs = count === 1 ? 3_000 : 8_000;
+  const nextMatch = await waitForAnyText(target, galleryNextLabels, galleryNextTimeoutMs, { exact: true, preferBottomRight: true });
   if (!nextMatch) {
     const screenshot = await captureScreenshot(account, userId, 'facebook_post_gallery_confirm_missing');
     await writeLog(userId, account._id, 'error', 'facebook_post_gallery_confirm_missing', 'Không tìm thấy nút xác nhận sau khi chọn ảnh.', {
@@ -7126,9 +7131,9 @@ async function attachFacebookImages(account, userId, target, imageCount = 1, tex
     y: Math.round((nextMatch.top + nextMatch.bottom) / 2)
   });
   steps.push(next);
-  await delay(750);
+  await delay(count === 1 ? 450 : 750);
 
-  const attached = await waitForAnyText(target, attachedImageLabels, 4_000);
+  const attached = await waitForAnyText(target, attachedImageLabels, count === 1 ? 1_800 : 4_000);
   if (!attached) {
     const composerState = await detectFacebookState(target, text);
     if (['ready_to_post', 'stale_composer'].includes(composerState.name)) {
@@ -7194,6 +7199,8 @@ async function selectGalleryImagesByAccessibility(account, userId, target, count
     ? options.initialNodes
     : await dumpVisibleNodes(target);
   let selectedCount = countSelectedGalleryImages(nodes);
+  if (selectedCount >= count) return { steps, selectedCount };
+
   const initialCells = getGalleryImageCells(nodes).filter((cell) => !cell.selected).slice(0, count - selectedCount);
 
   if (initialCells.length >= count - selectedCount) {
@@ -7209,6 +7216,15 @@ async function selectGalleryImagesByAccessibility(account, userId, target, count
       );
       steps.push(selectImage);
       await delay(180);
+    }
+
+    if (count === 1) {
+      await writeLog(userId, account._id, 'info', 'facebook_post_gallery_single_select_fast_path', 'Đã chọn 1 ảnh bằng fast path; bước xác nhận gallery và composer sẽ kiểm tra tiếp.', {
+        requestedCount: count,
+        selectedCount: Math.max(1, selectedCount),
+        initialCellCount: initialCells.length
+      });
+      return { steps, selectedCount: Math.max(1, selectedCount), optimistic: true };
     }
 
     for (let poll = 0; poll < 8; poll += 1) {
@@ -7402,11 +7418,13 @@ async function detectFacebookState(target, text, existingNodes = null) {
   const hasAttachedImage = Boolean(findNodeInNodes(nodes, attachedMediaLabels));
   const observedText = nodes.find((node) => node.className.includes('EditText') && normalizeSearchText(node.text))?.text || '';
   const hasComposerText = Boolean(observedText);
+  const captionVerified = hasTargetText ? verifyCompleteCaption(nodes, text).ok : false;
   if (hasSubmit && (hasTargetText || hasComposerText || hasAttachedImage)) {
     return {
       name: 'ready_to_post',
       reason: 'submit_visible_without_title',
       hasTargetText,
+      captionVerified,
       hasAttachedImage,
       observedText,
       submitPoint,
@@ -7427,6 +7445,7 @@ async function detectFacebookState(target, text, existingNodes = null) {
       name: 'ready_to_post',
       reason: hasSubmit ? 'submit_visible' : 'post_title_with_text',
       hasTargetText,
+      captionVerified,
       hasAttachedImage,
       submitPoint,
       nextPoint: hasComposerNext ? nextPoint : null
@@ -7437,6 +7456,7 @@ async function detectFacebookState(target, text, existingNodes = null) {
       name: 'composer',
       reason: 'post_title_visible',
       hasTargetText,
+      captionVerified,
       hasAttachedImage,
       submitPoint,
       nextPoint: hasComposerNext ? nextPoint : null
