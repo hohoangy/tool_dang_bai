@@ -7103,7 +7103,8 @@ async function attachFacebookImages(account, userId, target, imageCount = 1, tex
     throw new Error('Facebook không mở được thư viện ảnh.');
   }
   const selection = await selectGalleryImagesByAccessibility(account, userId, target, count, {
-    initialNodes: galleryNodes
+    initialNodes: galleryNodes,
+    fallbackCell: imageMatch
   });
   steps.push(...selection.steps);
   const selectedCount = selection.selectedCount;
@@ -7201,7 +7202,15 @@ async function selectGalleryImagesByAccessibility(account, userId, target, count
   let selectedCount = countSelectedGalleryImages(nodes);
   if (selectedCount >= count) return { steps, selectedCount };
 
-  const initialCells = getGalleryImageCells(nodes).filter((cell) => !cell.selected).slice(0, count - selectedCount);
+  const fallbackCell = normalizeGalleryFallbackCell(options.fallbackCell);
+  const baseCells = getGalleryImageCells(nodes);
+  if (fallbackCell && !baseCells.some((cell) => boundsOverlap(cell, fallbackCell) >= 0.8)) {
+    baseCells.push(fallbackCell);
+  }
+  const initialCells = baseCells
+    .sort((a, b) => (a.top - b.top) || (a.left - b.left))
+    .filter((cell) => !cell.selected)
+    .slice(0, count - selectedCount);
 
   if (initialCells.length >= count - selectedCount) {
     for (let index = 0; index < initialCells.length; index += 1) {
@@ -7286,9 +7295,13 @@ function getGalleryImageCells(nodes) {
   const galleryCells = [];
   for (const node of nodes) {
     const description = normalizeSearchText(`${node.text} ${node.desc}`);
+    const width = Math.max(0, (node.bounds?.right || 0) - (node.bounds?.left || 0));
+    const height = Math.max(0, (node.bounds?.bottom || 0) - (node.bounds?.top || 0));
+    const area = width * height;
+    const galleryLikeClass = /(?:Button|ViewGroup|ImageView|FrameLayout|View)$/i.test(node.className || '');
     if (
-      !node.clickable
-      || !['android.widget.Button', 'android.view.ViewGroup'].includes(node.className)
+      !(node.clickable || galleryLikeClass)
+      || area < 4_000
       || !labels.some((label) => description.includes(label))
     ) {
       continue;
@@ -7309,6 +7322,22 @@ function getGalleryImageCells(nodes) {
   }
 
   return galleryCells.sort((a, b) => (a.top - b.top) || (a.left - b.left));
+}
+
+function normalizeGalleryFallbackCell(match) {
+  if (!match || !Number.isFinite(match.left) || !Number.isFinite(match.right) || !Number.isFinite(match.top) || !Number.isFinite(match.bottom)) {
+    return null;
+  }
+  const width = Math.max(0, match.right - match.left);
+  const height = Math.max(0, match.bottom - match.top);
+  if (width * height < 4_000) return null;
+  return {
+    ...match,
+    x: Math.round((match.left + match.right) / 2),
+    y: Math.round((match.top + match.bottom) / 2),
+    selected: Boolean(match.selected),
+    label: match.label || match.text || match.desc || 'gallery image fallback'
+  };
 }
 
 function isGalleryCellSelected(node) {
