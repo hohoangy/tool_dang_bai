@@ -6059,7 +6059,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
         );
         steps.push(...attachment.steps);
         attachedImageCount += attachment.attachedCount || 1;
-        await delay(postStepDelay(1.25));
+        await delay(postStepDelay(0.6));
         continue;
       }
 
@@ -6080,7 +6080,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
         const next = await tapAndLog(userId, account._id, target, 'facebook_post_tap_next', state.nextPoint);
         steps.push(next);
         composerNextTaps += 1;
-        await delay(postStepDelay(1.5));
+        await delay(postStepDelay(0.8));
         continue;
       }
 
@@ -6141,7 +6141,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
           );
           steps.push(...attachment.steps);
           attachedImageCount += attachment.attachedCount || 1;
-          await delay(postStepDelay(1.25));
+          await delay(postStepDelay(0.6));
           continue;
         }
 
@@ -6161,7 +6161,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
           const next = await tapAndLog(userId, account._id, target, 'facebook_post_tap_next_from_composer', state.nextPoint);
           steps.push(next);
           composerNextTaps += 1;
-          await delay(postStepDelay(1.5));
+          await delay(postStepDelay(0.8));
           continue;
         }
         const submitted = await submitFacebookPost(
@@ -6962,7 +6962,12 @@ async function attachFacebookImages(account, userId, target, imageCount = 1, tex
   const openGalleryLabels = options.preserveExisting
     ? [...addMorePhotoLabels, ...galleryLabels]
     : galleryLabels;
-  const galleryMatch = await waitForAnyText(target, openGalleryLabels, 5_000, { exact: true });
+  const canUseFastComposerMediaFallback = ['ready_to_post', 'composer'].includes(currentState.name)
+    && currentState.hasTargetText
+    && currentState.nextPoint;
+  const galleryMatch = canUseFastComposerMediaFallback
+    ? null
+    : await waitForAnyText(target, openGalleryLabels, 1_800, { exact: true });
   const canUseComposerMediaFallback = !galleryMatch
     && ['ready_to_post', 'composer'].includes(currentState.name)
     && currentState.hasTargetText
@@ -7002,6 +7007,7 @@ async function attachFacebookImages(account, userId, target, imageCount = 1, tex
     });
   }
   let imageMatch = null;
+  let galleryNodes = null;
   let shouldTapGallery = true;
   for (let openAttempt = 1; openAttempt <= 5 && !imageMatch; openAttempt += 1) {
     const openPoint = galleryMatch
@@ -7016,10 +7022,11 @@ async function attachFacebookImages(account, userId, target, imageCount = 1, tex
         openPoint
       );
       steps.push(gallery);
-      await delay(openAttempt === 1 ? 750 : 1_150);
+      await delay(openAttempt === 1 ? 420 : 850);
     }
 
     let nodesAfterGalleryTap = await dumpVisibleNodes(target);
+    galleryNodes = nodesAfterGalleryTap;
     const systemAnr = detectSystemUiAnr(nodesAfterGalleryTap);
     if (systemAnr) {
       const recovered = await recoverSystemUiAnr(account, userId, target, {
@@ -7062,9 +7069,10 @@ async function attachFacebookImages(account, userId, target, imageCount = 1, tex
       imageMatch = immediateCells[0];
     }
     if (!imageMatch) {
-      imageMatch = await waitForAnyText(target, selectedImageLabels, openAttempt === 1 ? 4_000 : 3_000);
+      imageMatch = await waitForAnyText(target, selectedImageLabels, openAttempt === 1 ? 1_800 : 2_500);
       if (!imageMatch) {
         nodesAfterGalleryTap = await dumpVisibleNodes(target);
+        galleryNodes = nodesAfterGalleryTap;
         const cells = getGalleryImageCells(nodesAfterGalleryTap);
         if (cells.length) {
           imageMatch = cells[0];
@@ -7090,7 +7098,9 @@ async function attachFacebookImages(account, userId, target, imageCount = 1, tex
     });
     throw new Error('Facebook không mở được thư viện ảnh.');
   }
-  const selection = await selectGalleryImagesByAccessibility(account, userId, target, count);
+  const selection = await selectGalleryImagesByAccessibility(account, userId, target, count, {
+    initialNodes: galleryNodes
+  });
   steps.push(...selection.steps);
   const selectedCount = selection.selectedCount;
   if (selectedCount < count) {
@@ -7178,9 +7188,11 @@ async function waitForFacebookAttachableComposer(account, userId, target, text, 
   return lastState || { name: 'unknown', reason: 'attach_composer_wait_timeout', hasTargetText: false };
 }
 
-async function selectGalleryImagesByAccessibility(account, userId, target, count) {
+async function selectGalleryImagesByAccessibility(account, userId, target, count, options = {}) {
   const steps = [];
-  let nodes = await dumpVisibleNodes(target);
+  let nodes = Array.isArray(options.initialNodes) && options.initialNodes.length
+    ? options.initialNodes
+    : await dumpVisibleNodes(target);
   let selectedCount = countSelectedGalleryImages(nodes);
   const initialCells = getGalleryImageCells(nodes).filter((cell) => !cell.selected).slice(0, count - selectedCount);
 
