@@ -16,6 +16,7 @@ const openAppInFlight = new Map();
 const instagramPublishQueues = new Map();
 const accountRuntimeTargets = new Map();
 const androidUiReadyCache = new Map();
+const androidStorageReadyCache = new Map();
 const instagramDisplaySizeCache = new Map();
 const instagramSharePrewarmCache = new Map();
 const instagramShareMethodCache = new Map();
@@ -24,6 +25,7 @@ const facebookMediaCacheRoot = '/sdcard/Pictures/SocialPilotCache';
 const instagramPermissionCacheTtlMs = 10 * 60 * 1000;
 const uiDumpCacheTtlMs = 350;
 const androidUiReadyCacheTtlMs = 12_000;
+const androidStorageReadyCacheTtlMs = 2 * 60 * 1000;
 const instagramDisplaySizeCacheTtlMs = 10 * 60 * 1000;
 const instagramSharePrewarmCacheTtlMs = 4 * 60 * 1000;
 const instagramShareMethodCacheTtlMs = 10 * 60 * 1000;
@@ -967,6 +969,16 @@ async function waitForSystemUiHealthy(account, userId, target, options = {}) {
 }
 
 async function ensureAndroidStorageReady(account, userId, target, attempts = 45) {
+  const cached = androidStorageReadyCache.get(target);
+  if (cached && Date.now() - cached.at < androidStorageReadyCacheTtlMs) {
+    return {
+      ok: true,
+      cached: true,
+      elapsedMs: 0,
+      ...cached.result
+    };
+  }
+
   let lastCheck = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const boot = await runCommand(env.mobileAutomation.adbPath, [
@@ -1002,6 +1014,10 @@ async function ensureAndroidStorageReady(account, userId, target, attempts = 45)
       if (attempt > 1) {
         await writeLog(userId, account._id, 'info', 'android_storage_ready', `Bộ nhớ ${target} đã sẵn sàng sau ${attempt} lần kiểm tra.`);
       }
+      androidStorageReadyCache.set(target, {
+        at: Date.now(),
+        result: { attempt }
+      });
       return { ok: true, attempt, boot, storage };
     }
 
@@ -2593,17 +2609,15 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
     } else if (images.length > 1) {
       const pipelineStartedAt = Date.now();
       await assertDeviceConnected(target, 'trước khi mở Facebook composer');
+      preparedImages = await prepareFacebookImages(account, userId, target, images, { cleanup: false, skipPermissionGrant: true, storageAttempts: 8 });
       await resetFacebookAppBeforeComposer(account, userId, target, config.appPackage, steps);
-      [preparedImages, openHome] = await Promise.all([
-        prepareFacebookImages(account, userId, target, images, { cleanup: true }),
-        openFacebookComposer(account, userId, target, config, text, [], 'image')
-      ]);
+      openHome = await openFacebookComposer(account, userId, target, config, text, [], 'image');
       await writeLog(
         userId,
         account._id,
         'info',
-        'facebook_post_parallel_preparation',
-        'Đã chuẩn bị ảnh song song; Facebook sẽ chọn toàn bộ ảnh trong một lượt theo đúng thứ tự.',
+        'facebook_post_multi_image_preparation',
+        'Đã chuẩn bị ảnh nhiều ảnh trước khi mở Facebook để tránh quá tải System UI.',
         {
           imageCount: preparedImages.length,
           durationMs: Date.now() - pipelineStartedAt,
@@ -2612,7 +2626,7 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
       );
       perf.mark('images_prepared_and_composer_opened', { imageCount: preparedImages.length, method: openHome.method || '' });
     } else if (images.length === 1) {
-      preparedImages = await prepareFacebookImages(account, userId, target, images, { cleanup: false });
+      preparedImages = await prepareFacebookImages(account, userId, target, images, { cleanup: false, storageAttempts: 8 });
       perf.mark('image_prepared', { imageCount: preparedImages.length });
       await assertDeviceConnected(target, 'trước khi mở Facebook composer');
       await resetFacebookAppBeforeComposer(account, userId, target, config.appPackage, steps);
@@ -5204,7 +5218,7 @@ async function cleanupFacebookMediaLibrary(account, userId, target, reason) {
 async function prepareFacebookMediaSession(account, userId, target, options = {}) {
   const cleanupBeforePublish = options.cleanup !== false;
   const steps = [];
-  const storageReady = await ensureAndroidStorageReady(account, userId, target);
+  const storageReady = await ensureAndroidStorageReady(account, userId, target, options.storageAttempts || 45);
   steps.push(storageReady);
   if (!storageReady.ok) throw new Error(storageReady.error);
 
@@ -5269,18 +5283,18 @@ async function prepareFacebookImages(account, userId, target, images, options = 
     descriptor
   )));
 
-  // Chép file là bước nặng nên chạy song song. MediaStore vẫn đăng ký tuần tự
-  // từ ảnh cuối đến ảnh đầu để Facebook Gallery giữ đúng thứ tự Preview.
+  // Chép file chạy song song. Đăng ký MediaStore theo batch nhỏ để giữ tốc độ
+  // nhưng không làm ADB/System UI quá tải trên LDPlayer.
   const preparedImages = [];
-  for (const pushedImage of [...pushedImages].reverse()) {
-    preparedImages.push(await registerFacebookImageMedia(
+  for (let index = 0; index < pushedImages.length; index += 2) {
+    const batch = pushedImages.slice(index, index + 2);
+    preparedImages.push(...await Promise.all(batch.map((pushedImage) => registerFacebookImageMedia(
       account,
       userId,
       target,
       pushedImage
-    ));
+    ))));
   }
-  preparedImages.reverse();
   if (preparedImages[0]) {
     preparedImages[0].steps = [...mediaSession.steps, ...preparedImages[0].steps];
   }
@@ -6992,9 +7006,39 @@ async function selectGalleryImagesByAccessibility(account, userId, target, count
   const steps = [];
   let nodes = await dumpVisibleNodes(target);
   let selectedCount = countSelectedGalleryImages(nodes);
-  let attempts = 0;
+  const initialCells = getGalleryImageCells(nodes).filter((cell) => !cell.selected).slice(0, count - selectedCount);
 
-  while (selectedCount < count && attempts < count * 3) {
+  if (initialCells.length >= count - selectedCount) {
+    for (let index = 0; index < initialCells.length; index += 1) {
+      const candidate = initialCells[index];
+      const beforeCount = selectedCount + index;
+      const selectImage = await tapAndLog(
+        userId,
+        account._id,
+        target,
+        `facebook_post_select_image_${beforeCount + 1}`,
+        { x: candidate.x, y: candidate.y }
+      );
+      steps.push(selectImage);
+      await delay(180);
+    }
+
+    for (let poll = 0; poll < 8; poll += 1) {
+      await delay(poll < 3 ? 350 : 550);
+      nodes = await dumpVisibleNodes(target);
+      selectedCount = countSelectedGalleryImages(nodes);
+      if (selectedCount >= count) return { steps, selectedCount };
+    }
+
+    await writeLog(userId, account._id, 'warn', 'facebook_post_gallery_batch_select_pending', 'Facebook chưa ghi nhận đủ ảnh sau lượt chọn nhanh; chuyển sang xác nhận từng ảnh còn thiếu.', {
+      requestedCount: count,
+      selectedCount,
+      initialCellCount: initialCells.length
+    });
+  }
+
+  let attempts = 0;
+  while (selectedCount < count && attempts < count * 2) {
     attempts += 1;
     const cells = getGalleryImageCells(nodes);
     const candidate = cells.find((cell) => !cell.selected);
@@ -7011,8 +7055,8 @@ async function selectGalleryImagesByAccessibility(account, userId, target, count
     steps.push(selectImage);
 
     let changed = false;
-    for (let poll = 0; poll < 6; poll += 1) {
-      await delay(300);
+    for (let poll = 0; poll < 4; poll += 1) {
+      await delay(250);
       nodes = await dumpVisibleNodes(target);
       selectedCount = countSelectedGalleryImages(nodes);
       if (selectedCount > beforeCount) {
