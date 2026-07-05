@@ -6245,7 +6245,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
             return { finalState, screenshot, steps, composerPending: true, submitVerified: false, submitReason: 'next_not_advancing' };
           }
         }
-        const next = await tapAndLog(userId, account._id, target, 'facebook_post_tap_next', state.nextPoint);
+        const next = await tapFacebookNextButton(account, userId, target, 'facebook_post_tap_next', state.nextPoint);
         steps.push(next);
         composerNextTaps += 1;
         await delay(postStepDelay(0.8));
@@ -6326,7 +6326,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
           return { finalState, screenshot, steps, composerPending: false };
         }
         if (state.nextPoint) {
-          const next = await tapAndLog(userId, account._id, target, 'facebook_post_tap_next_from_composer', state.nextPoint);
+          const next = await tapFacebookNextButton(account, userId, target, 'facebook_post_tap_next_from_composer', state.nextPoint);
           steps.push(next);
           composerNextTaps += 1;
           await delay(postStepDelay(0.8));
@@ -6552,12 +6552,7 @@ async function waitForFacebookMediaComposer(target, text, mediaKind = 'image', t
 }
 
 async function submitFacebookPost(account, userId, target, config, text, steps, action, mediaCount = 0, knownSubmitPoint = null, mediaKind = 'image') {
-  const submitAttempts = knownSubmitPoint
-    ? [
-      { method: 'state_detection', point: knownSubmitPoint },
-      { method: 'state_detection_retry_same_point', point: knownSubmitPoint }
-    ]
-    : await buildSubmitTapAttempts(target);
+  const submitAttempts = await buildSubmitTapAttempts(target, knownSubmitPoint);
   let submitAccepted = false;
   let submitProgressSeen = false;
 
@@ -6685,30 +6680,39 @@ async function submitFacebookPost(account, userId, target, config, text, steps, 
   };
 }
 
-async function buildSubmitTapAttempts(target) {
+async function buildSubmitTapAttempts(target, knownSubmitPoint = null) {
   const nodes = await dumpVisibleNodes(target);
   const submitNode = findSemanticSubmitButton(nodes);
-  if (!submitNode) {
-    const size = await getDeviceScreenSize(target);
-    const width = size?.width || 900;
-    return [
-      { method: 'fallback_top_right_primary', point: { x: Math.round(width - 52), y: 72 } },
-      { method: 'fallback_top_right_secondary', point: { x: Math.round(width - 110), y: 72 } },
-      { method: 'fallback_top_right_lower', point: { x: Math.round(width - 52), y: 145 } }
-    ];
-  }
-
   const submitPoint = submitNode
     ? {
       x: Math.round((submitNode.left + submitNode.right) / 2),
       y: Math.round((submitNode.top + submitNode.bottom) / 2)
     }
     : null;
-  const points = [
-    { method: 'semantic_button', point: submitPoint }
-  ].filter((item) => item?.point?.x && item?.point?.y);
+  const points = [];
+  if (submitPoint) {
+    points.push({ method: 'semantic_button', point: submitPoint });
+  }
+  if (knownSubmitPoint && !points.some((item) => pointsDistance(item.point, knownSubmitPoint) <= 8)) {
+    points.push({ method: 'state_detection_fallback', point: knownSubmitPoint });
+  }
+  if (!points.length) {
+    const size = await getDeviceScreenSize(target);
+    const width = size?.width || 900;
+    points.push(
+      { method: 'fallback_top_right_primary', point: { x: Math.round(width - 52), y: 72 } },
+      { method: 'fallback_top_right_secondary', point: { x: Math.round(width - 110), y: 72 } },
+      { method: 'fallback_top_right_lower', point: { x: Math.round(width - 52), y: 145 } }
+    );
+  }
 
   return points;
+}
+
+function pointsDistance(left = {}, right = {}) {
+  const dx = Number(left.x || 0) - Number(right.x || 0);
+  const dy = Number(left.y || 0) - Number(right.y || 0);
+  return Math.sqrt((dx * dx) + (dy * dy));
 }
 
 function findSemanticSubmitButton(nodes) {
@@ -7112,6 +7116,41 @@ function findPostingProgressNode(nodes) {
   return null;
 }
 
+async function tapFacebookNextButton(account, userId, target, action, fallbackPoint = null) {
+  const nodes = await dumpVisibleNodes(target);
+  const match = findNodeInNodes(nodes, facebookComposerNextLabels, { exact: true, preferBottomRight: true });
+  const point = match
+    ? {
+      x: Math.round((match.left + match.right) / 2),
+      y: Math.round((match.top + match.bottom) / 2)
+    }
+    : fallbackPoint;
+  if (!point?.x || !point?.y) {
+    const screenshot = await captureScreenshot(account, userId, `${action}_missing`);
+    await writeLog(userId, account._id, 'error', `${action}_missing`, 'Không tìm thấy nút Tiếp trong Facebook composer.', {
+      labels: facebookComposerNextLabels,
+      screenshot
+    });
+    throw new Error('Không tìm thấy nút Tiếp trong Facebook composer.');
+  }
+
+  const result = await tapAndLog(userId, account._id, target, action, point);
+  await writeLog(
+    userId,
+    account._id,
+    match ? 'info' : 'warn',
+    match ? `${action}_by_text` : `${action}_by_point`,
+    match ? `Tap nút Tiếp theo UI text "${match.label}".` : 'Không tìm thấy UI text nút Tiếp, dùng tọa độ fallback đã detect từ state.',
+    {
+      label: match?.label || '',
+      bounds: match || null,
+      point,
+      fallbackPoint
+    }
+  );
+  return { ...result, matchedText: match?.label || '', point };
+}
+
 async function attachFacebookImages(account, userId, target, imageCount = 1, text = '', options = {}) {
   const steps = [];
   const count = Math.max(1, Math.min(Number(imageCount) || 1, 4));
@@ -7321,10 +7360,10 @@ async function attachFacebookImages(account, userId, target, imageCount = 1, tex
     });
     throw new Error('Không tìm thấy nút xác nhận chọn ảnh.');
   }
-  const next = await tapAndLog(userId, account._id, target, 'facebook_post_gallery_next', {
+  const next = await tapTextOrPoint(account, userId, target, galleryNextLabels, {
     x: Math.round((nextMatch.left + nextMatch.right) / 2),
     y: Math.round((nextMatch.top + nextMatch.bottom) / 2)
-  });
+  }, 'facebook_post_gallery_next', { exact: true, preferBottomRight: true });
   steps.push(next);
   await delay(count === 1 ? 450 : 750);
 
