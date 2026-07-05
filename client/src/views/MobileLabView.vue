@@ -510,6 +510,8 @@ const operationalPostRunActions = new Set([
   'facebook_post_submit_unverified',
   'facebook_post_submit_blocked',
   'facebook_post_state_machine_pending',
+  'facebook_post_next_not_advancing',
+  'facebook_post_composer_editor_not_opening',
   'facebook_post_image_attach_failed',
   'facebook_post_video_upload_reverted',
   'facebook_post_failed_auth_required',
@@ -574,6 +576,14 @@ const postRunActionLabels = {
   facebook_post_state_machine_pending: {
     title: 'Chưa tới được màn đăng bài',
     detail: 'Automation chưa đưa Facebook về đúng trạng thái.'
+  },
+  facebook_post_next_not_advancing: {
+    title: 'Nút Tiếp không chuyển màn',
+    detail: 'Facebook không phản hồi sau nhiều lần bấm Tiếp; tool đã dừng để tránh lặp thao tác.'
+  },
+  facebook_post_composer_editor_not_opening: {
+    title: 'Composer không mở editor',
+    detail: 'Facebook hoặc System UI không phản hồi khi mở editor nhập nội dung.'
   },
   facebook_post_image_attach_failed: {
     title: 'Gắn ảnh chưa thành công',
@@ -687,13 +697,20 @@ const postResultSummary = computed(() => {
   }
   if (postResult.value.autoSubmit) {
     const reasonDetails = {
+      state_machine_pending: 'Automation chưa đưa Facebook tới bước bấm Đăng an toàn.',
+      composer_editor_not_opening: 'Facebook không mở editor sau nhiều lần tap composer; có thể System UI hoặc Facebook đang treo.',
+      next_not_advancing: 'Facebook không chuyển màn sau nhiều lần bấm Tiếp; tool đã dừng để tránh bấm lặp.',
       video_upload_reverted_to_composer: 'Facebook đã bắt đầu tải video nhưng quay lại màn soạn bài. Video chưa được đăng.',
       still_in_composer: 'Facebook vẫn giữ màn soạn bài và chưa nhận thao tác đăng.',
       video_upload_timeout: 'Facebook tải video quá thời gian cho phép.',
       published_post_evidence_pending: 'Facebook đã rời composer nhưng chưa tìm thấy đúng bài mới trên feed.'
     };
+    const preSubmitReasons = new Set(['state_machine_pending', 'composer_editor_not_opening', 'next_not_advancing', 'caption_not_verified']);
+    const title = preSubmitReasons.has(postResult.value.submitReason)
+      ? 'Chưa gửi được bài'
+      : 'Đã bấm Đăng nhưng cần kiểm tra';
     return {
-      title: 'Đã bấm Đăng nhưng cần kiểm tra',
+      title,
       detail: `${reasonDetails[postResult.value.submitReason] || 'Automation chưa xác nhận được bài đã lên feed.'}${elapsedDetail} Hãy xem ảnh trạng thái mới nhất.`,
       tone: 'warn'
     };

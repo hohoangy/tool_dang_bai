@@ -2880,7 +2880,14 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
     const submitVerified = stateMachine.submitVerified ?? false;
     const submitReason = stateMachine.submitReason || (config.autoSubmit && stateMachine.composerPending ? 'state_machine_pending' : '');
     const finishedLevel = config.autoSubmit && !submitVerified ? 'warn' : 'info';
-    await writeLog(userId, account._id, finishedLevel, 'facebook_post_finished', config.autoSubmit && !submitVerified ? 'Đã bấm Đăng nhưng chưa xác nhận Facebook đã nhận bài.' : (config.autoSubmit ? 'Đã chạy luồng tự đăng Facebook.' : 'Đã mở composer Facebook, chờ kiểm tra/tự bấm đăng.'), {
+    const reachedSubmitPhase = ['submitted', 'submit_unverified', 'home'].includes(stateMachine.finalState)
+      || ['home_after_next', 'published_post_evidence_pending', 'upload_completed_and_post_visible', 'published_post_visible'].includes(submitReason);
+    const finishedMessage = config.autoSubmit && !submitVerified
+      ? (reachedSubmitPhase
+        ? 'Đã bấm Đăng nhưng chưa xác nhận Facebook đã nhận bài.'
+        : 'Chưa gửi được bài; automation dừng trước bước xác nhận Đăng để tránh thao tác lặp.')
+      : (config.autoSubmit ? 'Đã chạy luồng tự đăng Facebook.' : 'Đã mở composer Facebook, chờ kiểm tra/tự bấm đăng.');
+    await writeLog(userId, account._id, finishedLevel, 'facebook_post_finished', finishedMessage, {
       autoSubmit: config.autoSubmit,
       finalState: stateMachine.finalState,
       submitVerified,
@@ -5880,6 +5887,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
   let unknownStateStreak = 0;
   let textEntered = false;
   let composerNextTaps = 0;
+  let composerTextOpenAttempts = 0;
   let attachedImageCount = options.imageSharedByIntent && images.length ? 1 : 0;
   const imageCount = images.length;
   let screenshot = null;
@@ -5903,6 +5911,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
   for (let attempt = 1; attempt <= 12; attempt += 1) {
     const state = await resolveFacebookOpenState(target, await detectFacebookState(target, text));
     if (state.hasTargetText) textEntered = true;
+    if (state.name !== 'composer' || state.hasTargetText) composerTextOpenAttempts = 0;
     finalState = state.name;
     unknownStateStreak = state.name === 'unknown' ? unknownStateStreak + 1 : 0;
     await writeLog(userId, account._id, 'info', 'facebook_post_state', `Facebook state: ${state.name}.`, {
@@ -6123,6 +6132,32 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
       }
 
       if (state.nextPoint) {
+        if (composerNextTaps >= 2) {
+          const healthy = await waitForSystemUiHealthy(account, userId, target, {
+            phase: 'facebook_next_tap_stalled',
+            stableChecks: 2,
+            maxAttempts: 5,
+            initialDelayMs: 250
+          });
+          steps.push(healthy);
+          if (healthy.recoveryCount > 0) {
+            await writeLog(userId, account._id, 'warn', 'facebook_post_next_tap_recovered_system_ui', 'System UI vừa hồi phục sau khi nút Tiếp không chuyển màn; kiểm tra lại trạng thái trước khi bấm tiếp.', {
+              composerNextTaps,
+              healthy
+            });
+            invalidateUiDump(target);
+            await delay(postStepDelay(0.8));
+            continue;
+          }
+          if (composerNextTaps >= 4) {
+            screenshot = await captureScreenshot(account, userId, 'facebook_post_next_not_advancing');
+            await writeLog(userId, account._id, 'warn', 'facebook_post_next_not_advancing', 'Facebook không chuyển màn sau nhiều lần bấm Tiếp; dừng để tránh bấm lặp.', {
+              composerNextTaps,
+              state
+            });
+            return { finalState, screenshot, steps, composerPending: true, submitVerified: false, submitReason: 'next_not_advancing' };
+          }
+        }
         const next = await tapAndLog(userId, account._id, target, 'facebook_post_tap_next', state.nextPoint);
         steps.push(next);
         composerNextTaps += 1;
@@ -6225,6 +6260,33 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
         return submitted;
       }
 
+      composerTextOpenAttempts += 1;
+      if (composerTextOpenAttempts >= 3) {
+        const healthy = await waitForSystemUiHealthy(account, userId, target, {
+          phase: 'facebook_composer_tap_stalled',
+          stableChecks: 2,
+          maxAttempts: 5,
+          initialDelayMs: 250
+        });
+        steps.push(healthy);
+        if (healthy.recoveryCount > 0) {
+          await writeLog(userId, account._id, 'warn', 'facebook_post_composer_tap_recovered_system_ui', 'System UI vừa hồi phục sau khi composer không mở editor; kiểm tra lại trạng thái trước khi tap tiếp.', {
+            composerTextOpenAttempts,
+            healthy
+          });
+          invalidateUiDump(target);
+          await delay(postStepDelay(0.8));
+          continue;
+        }
+        if (composerTextOpenAttempts >= 8) {
+          screenshot = await captureScreenshot(account, userId, 'facebook_post_composer_editor_not_opening');
+          await writeLog(userId, account._id, 'warn', 'facebook_post_composer_editor_not_opening', 'Facebook không mở editor sau nhiều lần tap composer; dừng để tránh treo workflow.', {
+            composerTextOpenAttempts,
+            state
+          });
+          return { finalState, screenshot, steps, composerPending: true, submitVerified: false, submitReason: 'composer_editor_not_opening' };
+        }
+      }
       const bodyTap = await tapTextOrPoint(account, userId, target, composerLabels, { x: 450, y: 218 }, 'facebook_post_open_text_editor');
       steps.push(bodyTap);
       await delay(postStepDelay(1.25));
