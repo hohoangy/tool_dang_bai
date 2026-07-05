@@ -5876,7 +5876,7 @@ async function openFacebookHome(account, userId, target, config, shareIntent) {
 async function runFacebookPostStateMachine(account, userId, target, config, text, images = [], options = {}) {
   const steps = [];
   const mediaKind = options.mediaKind === 'video' ? 'video' : 'image';
-  let recoveredEmptyUiOnce = false;
+  let emptyUiRecoveryCount = 0;
   let unknownStateStreak = 0;
   let textEntered = false;
   let composerNextTaps = 0;
@@ -5900,7 +5900,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
     );
   }
 
-  for (let attempt = 1; attempt <= 10; attempt += 1) {
+  for (let attempt = 1; attempt <= 12; attempt += 1) {
     const state = await resolveFacebookOpenState(target, await detectFacebookState(target, text));
     if (state.hasTargetText) textEntered = true;
     finalState = state.name;
@@ -5926,26 +5926,71 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
 
     if (state.name === 'unknown' && state.reason === 'no_uiautomator_nodes') {
       await assertDeviceConnected(target, 'trong lúc điều khiển Facebook');
-      if (recoveredEmptyUiOnce) {
+      if (emptyUiRecoveryCount >= 2) {
         screenshot = await captureScreenshot(account, userId, 'facebook_ui_nodes_unavailable');
         throw new Error('Facebook hoặc System UI không phản hồi trên LDPlayer. Đã dừng sớm để tránh workflow chạy treo.');
       }
-      recoveredEmptyUiOnce = true;
+      emptyUiRecoveryCount += 1;
       await writeLog(
         userId,
         account._id,
         'warn',
         'facebook_post_empty_ui_recovery',
-        'UIAutomator chưa trả node; tạm dừng nhập liệu và chờ System UI/Facebook ổn định lại.',
-        { attempt, textEntered }
+        emptyUiRecoveryCount === 1
+          ? 'UIAutomator chưa trả node; tạm dừng nhập liệu và chờ System UI/Facebook ổn định lại.'
+          : 'UIAutomator vẫn chưa trả node; khởi động lại Facebook để phục hồi màn đăng.',
+        { attempt, textEntered, recoveryCount: emptyUiRecoveryCount }
       );
-      const healthy = await waitForSystemUiHealthy(account, userId, target, {
-        phase: 'facebook_empty_ui_recovery',
-        stableChecks: 2,
-        maxAttempts: 8,
-        initialDelayMs: 600
-      });
-      steps.push(healthy);
+      let healthy = null;
+      if (emptyUiRecoveryCount === 1) {
+        healthy = await waitForSystemUiHealthy(account, userId, target, {
+          phase: 'facebook_empty_ui_recovery',
+          stableChecks: 2,
+          maxAttempts: 8,
+          initialDelayMs: 600
+        });
+        steps.push(healthy);
+      } else {
+        const stop = await runCommand(env.mobileAutomation.adbPath, [
+          '-s',
+          target,
+          'shell',
+          'am',
+          'force-stop',
+          config.appPackage
+        ], { timeoutMs: 8_000 });
+        steps.push(stop);
+        await writeLog(
+          userId,
+          account._id,
+          stop.ok ? 'info' : 'warn',
+          'facebook_post_empty_ui_app_restart',
+          stop.ok
+            ? 'Đã force-stop Facebook sau khi UIAutomator mất node lặp lại.'
+            : 'Không force-stop được Facebook sau khi UIAutomator mất node lặp lại.',
+          stop
+        );
+        await delay(900);
+        const launch = await launchFacebookWarm(target, config.appPackage);
+        steps.push(launch);
+        await writeLog(
+          userId,
+          account._id,
+          launch.ok ? 'info' : 'warn',
+          'facebook_post_empty_ui_reopen_app',
+          launch.ok
+            ? 'Đã mở lại Facebook sau phục hồi UIAutomator.'
+            : 'Không mở lại được Facebook sau phục hồi UIAutomator.',
+          launch
+        );
+        healthy = await waitForSystemUiHealthy(account, userId, target, {
+          phase: 'facebook_empty_ui_app_restart',
+          stableChecks: 2,
+          maxAttempts: 8,
+          initialDelayMs: 800
+        });
+        steps.push(healthy);
+      }
       invalidateUiDump(target);
       if (!healthy.ok) {
         screenshot = await captureScreenshot(account, userId, 'facebook_ui_recovery_failed');
