@@ -337,9 +337,25 @@ export async function openLdPlayer(account, userId) {
 
   const wasRunningBeforeLaunch = Boolean(instance?.running);
   const engineWaitMs = wasRunningBeforeLaunch && !instance.engineReady
-    ? 3_000
-    : Math.max(env.mobileAutomation.launchWaitMs, 45_000);
+    ? 20_000
+    : Math.max(env.mobileAutomation.launchWaitMs, 120_000);
   let engine = await waitForLdPlayerEngine(account, engineWaitMs);
+  if (!engine.ok && engine.expectedTargetState === 'offline') {
+    const killServer = await runCommand(env.mobileAutomation.adbPath, ['kill-server'], { timeoutMs: 10_000 });
+    await delay(1_000);
+    const restartServer = await runCommand(env.mobileAutomation.adbPath, ['start-server'], { timeoutMs: 10_000 });
+    await writeLog(
+      userId,
+      account._id,
+      restartServer.ok ? 'info' : 'warn',
+      'ldplayer_adb_offline_recovery',
+      restartServer.ok
+        ? `${account.instanceName} đang ở trạng thái ADB offline; đã restart ADB server và chờ thêm thay vì reboot LDPlayer sớm.`
+        : `${account.instanceName} đang ADB offline nhưng restart ADB server chưa thành công.`,
+      { engine, killServer, restartServer }
+    );
+    engine = await waitForLdPlayerEngine(account, 60_000);
+  }
   if (!engine.ok) {
     await writeLog(
       userId,
@@ -372,8 +388,12 @@ export async function openLdPlayer(account, userId) {
   }
 
   if (!engine.ok) {
+    const instanceProcessStarted = Boolean(engine.instance?.processId || engine.instance?.androidStarted);
+    const noAdbDevice = !parseConnectedAdbTargets(engine.devices).length;
     const error = new Error(
-      `${account.instanceName} đã mở cửa sổ nhưng Android/ADB chưa khởi động. Hãy đóng instance này trong LDPlayer Manager, mở lại một lần rồi thử tiếp.`
+      instanceProcessStarted && noAdbDevice
+        ? `${account.instanceName} đã có process LDPlayer nhưng ADB không thấy thiết bị. Hãy chạy server/tool trong phiên desktop tương tác, hoặc mở LDPlayer thủ công một lần rồi thử lại.`
+        : `${account.instanceName} đã mở cửa sổ nhưng Android/ADB chưa khởi động. Hãy đóng instance này trong LDPlayer Manager, mở lại một lần rồi thử tiếp.`
     );
     error.code = 'LDPLAYER_ENGINE_NOT_READY';
     error.details = {
@@ -476,13 +496,18 @@ async function waitForLdPlayerEngine(account, timeoutMs = 12_000) {
   const startedAt = Date.now();
   let lastInstance = null;
   let lastDevices = null;
+  let lastExpectedTargetState = '';
 
   while (Date.now() - startedAt < timeoutMs) {
     lastInstance = await getLdPlayerInstanceInfo(account.instanceName);
     lastDevices = await runCommand(env.mobileAutomation.adbPath, ['devices'], { timeoutMs: 4_000 });
-    const connectedTargets = parseConnectedAdbTargets(lastDevices);
+    const deviceRows = parseAdbDeviceRows(lastDevices);
+    const connectedTargets = deviceRows
+      .filter((row) => row.state === 'device')
+      .map((row) => row.serial);
     const configuredTarget = getDeviceTarget(account);
     const expectedTarget = lastInstance?.target || configuredTarget;
+    lastExpectedTargetState = deviceRows.find((row) => row.serial === expectedTarget)?.state || '';
     const target = connectedTargets.includes(expectedTarget)
       ? expectedTarget
       : expectedTarget?.includes(':') && connectedTargets.length === 1
@@ -519,17 +544,25 @@ async function waitForLdPlayerEngine(account, timeoutMs = 12_000) {
     reason: 'engine_start_timeout',
     elapsedMs: Date.now() - startedAt,
     instance: lastInstance,
-    devices: lastDevices
+    devices: lastDevices,
+    expectedTargetState: lastExpectedTargetState
   };
 }
 
 function parseConnectedAdbTargets(result) {
   if (!result?.ok) return [];
+  return parseAdbDeviceRows(result)
+    .filter((row) => row.state === 'device')
+    .map((row) => row.serial);
+}
+
+function parseAdbDeviceRows(result) {
+  if (!result?.ok) return [];
   return String(result.stdout || '')
     .split(/\r?\n/)
     .map((line) => line.trim().split(/\s+/))
-    .filter(([serial, state]) => serial && state === 'device')
-    .map(([serial]) => serial);
+    .filter(([serial, state]) => serial && state)
+    .map(([serial, state]) => ({ serial, state }));
 }
 
 async function isAndroidPackageInstalled(target, packageName) {
@@ -1484,8 +1517,8 @@ async function performOpenAccountApp(account, userId, appPackage) {
         launcherActivity
       });
       throw new Error(`ADB ${target} chưa ổn định khi kiểm tra launcher của ${packageName}. Hãy thử lại sau khi LDPlayer boot xong.`);
-    } else if (packageName === defaultPackages.instagram && packageInstalled.ok) {
-      await writeLog(userId, account._id, 'warn', 'remote_open_app_launcher_unverified', `Chưa xác minh được launcher activity của ${packageName}; package đã tồn tại nên tiếp tục thử mở Instagram.`, {
+    } else if ([defaultPackages.facebook, defaultPackages.instagram].includes(packageName) && packageInstalled.ok) {
+      await writeLog(userId, account._id, 'warn', 'remote_open_app_launcher_unverified', `Chưa xác minh được launcher activity của ${packageName}; package đã tồn tại nên tiếp tục thử mở app.`, {
         target,
         packageName,
         launcherActivity
@@ -1553,12 +1586,16 @@ async function performOpenAccountApp(account, userId, appPackage) {
           ? isFacebookAuthActivity(readiness.foregroundActivity)
             ? createFacebookAuthForegroundResult(readiness)
             : await ensureFacebookHomeOnOpen(account, userId, target, packageName, {
-            fast: true,
+            fast: false,
             recentlyBooted: androidUi.waitedForBoot
           })
           : null
       };
-      await writeLog(userId, account._id, 'info', 'remote_open_app_fast_path', `App ${packageName} đã mở sẵn.`, fastResult);
+      if (packageName === defaultPackages.facebook) {
+        fastResult.ok = Boolean(fastResult.home?.verified || fastResult.home?.state?.name === 'auth_screen');
+        fastResult.facebookHomeVerified = Boolean(fastResult.home?.verified);
+      }
+      await writeLog(userId, account._id, fastResult.ok ? 'info' : 'warn', 'remote_open_app_fast_path', fastResult.ok ? `App ${packageName} đã mở sẵn.` : `App ${packageName} ở foreground nhưng chưa xác minh được trạng thái sẵn sàng.`, fastResult);
       return fastResult;
     }
   }
@@ -1625,11 +1662,32 @@ async function performOpenAccountApp(account, userId, appPackage) {
     home = isFacebookAuthActivity(readiness.foregroundActivity)
       ? createFacebookAuthForegroundResult(readiness)
       : await ensureFacebookHomeOnOpen(account, userId, target, packageName, {
-        fast: true,
+        fast: false,
         recentlyBooted: androidUi.waitedForBoot
       });
   }
-  return { ...result, target, readiness, systemUiHealth, home, androidUi, elapsedMs: Date.now() - startedAt };
+  const finalResult = { ...result, target, readiness, systemUiHealth, home, androidUi, elapsedMs: Date.now() - startedAt };
+  if (packageName === defaultPackages.facebook) {
+    finalResult.ok = Boolean(result.ok && (home?.verified || home?.state?.name === 'auth_screen'));
+    finalResult.facebookHomeVerified = Boolean(home?.verified);
+    if (!finalResult.ok) {
+      await writeLog(
+        userId,
+        account._id,
+        'warn',
+        'remote_open_facebook_not_ready',
+        'Facebook đã mở nhưng chưa xác minh được Feed/Home hoặc màn xác thực.',
+        {
+          target,
+          packageName,
+          home,
+          readiness,
+          systemUiHealth
+        }
+      );
+    }
+  }
+  return finalResult;
 }
 
 function isFacebookAuthActivity(activityName = '') {
@@ -2036,7 +2094,17 @@ async function ensureFacebookHomeOnOpen(account, userId, target, packageName, op
   if (state.name === 'blocked') {
     throwFacebookBlockedError(state);
   }
-  const finalActive = await getForegroundAndroidPackage(target);
+  let finalActive = await getForegroundAndroidPackage(target);
+  if (finalActive.packageName !== packageName && !finalActive.packageName) {
+    const retryReady = await ensureDeviceReady(account, userId, target, 3);
+    target = retryReady.resolvedTarget || target;
+    if (retryReady.ok && String(retryReady.stdout || '').trim() === 'device') {
+      finalActive = await getForegroundAndroidPackage(target);
+    }
+    if (finalActive.packageName !== packageName && active.packageName === packageName) {
+      finalActive = { ...active, reusedAfterTransientFailure: true, retryReady };
+    }
+  }
   if (finalActive.packageName !== packageName) {
     const error = new Error('Facebook chưa mở thành công trên LDPlayer.');
     error.code = 'FACEBOOK_APP_NOT_FOREGROUND';
@@ -2558,15 +2626,34 @@ export async function getAccountRuntimeStatus(account, appPackage) {
   const processId = String(appProcess.stdout || '').trim();
   const appInForeground = Boolean(packageName) && foreground.packageName === packageName;
   const appProcessAlive = Boolean(packageName) && appProcess.ok && Boolean(processId);
+  let platformState = null;
+  let appReady = appInForeground || appProcessAlive;
+  if (packageName === defaultPackages.facebook) {
+    if (appInForeground) {
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        if (attempt > 1) {
+          invalidateUiDump(target);
+          await delay(700);
+        }
+        const nodes = await dumpVisibleNodes(target);
+        platformState = await detectFacebookState(target, '', nodes);
+        if (platformState && !['unknown', 'system_anr'].includes(platformState.name)) break;
+      }
+      appReady = Boolean(platformState && !['unknown', 'system_anr', 'blocked'].includes(platformState.name));
+    } else {
+      appReady = false;
+    }
+  }
   return {
     target,
     deviceReady: true,
-    appReady: appInForeground || appProcessAlive,
+    appReady,
     appInForeground,
     appProcessAlive,
     processId,
     foregroundPackage: foreground.packageName,
-    foregroundActivity: foreground.activityName
+    foregroundActivity: foreground.activityName,
+    platformState
   };
 }
 
