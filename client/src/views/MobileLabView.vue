@@ -35,6 +35,7 @@ const activeLdPlayerAccountId = ref('');
 const runtimeStatusChecking = ref(false);
 const selectedRuntimeStatus = ref(null);
 const runtimeStatusMissCount = ref(0);
+const composerReviewClosePending = ref(false);
 const technicalLogsOpen = ref(false);
 const workflowStage = ref('idle');
 const publishMode = ref('direct');
@@ -46,6 +47,7 @@ const queueRunning = ref(false);
 const queueDelaySeconds = ref(0);
 const queuePhase = ref('idle');
 const queueCurrentAccountId = ref('');
+const queueRunMode = ref('publish');
 const scheduleDateTime = ref(defaultScheduleDateTime());
 const drafts = ref([]);
 const editingDraftId = ref('');
@@ -58,11 +60,15 @@ const maxInstagramAlbumPhotos = 10;
 const maxVideoSizeMb = 100;
 const draftStorageKey = 'socialpilot-platform-composer-drafts';
 const platformDraftStoragePrefix = `${draftStorageKey}-`;
+const composerReviewResultStoragePrefix = 'socialpilot-composer-review-result';
+const composerReviewResultTtlMs = 6 * 60 * 60 * 1000;
 const runtimeStatusIntervalMs = 15_000;
 const runtimeStatusMissLimit = 3;
+const exclusiveLdSessionEnabled = true;
 let runtimeStatusTimer = null;
 let runtimeStatusRequestId = 0;
 let clearComposerConfirmTimer = null;
+let composerReviewCloseTimer = null;
 let collageCache = { key: '', item: null };
 
 const platforms = [
@@ -157,6 +163,14 @@ const selectedAccountLabel = computed(() => selectedAccount.value ? formatAccoun
 const accountInitial = computed(() => selectedAccount.value?.displayName?.slice(0, 1)?.toUpperCase() || 'F');
 const screenshotSrc = computed(() => screenshot.value?.imageBase64 ? `data:image/png;base64,${screenshot.value.imageBase64}` : '');
 const composerScreenshotSrc = computed(() => postResult.value?.screenshot?.imageBase64 ? `data:image/png;base64,${postResult.value.screenshot.imageBase64}` : '');
+const restoredComposerReviewInfo = computed(() => {
+  if (!postResult.value?.restored) return null;
+  return {
+    savedAt: postResult.value.snapshotSavedAt || '',
+    textPreview: postResult.value.snapshotTextPreview || '',
+    accountLabel: postResult.value.snapshotAccountLabel || selectedAccountLabel.value
+  };
+});
 const latestLogs = computed(() => logs.value.slice(0, 80));
 const technicalLogs = computed(() => latestLogs.value.slice(0, 20));
 const technicalLogStats = computed(() => ({
@@ -185,6 +199,7 @@ const platformMaxPhotos = computed(() => {
 });
 const platformRequiresPhoto = computed(() => selectedPlatformId.value === 'instagram');
 const isFacebookVideoMode = computed(() => selectedPlatformId.value === 'facebook' && facebookPostType.value === 'video');
+const isFacebookCollageMode = computed(() => selectedPlatformId.value === 'facebook' && !isFacebookVideoMode.value && selectedPhotoCount.value > 1);
 const uploadedPhotoCount = computed(() => post.media.filter((item) => item.type === 'photo' && item.uploadedUrl).length);
 const uploadedVideoCount = computed(() => post.media.filter((item) => item.type === 'video' && item.uploadedUrl).length);
 const selectedVideo = computed(() => post.media.find((item) => item.type === 'video') || null);
@@ -220,8 +235,12 @@ const availablePhotoLayouts = computed(() => {
   }
   return photoLayouts;
 });
+const selectedPhotoLayout = computed(() => availablePhotoLayouts.value.find((layout) => layout.id === photoLayout.value) || availablePhotoLayouts.value[0] || photoLayouts[0]);
 const previewGalleryClass = computed(() => {
   if (previewPhotos.value.length === 1) return 'grid grid-cols-1';
+  if (selectedPlatformId.value === 'facebook' && previewPhotos.value.length > 1) {
+    return 'grid w-full aspect-[16/9] grid-cols-6 grid-rows-4 gap-0.5';
+  }
   if (previewPhotos.value.length === 2) return 'grid w-full aspect-[16/9] grid-cols-2 gap-0.5';
   if (previewPhotos.value.length === 3) return 'grid w-full aspect-[16/9] grid-cols-2 grid-rows-2 gap-0.5';
   return 'grid w-full aspect-[16/9] grid-cols-3 grid-rows-2 gap-0.5';
@@ -248,12 +267,9 @@ const currentPublishModeShortLabel = computed(() => ({
 const isBulkMode = computed(() => publishMode.value === 'bulk');
 const isReviewMode = computed(() => publishMode.value === 'review');
 const isScheduleMode = computed(() => publishMode.value === 'schedule');
-// Facebook cần được mở trước để ổn định Home/composer. Instagram tự mở
-// ShareHandlerActivity khi chạy workflow nên không được chặn chỉ vì app
-// hiện không nằm ở foreground.
-const requiresFacebookSession = computed(() => selectedPlatformId.value === 'facebook'
-  && !isBulkMode.value
-  && !isScheduleMode.value);
+const isQueueReviewMode = computed(() => isBulkMode.value && queueRunMode.value === 'review');
+// App sẽ được mở tự động khi bấm Đăng. Nút mở app chỉ còn là công cụ phụ
+// để xử lý login/checkpoint hoặc debug thủ công.
 const runtimeConfirmsFacebookApp = computed(() => Boolean(
   selectedRuntimeStatus.value?.deviceReady
   && selectedRuntimeStatus.value?.appReady
@@ -285,6 +301,7 @@ const facebookAppRunningInBackground = computed(() => Boolean(
 ));
 const selectedDeviceReady = computed(() => Boolean(selectedRuntimeStatus.value?.deviceReady));
 const runtimeStatusDetail = computed(() => {
+  if (selectedRuntimeStatus.value?.readinessSummary && !selectedRuntimeStatus.value?.appReady) return selectedRuntimeStatus.value.readinessSummary;
   if (facebookRuntimeWaiting.value) return `Đang chờ ${formatInstanceLabel(selectedAccount.value)} kết nối lại`;
   if (facebookAppInForeground.value) return `${selectedPlatform.value.label} đang mở trên màn hình ${formatInstanceLabel(selectedAccount.value)}`;
   if (facebookAppRunningInBackground.value) return `${selectedPlatform.value.label} đang chạy nền trong ${formatInstanceLabel(selectedAccount.value)}`;
@@ -356,7 +373,6 @@ const submitWaitMs = computed(() => {
 });
 const canRunWorkflow = computed(() => selectedPlatform.value.status === 'ready'
   && canUseRemote.value
-  && (!requiresFacebookSession.value || facebookAppReady.value)
   && queueReady.value
   && scheduleReady.value
   && mediaReady.value
@@ -440,10 +456,10 @@ const preflightItems = computed(() => [
   },
   {
     label: `${selectedPlatform.value.label} app`,
-    detail: !requiresFacebookSession.value
-      ? `${selectedPlatform.value.label} sẽ tự mở khi bắt đầu đăng`
-      : runtimeStatusDetail.value,
-    ok: Boolean(facebookAppPackage.value) && (!requiresFacebookSession.value || facebookAppReady.value),
+    detail: facebookAppReady.value
+      ? runtimeStatusDetail.value
+      : `${selectedPlatform.value.label} sẽ tự mở khi bấm Đăng`,
+    ok: Boolean(facebookAppPackage.value),
     blocking: true
   },
   {
@@ -482,7 +498,6 @@ const readinessSummary = computed(() => {
     return characterCount.value ? 'Đủ điều kiện chạy automation' : 'Đủ điều kiện, caption đang trống';
   }
   if (!contentReady.value && captionRequired.value) return 'Cần nhập nội dung trước khi đăng';
-  if (requiresFacebookSession.value && !facebookAppReady.value) return runtimeStatusDetail.value;
   return `Cần xử lý: ${blockedPreflightItems.value.map((item) => item.label).join(', ')}`;
 });
 const readinessTone = computed(() => {
@@ -514,6 +529,7 @@ const operationalPostRunActions = new Set([
   'facebook_post_composer_editor_not_opening',
   'facebook_post_image_attach_failed',
   'facebook_post_video_upload_reverted',
+  'facebook_native_multi_image_unsupported',
   'facebook_post_failed_auth_required',
   'facebook_post_failed_ld_unstable',
   'facebook_post_failed_gallery_selection',
@@ -533,8 +549,15 @@ const operationalPostRunActions = new Set([
   'instagram_post_failed_ui_state',
   'instagram_post_failed'
 ]);
+function isTechnicalPostRunNoise(log) {
+  return String(log?.action || '').endsWith('_failed_ld_unstable')
+    || log?.metadata?.category === 'ldplayer_unstable'
+    || log?.metadata?.code === 'LDPLAYER_UNSTABLE';
+}
+
 const recentPostRuns = computed(() => latestLogs.value
   .filter((log) => operationalPostRunActions.has(String(log.action || '')))
+  .filter((log) => !isTechnicalPostRunNoise(log))
   .filter((log, index, items) => {
     const accountId = String(log.accountId || '');
     return items.findIndex((item) => String(item.accountId || '') === accountId) === index;
@@ -568,6 +591,10 @@ const postRunActionLabels = {
   facebook_post_video_upload_reverted: {
     title: 'Facebook từ chối tải video',
     detail: 'Facebook đã bắt đầu tải nhưng quay lại màn soạn bài. Hãy thử lại hoặc kiểm tra video/mạng.'
+  },
+  facebook_native_multi_image_unsupported: {
+    title: 'Nhiều ảnh native không hỗ trợ',
+    detail: 'Facebook trên LDPlayer không ổn định với SEND_MULTIPLE; tool sẽ dùng 1 ảnh collage cho nhiều ảnh.'
   },
   facebook_post_submit_blocked: {
     title: 'Facebook bị chặn bởi checkpoint',
@@ -688,6 +715,9 @@ const postResultSummary = computed(() => {
   const elapsedDetail = elapsedMs > 0
     ? ` Hoàn tất trong ${(elapsedMs / 1000).toFixed(1)} giây.`
     : '';
+  const restoredDetail = restoredComposerReviewInfo.value
+    ? ` Ảnh này được khôi phục từ phiên ${formatDate(restoredComposerReviewInfo.value.savedAt)} cho đúng profile và nội dung hiện tại.`
+    : '';
   if (postResult.value.submitVerified) {
     return {
       title: 'Đã xác minh bài đăng',
@@ -715,9 +745,16 @@ const postResultSummary = computed(() => {
       tone: 'warn'
     };
   }
+  if (postResult.value.composerPending || postResult.value.submitReason === 'review_caption_not_verified') {
+    return {
+      title: 'Đã chụp màn composer',
+      detail: `Tool đã dừng ở chế độ kiểm tra, lưu ảnh trạng thái ${selectedPlatform.value.label} và không bấm đăng.${elapsedDetail}${restoredDetail}${composerReviewClosePending.value ? ' LDPlayer sẽ tự đóng sau 30 giây.' : ''}`,
+      tone: 'warn'
+    };
+  }
   return {
-    title: 'Composer đã mở',
-    detail: `Bài đang chờ thao tác trong ${selectedPlatform.value.label} app.${elapsedDetail}`,
+    title: 'Đã chụp màn composer',
+    detail: `Tool đã mở composer, lưu ảnh kiểm tra và không bấm đăng.${elapsedDetail}${restoredDetail}${composerReviewClosePending.value ? ' LDPlayer sẽ tự đóng sau 30 giây.' : ''}`,
     tone: 'run'
   };
 });
@@ -732,7 +769,7 @@ const publishModes = [
     id: 'review',
     title: 'Mở composer để kiểm tra',
     icon: 'shield',
-    description: 'Chỉ nhập nội dung/media vào composer, không tự bấm đăng.'
+    description: 'Nhập nội dung/media, chụp màn hình kiểm tra rồi tự tắt LDPlayer.'
   },
   {
     id: 'bulk',
@@ -759,10 +796,12 @@ const queueStats = computed(() => {
   };
 });
 const primaryActionLabel = computed(() => {
-  if (queueRunning.value) return 'Đang đăng hàng loạt';
+  if (queueRunning.value) return isQueueReviewMode.value ? 'Đang kiểm tra hàng loạt' : 'Đang đăng hàng loạt';
   if (posting.value) return isReviewMode.value ? 'Đang kiểm tra' : `Đang đăng ${selectedPlatform.value.label}`;
   if (isReviewMode.value) return 'Mở kiểm tra';
-  if (isBulkMode.value) return `Bắt đầu đăng (${selectedQueueAccounts.value.length})`;
+  if (isBulkMode.value) return isQueueReviewMode.value
+    ? `Mở kiểm tra (${selectedQueueAccounts.value.length})`
+    : `Bắt đầu đăng (${selectedQueueAccounts.value.length})`;
   if (isScheduleMode.value) return 'Lưu lịch';
   return 'Đăng';
 });
@@ -775,10 +814,8 @@ const professionalKpis = computed(() => [
     label: 'Điều kiện đăng',
     value: blockedPreflightItems.value.length ? 'Cần kiểm tra' : 'Đủ điều kiện',
     detail: blockedPreflightItems.value.length
-      ? (requiresFacebookSession.value && !facebookAppReady.value
-        ? runtimeStatusDetail.value
-        : `Thiếu: ${blockedPreflightItems.value.map((item) => item.label).join(', ')}`)
-      : `Profile, ADB và ${selectedPlatform.value.label} đã sẵn sàng`,
+      ? `Thiếu: ${blockedPreflightItems.value.map((item) => item.label).join(', ')}`
+      : `Profile, ADB và ${selectedPlatform.value.label} sẽ tự chạy khi đăng`,
     tone: blockedPreflightItems.value.length ? 'warn' : 'ok'
   },
   {
@@ -791,9 +828,13 @@ const professionalKpis = computed(() => [
     label: 'Media',
     value: isFacebookVideoMode.value
       ? (uploadedVideoCount.value ? 'Video' : 'Chưa chọn')
-      : post.media.length ? `${uploadedPhotoCount.value}/${post.media.length}` : 'Text',
+      : isFacebookCollageMode.value
+        ? `${uploadedPhotoCount.value} ảnh -> 1 collage`
+        : post.media.length ? `${uploadedPhotoCount.value}/${post.media.length}` : 'Text',
     detail: isFacebookVideoMode.value
       ? 'Đăng video Facebook'
+      : isFacebookCollageMode.value
+        ? 'Facebook sẽ đăng 1 ảnh collage ổn định, không dùng nhiều ảnh native'
       : selectedPlatformId.value === 'instagram'
         ? `Instagram Feed - ${isInstagramAlbumMode.value ? 'Album' : 'Ảnh đơn'}`
       : post.media.length ? 'Ảnh đã sẵn sàng để gắn vào bài' : 'Bài đăng dạng text',
@@ -861,6 +902,13 @@ const professionalActions = computed(() => {
       tone: 'required'
     });
   }
+  if (isFacebookCollageMode.value) {
+    actions.push({
+      title: 'Facebook dùng collage ổn định',
+      detail: `${selectedPhotoCount.value} ảnh sẽ được gộp thành 1 ảnh trước khi mở composer.`,
+      tone: 'optional'
+    });
+  }
   if (isFacebookVideoMode.value && !uploadedVideoCount.value) {
     actions.push({
       title: 'Thêm video Facebook',
@@ -872,13 +920,6 @@ const professionalActions = computed(() => {
     actions.push({
       title: 'Thêm ảnh Instagram',
       detail: 'Instagram cần 1 ảnh đã upload trước khi mở composer.',
-      tone: 'required'
-    });
-  }
-  if (requiresFacebookSession.value && !facebookAppReady.value) {
-    actions.push({
-      title: `Mở ${selectedPlatform.value.label}`,
-      detail: `Mở app ${selectedPlatform.value.label} trong đúng LDPlayer profile trước khi đăng.`,
       tone: 'required'
     });
   }
@@ -1021,24 +1062,14 @@ async function remoteLaunch() {
 async function remoteOpenApp() {
   if (!selectedAccount.value || facebookOpening.value) return;
   const nextAccount = selectedAccount.value;
-  const previousAccount = facebookAppReady.value
-    ? null
-    : await findActiveAccountBeforeSwitch(nextAccount);
-  const shouldClosePrevious = previousAccount && previousAccount._id !== nextAccount._id;
   running.value = true;
   facebookOpening.value = true;
   try {
-    if (shouldClosePrevious) {
-      await http.post(`/mobile/accounts/${previousAccount._id}/remote/close-session`, {
-        appPackage: previousAccount.metadata?.appPackage || selectedPlatform.value.packageName
-      });
-      activeLdPlayerAccountId.value = '';
-      facebookSessionAccountId.value = '';
-    }
+    const handoff = await ensureExclusiveLdSession(nextAccount, 'open_app');
     const { data } = await http.post(`/mobile/accounts/${nextAccount._id}/remote/open-app`, {
       appPackage: nextAccount.metadata?.appPackage || selectedPlatform.value.packageName
     });
-    const backendConfirmed = Boolean(data.result?.ok && data.result?.readiness?.ok);
+    const backendConfirmed = isOpenAppConfirmed(nextAccount, data.result);
     if (backendConfirmed && selectedAccount.value?._id === nextAccount._id) {
       activeLdPlayerAccountId.value = nextAccount._id;
       facebookSessionAccountId.value = nextAccount._id;
@@ -1048,12 +1079,13 @@ async function remoteOpenApp() {
         deviceReady: true,
         appReady: true,
         foregroundPackage: nextAccount.metadata?.appPackage || selectedPlatform.value.packageName,
-        foregroundActivity: data.result?.readiness?.foregroundActivity || ''
+        foregroundActivity: data.result?.readiness?.foregroundActivity || '',
+        platformState: data.result?.home?.state || null
       };
     }
     const runtimeReady = await waitForSelectedAccountRuntimeReady(nextAccount._id);
     if (runtimeReady) {
-      ui.notify(shouldClosePrevious ? `Đã chuyển sang ${nextAccount.displayName}.` : `Đã mở ${selectedPlatform.value.label}.`);
+      ui.notify(handoff.closed.length ? `Đã chuyển LD và mở ${selectedPlatform.value.label}.` : `Đã mở ${selectedPlatform.value.label}.`);
     } else {
       facebookSessionAccountId.value = '';
       ui.notify(data.result?.readiness?.error || `${selectedPlatform.value.label} chưa ổn định, thử mở lại.`, 'error');
@@ -1068,23 +1100,65 @@ async function remoteOpenApp() {
   }
 }
 
+function isOpenAppConfirmed(account, result = {}) {
+  if (!result?.ok) return false;
+  if (account?.platform === 'facebook') {
+    return Boolean(result.facebookHomeVerified || result.home?.verified || result.home?.state?.name === 'auth_screen');
+  }
+  return Boolean(result.readiness?.ok || result.readiness?.appReady);
+}
+
+function getAccountAppPackage(account) {
+  return account?.metadata?.appPackage || platforms.find((platform) => platform.id === account?.platform)?.packageName || selectedPlatform.value.packageName;
+}
+
+function isSameLdSlot(left, right) {
+  if (!left || !right) return false;
+  const leftSlot = getLdPlayerSlot(left);
+  const rightSlot = getLdPlayerSlot(right);
+  return Number.isFinite(leftSlot) && leftSlot === rightSlot;
+}
+
+async function ensureExclusiveLdSession(nextAccount, reason = 'switch') {
+  if (!exclusiveLdSessionEnabled || !nextAccount) return { closed: [], skipped: true };
+  const previousAccount = await findActiveAccountBeforeSwitch(nextAccount);
+  if (!previousAccount) return { closed: [] };
+
+  const { data } = await http.post(`/mobile/accounts/${previousAccount._id}/remote/close-session`, {
+    appPackage: getAccountAppPackage(previousAccount),
+    reason
+  });
+  if (!data.result?.ok) {
+    throw new Error(`Chưa tắt hoàn toàn ${formatInstanceLabel(previousAccount)}. Dừng lại để tránh chạy nhiều LDPlayer cùng lúc.`);
+  }
+
+  if (facebookSessionAccountId.value === previousAccount._id) facebookSessionAccountId.value = '';
+  if (activeLdPlayerAccountId.value === previousAccount._id) activeLdPlayerAccountId.value = '';
+  if (selectedAccount.value?._id === previousAccount._id) selectedRuntimeStatus.value = null;
+  runtimeStatusMissCount.value = 0;
+  return { closed: [previousAccount] };
+}
+
 async function findActiveAccountBeforeSwitch(nextAccount) {
   const remembered = accounts.value.find((account) => account._id === activeLdPlayerAccountId.value);
-  if (remembered && remembered._id !== nextAccount._id) return remembered;
+  if (remembered && remembered._id !== nextAccount._id && !isSameLdSlot(remembered, nextAccount)) return remembered;
 
-  const candidates = accounts.value.filter((account) => (
-    account.platform === nextAccount.platform
-    && account._id !== nextAccount._id
-  ));
+  const slotCandidates = new Map();
+  for (const account of accounts.value) {
+    if (account._id === nextAccount._id || isSameLdSlot(account, nextAccount)) continue;
+    const slot = getLdPlayerSlot(account);
+    if (!slotCandidates.has(slot)) slotCandidates.set(slot, account);
+  }
+  const candidates = [...slotCandidates.values()];
   if (!candidates.length) return null;
 
   const checks = await Promise.allSettled(candidates.map(async (account) => {
     const { data } = await http.get(`/mobile/accounts/${account._id}/runtime-status`, {
       params: {
-        appPackage: account.metadata?.appPackage || selectedPlatform.value.packageName
+        appPackage: getAccountAppPackage(account)
       }
     });
-    return data.status?.deviceReady && data.status?.appReady ? account : null;
+    return data.status?.deviceReady ? account : null;
   }));
   return checks.find((result) => result.status === 'fulfilled' && result.value)?.value || null;
 }
@@ -1237,12 +1311,7 @@ async function runPostWorkflow() {
     workflowStage.value = 'failed';
     return;
   }
-  await syncSelectedAccountRuntimeStatus();
-  if (requiresFacebookSession.value && !facebookAppReady.value) {
-    ui.notify(`ADB hoặc ${selectedPlatform.value.label} chưa sẵn sàng. Bấm Mở ${selectedPlatform.value.label} rồi thử lại.`, 'error');
-    workflowStage.value = 'failed';
-    return;
-  }
+  workflowStage.value = 'preflight';
   if (selectedPlatform.value.status !== 'ready') {
     ui.notify(`Workflow ${selectedPlatform.value.label} se duoc them sau.`, 'error');
     workflowStage.value = 'failed';
@@ -1269,20 +1338,34 @@ async function runPostWorkflow() {
   }
 
   posting.value = true;
+  cancelComposerReviewClose();
   postResult.value = null;
+  const account = selectedAccount.value;
   try {
-    workflowStage.value = 'preflight';
+    const facebookSinglePost = selectedPlatformId.value === 'facebook';
+    if (isReviewMode.value || facebookSinglePost) {
+      await ensureExclusiveLdSession(account, isReviewMode.value ? 'composer_review' : 'publish_direct');
+    } else {
+      const opened = await openAccountForWorkflow(account);
+      if (!opened.ok) {
+        workflowStage.value = 'failed';
+        ui.notify(opened.error || `${selectedPlatform.value.label} chưa ổn định, hãy xem LDPlayer để xử lý.`, 'error');
+        return;
+      }
+    }
+
     workflowStage.value = 'posting';
     const { data } = await submitPostForAccount(
-      selectedAccount.value,
+      account,
       !isReviewMode.value,
       submitWaitMs.value
     );
     postResult.value = data.result;
     screenshot.value = data.result.screenshot || screenshot.value;
     if (isReviewMode.value) {
+      persistComposerReviewResult(account, data.result);
       workflowStage.value = 'review';
-      ui.notify('Đã mở composer để bạn kiểm tra trước khi đăng.');
+      scheduleComposerReviewClose(account);
     } else if (data.result.submitVerified === false) {
       workflowStage.value = 'review';
       ui.notify(`Đã bấm đăng nhưng chưa xác nhận ${selectedPlatform.value.label} đã nhận bài. Hãy xem screenshot/log.`, 'error');
@@ -1293,15 +1376,89 @@ async function runPostWorkflow() {
         : uploadedPhotoCount.value
         ? `Đã tải xong ${uploadedPhotoCount.value} ảnh và đăng bài ${selectedPlatform.value.label}.`
         : `Đã đăng và xác minh bài ${selectedPlatform.value.label}.`);
+      await closeAccountAfterWorkflow(account, 'Đã đăng xong');
     }
     await load();
   } catch (error) {
     workflowStage.value = 'failed';
     ui.notify(getHttpErrorMessage(error), 'error');
+    if (isReviewMode.value && account) {
+      await closeAccountAfterWorkflow(account, 'Đã dừng kiểm tra composer');
+    }
     await load();
   } finally {
     posting.value = false;
   }
+}
+
+async function openAccountForWorkflow(account) {
+  workflowStage.value = 'preflight';
+  await ensureExclusiveLdSession(account, 'publish_preflight');
+  const appPackage = getAccountAppPackage(account);
+  const { data } = await http.post(`/mobile/accounts/${account._id}/remote/open-app`, {
+    appPackage
+  });
+  const result = data.result || {};
+  const readiness = result.readiness || {};
+  selectedRuntimeStatus.value = {
+    ...readiness,
+    target: result.target || readiness.target || account.deviceId,
+    deviceReady: Boolean(result.ok),
+    appReady: isOpenAppConfirmed(account, result),
+    foregroundPackage: appPackage,
+    foregroundActivity: readiness.foregroundActivity || '',
+    platformState: result.home?.state || readiness.platformState || null
+  };
+  if (isOpenAppConfirmed(account, result)) {
+    runtimeStatusMissCount.value = 0;
+    activeLdPlayerAccountId.value = account._id;
+    facebookSessionAccountId.value = account._id;
+    return { ok: true, result };
+  }
+  return {
+    ok: false,
+    result,
+    error: readiness.error || readiness.summary || result.error || `Không mở được ${selectedPlatform.value.label}.`
+  };
+}
+
+async function closeAccountAfterWorkflow(account, message = '') {
+  try {
+    const { data } = await http.post(`/mobile/accounts/${account._id}/remote/close-session`, {
+      appPackage: getAccountAppPackage(account)
+    });
+    if (data.result?.ok) {
+      if (facebookSessionAccountId.value === account._id) facebookSessionAccountId.value = '';
+      if (activeLdPlayerAccountId.value === account._id) activeLdPlayerAccountId.value = '';
+      if (selectedAccount.value?._id === account._id) selectedRuntimeStatus.value = null;
+      ui.notify(`${message || 'Hoàn tất'} · Đã tắt LDPlayer.`);
+    } else {
+      ui.notify(`${message || 'Hoàn tất'} nhưng chưa tắt sạch LDPlayer.`, 'error');
+    }
+  } catch (error) {
+    ui.notify(`${message || 'Hoàn tất'} nhưng chưa tắt được LDPlayer: ${getHttpErrorMessage(error)}`, 'error');
+  }
+}
+
+function cancelComposerReviewClose() {
+  if (composerReviewCloseTimer) {
+    window.clearTimeout(composerReviewCloseTimer);
+    composerReviewCloseTimer = null;
+  }
+  composerReviewClosePending.value = false;
+}
+
+function scheduleComposerReviewClose(account) {
+  cancelComposerReviewClose();
+  if (!account?._id) return;
+  composerReviewClosePending.value = true;
+  ui.notify('Đã chụp màn composer. LDPlayer sẽ tự tắt sau 30 giây.');
+  composerReviewCloseTimer = window.setTimeout(async () => {
+    composerReviewCloseTimer = null;
+    composerReviewClosePending.value = false;
+    await closeAccountAfterWorkflow(account, 'Đã chụp màn composer');
+    await load();
+  }, 30_000);
 }
 
 async function runQueueWorkflow() {
@@ -1311,13 +1468,10 @@ async function runQueueWorkflow() {
     return;
   }
 
-  const warmAccountId = activeLdPlayerAccountId.value || facebookSessionAccountId.value;
-  const queueAccounts = [...selectedQueueAccounts.value].sort((left, right) => {
-    if (left._id === warmAccountId) return -1;
-    if (right._id === warmAccountId) return 1;
-    return 0;
-  });
+  const queueAccounts = [...selectedQueueAccounts.value];
   const interAccountDelaySeconds = Math.max(0, Math.min(Number(queueDelaySeconds.value) || 0, 600));
+  const queueRetryLimit = 1;
+  const queueAutoSubmit = queueRunMode.value !== 'review';
   posting.value = true;
   queueRunning.value = true;
   queuePhase.value = 'preparing';
@@ -1335,61 +1489,95 @@ async function runQueueWorkflow() {
 
   try {
     await prepareQueueEnvironment();
-    let stopQueue = false;
     for (let index = 0; index < queueAccounts.length; index += 1) {
       const account = queueAccounts[index];
       queueCurrentAccountId.value = account._id;
       queuePhase.value = index > 0 ? 'switching' : 'preparing';
 
-      try {
-        updateQueueItem(account._id, { status: 'running', message: 'Đang kiểm tra LDPlayer và ADB' });
-        queuePhase.value = 'posting';
-        const queueSubmitWaitMs = submitWaitMs.value;
-        updateQueueItem(account._id, {
-          status: 'running',
-          message: isFacebookVideoMode.value
-            ? 'Đang đăng và chờ xử lý video'
-            : uploadedPhotoCount.value
-            ? `Đang đăng và chờ tải ${uploadedPhotoCount.value} ảnh`
-            : 'Đang đăng bài'
-        });
-        const { data } = await submitPostForAccount(account, true, queueSubmitWaitMs);
-        postResult.value = data.result;
-        screenshot.value = data.result.screenshot || screenshot.value;
-
-        if (data.result.submitVerified === false) {
+      for (let attempt = 0; attempt <= queueRetryLimit; attempt += 1) {
+        try {
           updateQueueItem(account._id, {
-            status: 'review',
-            message: data.result.composerPending ? 'Chưa hoàn tất, giữ LDPlayer để kiểm tra' : 'Chưa xác minh, giữ LDPlayer để kiểm tra',
-            result: data.result
+            status: 'running',
+            message: attempt
+              ? `Đang chạy lại lần ${attempt + 1}/${queueRetryLimit + 1} sau khi dọn LDPlayer`
+              : 'Đang kiểm tra LDPlayer và ADB'
           });
-          stopQueue = true;
-        } else {
-          const successMessage = isFacebookVideoMode.value
-            ? 'Đã đăng video và xác minh'
-            : uploadedPhotoCount.value
-            ? `Đã tải xong ${uploadedPhotoCount.value} ảnh và đăng bài`
-            : 'Đã đăng và xác minh';
+          queuePhase.value = 'posting';
+          const queueSubmitWaitMs = queueAutoSubmit ? submitWaitMs.value : 0;
           updateQueueItem(account._id, {
-            status: 'done',
-            message: successMessage,
-            result: data.result
+            status: 'running',
+            message: queueAutoSubmit
+              ? (isFacebookVideoMode.value
+                ? 'Đang đăng và chờ xử lý video'
+                : isFacebookCollageMode.value
+                  ? `${selectedPhotoCount.value} ảnh sẽ đăng bằng 1 collage`
+                : uploadedPhotoCount.value
+                  ? `Đang đăng và chờ tải ${uploadedPhotoCount.value} ảnh`
+                : 'Đang đăng bài')
+              : (isFacebookVideoMode.value
+                ? 'Đang mở composer video để kiểm tra'
+                : isFacebookCollageMode.value
+                  ? `Đang mở composer kiểm tra ${selectedPhotoCount.value} ảnh dạng collage`
+                : 'Đang mở composer để kiểm tra')
+          });
+          const { data } = await submitPostForAccount(account, queueAutoSubmit, queueSubmitWaitMs);
+          postResult.value = data.result;
+          screenshot.value = data.result.screenshot || screenshot.value;
+
+          if (!queueAutoSubmit) {
+            const reviewMessage = data.result.screenshotVerified
+              ? 'Đã chụp composer kiểm tra và đóng LDPlayer'
+              : 'Đã mở kiểm tra nhưng screenshot chưa xác minh, đã đóng LDPlayer';
+            updateQueueItem(account._id, {
+              status: 'review',
+              message: reviewMessage,
+              result: data.result
+            });
+            queuePhase.value = 'closing';
+            await closeQueueAccount(account, reviewMessage);
+          } else if (data.result.submitVerified === false) {
+            const reviewMessage = data.result.composerPending
+              ? 'Chưa hoàn tất, đã lưu screenshot và đóng LDPlayer'
+              : 'Chưa xác minh, đã lưu screenshot và đóng LDPlayer';
+            updateQueueItem(account._id, {
+              status: 'review',
+              message: reviewMessage,
+              result: data.result
+            });
+            queuePhase.value = 'closing';
+            await closeQueueAccount(account, reviewMessage);
+          } else {
+            const successMessage = isFacebookVideoMode.value
+              ? 'Đã đăng video và xác minh'
+              : isFacebookCollageMode.value
+                ? 'Đã đăng collage và xác minh'
+              : uploadedPhotoCount.value
+                ? `Đã tải xong ${uploadedPhotoCount.value} ảnh và đăng bài`
+              : 'Đã đăng và xác minh';
+            updateQueueItem(account._id, {
+              status: 'done',
+              message: successMessage,
+              result: data.result
+            });
+            queuePhase.value = 'closing';
+            await closeQueueAccount(account, successMessage);
+          }
+          break;
+        } catch (error) {
+          const message = getHttpErrorMessage(error);
+          const retryable = attempt < queueRetryLimit && isRetryableQueueError(error);
+          updateQueueItem(account._id, {
+            status: retryable ? 'waiting' : 'failed',
+            message: retryable
+              ? `Lỗi tạm thời: ${message} · đang dọn LDPlayer để thử lại`
+              : message
           });
           queuePhase.value = 'closing';
-          await closeQueueAccount(account, successMessage);
+          await closeQueueAccount(account, retryable ? 'Dọn LDPlayer trước khi chạy lại' : `Lỗi: ${message}`);
+          if (!retryable) break;
+          queuePhase.value = 'waiting';
+          await wait(4_000);
         }
-      } catch (error) {
-        updateQueueItem(account._id, { status: 'failed', message: error.message });
-        queuePhase.value = 'closing';
-        await closeQueueAccount(account, `Lỗi: ${error.message}`);
-      }
-
-      if (stopQueue) {
-        for (let pendingIndex = index + 1; pendingIndex < queueAccounts.length; pendingIndex += 1) {
-          const pendingAccount = queueAccounts[pendingIndex];
-          updateQueueItem(pendingAccount._id, { status: 'pending', message: 'Tạm dừng do lượt trước chưa hoàn tất' });
-        }
-        break;
       }
 
       if (index < queueAccounts.length - 1 && interAccountDelaySeconds > 0) {
@@ -1409,6 +1597,16 @@ async function runQueueWorkflow() {
     workflowStage.value = queueStats.value.failed ? 'failed' : (queueStats.value.review ? 'review' : 'verified');
     ui.notify(`Đăng hàng loạt hoàn tất: ${queueStats.value.done} thành công, ${queueStats.value.review} cần kiểm tra, ${queueStats.value.failed} lỗi.`);
     await load();
+  } catch (error) {
+    const message = getHttpErrorMessage(error);
+    queueItems.value = queueItems.value.map((item) => (
+      ['done', 'review', 'failed'].includes(item.status)
+        ? item
+        : { ...item, status: 'failed', message: `Dừng hàng loạt: ${message}` }
+    ));
+    workflowStage.value = 'failed';
+    ui.notify(`Đăng hàng loạt dừng: ${message}`, 'error');
+    await load();
   } finally {
     posting.value = false;
     queueRunning.value = false;
@@ -1424,14 +1622,15 @@ async function prepareQueueEnvironment() {
     message: 'Đang chờ đến lượt'
   }));
 
-  // Chỉ giữ profile warm khi chính nó nằm trong hàng đợi. Nếu không, đóng
-  // trước để tránh hai LDPlayer cùng chiếm RAM lúc chuyển tài khoản.
+  // Chỉ giữ profile warm khi chính nó nằm trong hàng đợi và cùng LD slot.
+  // Nếu không, đóng trước để tránh hai LDPlayer cùng chiếm RAM lúc chuyển tài khoản.
   const activeAccountId = activeLdPlayerAccountId.value || facebookSessionAccountId.value;
   if (activeAccountId && !selectedQueueAccountIds.value.includes(activeAccountId)) {
     const activeAccount = accounts.value.find((account) => account._id === activeAccountId);
-    if (activeAccount) {
+    const activeSlotIsQueued = selectedQueueAccounts.value.some((account) => isSameLdSlot(account, activeAccount));
+    if (activeAccount && !activeSlotIsQueued) {
       const { data } = await http.post(`/mobile/accounts/${activeAccount._id}/remote/close-session`, {
-        appPackage: selectedPlatform.value.packageName
+        appPackage: getAccountAppPackage(activeAccount)
       });
       if (!data.result?.ok) {
         throw new Error(`Chưa tắt hoàn toàn ${activeAccount.instanceName}. Dừng hàng loạt để tránh chạy nhiều LDPlayer cùng lúc.`);
@@ -1465,6 +1664,7 @@ async function submitPostForAccount(account, autoSubmit, waitAfterSubmitMs = 0) 
     text: finalPostText.value.trim(),
     appPackage: selectedPlatform.value.packageName,
     autoSubmit,
+    textInputMode: 'stable',
     waitAfterSubmitMs,
     images: publishImages
       .map((item) => ({
@@ -1485,11 +1685,37 @@ async function submitPostForAccount(account, autoSubmit, waitAfterSubmitMs = 0) 
 }
 
 async function preparePlatformPublishImages(images) {
-  // Facebook/Instagram native album layout is controlled by upload order, not
-  // by an editable layout API. Keep every uploaded image separate and send
-  // them in the same order the user arranged in the composer. This avoids
-  // turning a multi-photo post into one flattened collage image.
-  return images;
+  if (selectedPlatformId.value === 'instagram' || images.length <= 1) return images;
+
+  const cacheKey = [
+    'facebook-collage',
+    photoLayout.value,
+    ...images.map((image) => `${image.uploadedUrl}:${image.size || 0}:${image.name || ''}`)
+  ].join('|');
+  if (collageCache.key === cacheKey && collageCache.item?.uploadedUrl) {
+    return [collageCache.item];
+  }
+
+  const collageBlob = await createPhotoCollage(images, photoLayout.value);
+  const collageName = `facebook-collage-${images.length}-${photoLayout.value}.jpg`;
+  const { data } = await http.post('/media/images', collageBlob, {
+    headers: {
+      'Content-Type': 'image/jpeg',
+      'X-File-Name': encodeURIComponent(collageName)
+    }
+  });
+  const collageItem = {
+    id: `collage-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    name: collageName,
+    type: 'photo',
+    url: data.image.url,
+    uploadedUrl: data.image.url,
+    mimeType: data.image.mimeType || 'image/jpeg',
+    size: data.image.size || collageBlob.size
+  };
+  collageCache = { key: cacheKey, item: collageItem };
+  ui.notify(`Đã gộp ${images.length} ảnh thành 1 ảnh collage để đăng Facebook ổn định.`);
+  return [collageItem];
 }
 
 async function createPhotoCollage(images, layout) {
@@ -1504,7 +1730,7 @@ async function createPhotoCollage(images, layout) {
 
   context.fillStyle = '#111827';
   context.fillRect(0, 0, width, height);
-  const loadedImages = await Promise.all(images.map((item) => loadCollageImage(item.uploadedUrl)));
+  const loadedImages = await Promise.all(images.map((item) => loadCollageImage(item.url || item.uploadedUrl)));
   const rectangles = getCollageRectangles(loadedImages.length, layout, width, height, gap);
   loadedImages.forEach((image, index) => drawImageCover(context, image, rectangles[index]));
 
@@ -1625,7 +1851,7 @@ async function closeQueueAccount(account, message = '') {
   updateQueueItem(account._id, { message: `${baseMessage} · Đang tắt LDPlayer` });
   try {
     const { data } = await http.post(`/mobile/accounts/${account._id}/remote/close-session`, {
-      appPackage: selectedPlatform.value.packageName
+      appPackage: getAccountAppPackage(account)
     });
     updateQueueItem(account._id, {
       message: data.result?.ok
@@ -2031,6 +2257,25 @@ function ensureValidPhotoLayout() {
 
 function previewPhotoClass(index) {
   const count = previewPhotos.value.length;
+  if (selectedPlatformId.value === 'facebook' && count > 1) {
+    if (count === 2) {
+      return photoLayout.value === 'hero-top'
+        ? (index === 0 ? 'col-span-6 row-span-2' : 'col-span-6 row-span-2')
+        : 'col-span-3 row-span-4';
+    }
+    if (photoLayout.value === 'focus-first') {
+      if (index === 0) return 'col-span-3 row-span-4';
+      if (count === 3) return 'col-span-3 row-span-2';
+      return index === 1 ? 'col-span-3 row-span-2' : 'col-span-3 row-span-1';
+    }
+    if (photoLayout.value === 'hero-top') {
+      if (index === 0) return 'col-span-6 row-span-2';
+      if (count === 3) return 'col-span-3 row-span-2';
+      return 'col-span-2 row-span-2';
+    }
+    if (count === 3) return 'col-span-2 row-span-4';
+    return index === 0 || index === 1 ? 'col-span-3 row-span-2' : 'col-span-3 row-span-2';
+  }
   if (count === 3 && index === 0) return 'col-span-2';
   if (count >= 4 && index === 0) return 'col-span-3';
   return '';
@@ -2126,6 +2371,7 @@ function resetComposer() {
   clearComposerMedia();
   photoLayout.value = 'grid';
   postResult.value = null;
+  clearComposerReviewResult();
   showEmojiPicker.value = false;
   workflowStage.value = 'idle';
 }
@@ -2164,24 +2410,50 @@ function getHttpErrorMessage(error) {
     || 'Workflow trả lỗi chưa xác định.';
 }
 
+function isRetryableQueueError(error) {
+  const apiError = error?.response?.data?.error;
+  const details = apiError?.details || {};
+  if (details.retryable === true) return true;
+  if (Number(error?.response?.status) === 503) return true;
+  const message = getHttpErrorMessage(error)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+  return /adb|ldplayer|device|system ui|khong phan hoi|not responding|offline|chua mo thanh cong|composer|media|video|facebook chua nhan/.test(message);
+}
+
 function formatPostRun(log) {
   const mapped = postRunActionLabels[log.action];
+  if (log.action === 'facebook_post_finished' && log.metadata?.autoSubmit === false) {
+    return {
+      title: 'Đã mở composer kiểm tra',
+      detail: 'Tool đã mở composer, không bấm đăng. Ảnh kiểm tra được lưu ở khung trạng thái phía trên nếu phiên hiện tại có snapshot.',
+      tone: 'ok',
+      badge: 'Ổn'
+    };
+  }
   const detail = log.metadata?.recoveryHint || log.message || mapped?.detail || 'Tool vừa ghi nhận một bước trong workflow đăng bài.';
   if (log.action === 'facebook_post_finished' && log.level !== 'info') {
     return {
       title: 'Bài đăng chưa được xác minh',
-      detail
+      detail,
+      tone: 'warn',
+      badge: 'Cần kiểm tra'
     };
   }
   if (log.action === 'instagram_post_finished' && log.level !== 'info') {
     return {
       title: 'Bài Instagram chưa được xác minh',
-      detail
+      detail,
+      tone: 'warn',
+      badge: 'Cần kiểm tra'
     };
   }
   return {
     title: mapped?.title || 'Cập nhật trạng thái đăng',
-    detail
+    detail,
+    tone: log.level === 'error' ? 'error' : log.level === 'warn' ? 'warn' : 'ok',
+    badge: log.level === 'error' ? 'Lỗi' : log.level === 'warn' ? 'Cần kiểm tra' : 'Ổn'
   };
 }
 
@@ -2206,10 +2478,104 @@ function logout() {
   router.push('/login');
 }
 
+function getComposerReviewResultStorageKey(accountId = selectedAccount.value?._id, platform = selectedPlatformId.value) {
+  return `${composerReviewResultStoragePrefix}:${platform || 'facebook'}:${accountId || 'unknown'}`;
+}
+
+function getComposerReviewSnapshotContext(account = selectedAccount.value) {
+  const text = finalPostText.value.trim();
+  return {
+    accountId: account?._id || '',
+    platform: account?.platform || selectedPlatformId.value,
+    accountLabel: account ? formatAccountLabel(account) : '',
+    textHash: hashSnapshotText(text),
+    textPreview: text.slice(0, 120),
+    characterCount: text.length
+  };
+}
+
+function hashSnapshotText(value = '') {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+function persistComposerReviewResult(account, result) {
+  if (!account?._id || !result?.screenshot?.imageBase64) return;
+  const context = getComposerReviewSnapshotContext(account);
+  if (!context.textHash || !context.characterCount) return;
+  try {
+    window.localStorage.setItem(
+      getComposerReviewResultStorageKey(account._id, account.platform || selectedPlatformId.value),
+      JSON.stringify({
+        ...context,
+        savedAt: new Date().toISOString(),
+        result
+      })
+    );
+  } catch {
+    // Snapshot chỉ là tiện ích hiển thị; không chặn workflow nếu trình duyệt hết quota.
+  }
+}
+
+function isComposerReviewPayloadCurrent(payload) {
+  if (!payload?.accountId || payload.accountId !== selectedAccount.value?._id) return false;
+  if ((payload.platform || selectedPlatformId.value) !== selectedPlatformId.value) return false;
+  if (!payload?.result?.screenshot?.imageBase64) return false;
+  const savedAtMs = new Date(payload.savedAt || 0).getTime();
+  if (!Number.isFinite(savedAtMs) || Date.now() - savedAtMs > composerReviewResultTtlMs) return false;
+  const context = getComposerReviewSnapshotContext();
+  if (!context.characterCount || !payload.textHash) return false;
+  return payload.textHash === context.textHash;
+}
+
+function restoreComposerReviewResult() {
+  if (postResult.value?.screenshot?.imageBase64 || !selectedAccount.value?._id) return;
+  try {
+    const raw = window.localStorage.getItem(getComposerReviewResultStorageKey());
+    if (!raw) return;
+    const payload = JSON.parse(raw);
+    if (!isComposerReviewPayloadCurrent(payload)) {
+      window.localStorage.removeItem(getComposerReviewResultStorageKey());
+      return;
+    }
+    postResult.value = {
+      ...payload.result,
+      restored: true,
+      snapshotSavedAt: payload.savedAt,
+      snapshotTextPreview: payload.textPreview || '',
+      snapshotAccountLabel: payload.accountLabel || selectedAccountLabel.value
+    };
+    screenshot.value = payload.result.screenshot;
+    if (workflowStage.value === 'idle') workflowStage.value = 'review';
+  } catch {
+    window.localStorage.removeItem(getComposerReviewResultStorageKey());
+  }
+}
+
+function resetDisplayedComposerReviewResult(options = {}) {
+  postResult.value = null;
+  screenshot.value = null;
+  if (workflowStage.value === 'review' || options.forceIdle) workflowStage.value = 'idle';
+}
+
+function clearComposerReviewResult() {
+  if (!selectedAccount.value?._id) return;
+  try {
+    window.localStorage.removeItem(getComposerReviewResultStorageKey());
+  } catch {
+    // Không cần xử lý thêm.
+  }
+}
+
 onMounted(async () => {
   loadDrafts();
   await load();
   await ensureDefaultProfile();
+  restoreComposerReviewResult();
   await syncSelectedAccountRuntimeStatus();
   startRuntimeStatusPolling();
   document.addEventListener('visibilitychange', handleRuntimeVisibilityChange);
@@ -2228,10 +2594,23 @@ watch(selectedAccountId, () => {
   runtimeStatusRequestId += 1;
   selectedRuntimeStatus.value = null;
   runtimeStatusMissCount.value = 0;
+  cancelComposerReviewClose();
+  resetDisplayedComposerReviewResult({ forceIdle: true });
   // Chỉ xóa trạng thái của profile đang chọn. Giữ activeLdPlayerAccountId
   // để khi bấm mở profile mới, hệ thống vẫn biết instance cũ cần được tắt.
   facebookSessionAccountId.value = '';
+  restoreComposerReviewResult();
   syncSelectedAccountRuntimeStatus();
+});
+watch(finalPostText, () => {
+  if (!postResult.value?.restored) {
+    if (postResult.value?.screenshot?.imageBase64 && workflowStage.value !== 'posting') {
+      resetDisplayedComposerReviewResult({ forceIdle: true });
+    }
+    return;
+  }
+  resetDisplayedComposerReviewResult({ forceIdle: true });
+  restoreComposerReviewResult();
 });
 const queueCurrentItem = computed(() => queueItems.value.find((item) => item.id === queueCurrentAccountId.value)
   || queueItems.value.find((item) => ['running', 'waiting'].includes(item.status))
@@ -2433,6 +2812,7 @@ watch(selectedPlatformId, async () => {
               </select>
             </label>
             <button
+              v-if="showDeviceTools"
               class="btn-soft mt-5 h-10"
               :class="facebookAppReady ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-200' : ''"
               :disabled="running || facebookOpening || facebookAppReady || !canUseRemote"
@@ -2642,6 +3022,42 @@ watch(selectedPlatformId, async () => {
 
           <div v-if="isBulkMode" class="grid gap-4 xl:grid-cols-[minmax(0,1fr)_220px]">
             <div>
+              <div class="mb-4 rounded-xl border border-zinc-200 bg-white p-2 dark:border-zinc-800 dark:bg-zinc-950">
+                <div class="grid gap-2 sm:grid-cols-2">
+                  <button
+                    :class="[
+                      'rounded-lg px-3 py-2 text-left transition',
+                      queueRunMode === 'review'
+                        ? 'bg-sky-500 text-white'
+                        : 'bg-zinc-100 text-zinc-600 hover:text-zinc-950 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:text-white'
+                    ]"
+                    type="button"
+                    :disabled="posting || queueRunning"
+                    @click="queueRunMode = 'review'"
+                  >
+                    <span class="block text-sm font-black">Mở kiểm tra</span>
+                    <span :class="['mt-1 block text-[11px] leading-4', queueRunMode === 'review' ? 'text-white/80' : 'text-zinc-500']">
+                      Mở composer, chụp màn hình, không bấm Đăng.
+                    </span>
+                  </button>
+                  <button
+                    :class="[
+                      'rounded-lg px-3 py-2 text-left transition',
+                      queueRunMode === 'publish'
+                        ? 'bg-emerald-500 text-white'
+                        : 'bg-zinc-100 text-zinc-600 hover:text-zinc-950 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:text-white'
+                    ]"
+                    type="button"
+                    :disabled="posting || queueRunning"
+                    @click="queueRunMode = 'publish'"
+                  >
+                    <span class="block text-sm font-black">Đăng thật</span>
+                    <span :class="['mt-1 block text-[11px] leading-4', queueRunMode === 'publish' ? 'text-white/80' : 'text-zinc-500']">
+                      Bấm Đăng tự động theo từng profile.
+                    </span>
+                  </button>
+                </div>
+              </div>
               <div class="mb-3 flex items-center justify-between gap-3">
                 <p class="text-sm font-extrabold">Profile mục tiêu</p>
                 <span class="rounded-full bg-zinc-100 px-3 py-1 text-xs font-extrabold text-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
@@ -2739,7 +3155,7 @@ watch(selectedPlatformId, async () => {
                 @click="runPostWorkflow()"
               >
                 <Send class="h-4 w-4" />
-                Bắt đầu đăng
+                {{ isQueueReviewMode ? 'Mở kiểm tra hàng loạt' : 'Bắt đầu đăng' }}
               </button>
             </div>
           </div>
@@ -2969,7 +3385,7 @@ watch(selectedPlatformId, async () => {
                   class="inline-flex h-9 min-w-20 items-center justify-center gap-2 rounded-lg bg-white px-3 text-xs font-extrabold text-zinc-950 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-white"
                   type="button"
                   :disabled="!canRunWorkflow"
-                  :title="facebookAppReady || !requiresFacebookSession ? primaryActionLabel : `Mở ${selectedPlatform.label} trước khi đăng`"
+                  :title="primaryActionLabel"
                   @click="runPostWorkflow()"
                 >
                   <Send class="h-4 w-4" />
@@ -3121,24 +3537,53 @@ watch(selectedPlatformId, async () => {
                 <div v-if="post.media.length" class="space-y-3">
                   <div
                     v-if="canArrangePhotos"
-                    class="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-2.5 dark:border-zinc-700 dark:bg-zinc-900"
+                    class="space-y-3 rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-3 dark:border-zinc-700 dark:bg-zinc-900"
                   >
-                    <div class="flex min-w-0 items-center gap-2.5">
-                      <span class="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-zinc-200 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
-                        <ListChecks class="h-4 w-4" />
+                    <div class="flex flex-wrap items-start justify-between gap-3">
+                      <div class="flex min-w-0 items-center gap-2.5">
+                        <span class="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-zinc-200 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
+                          <ListChecks class="h-4 w-4" />
+                        </span>
+                        <div class="min-w-0">
+                          <p class="text-xs font-black text-zinc-800 dark:text-zinc-100">
+                            {{ selectedPlatformId === 'instagram' ? 'Sắp xếp album Instagram' : 'Bố cục collage Facebook' }}
+                          </p>
+                          <p class="text-[11px] leading-5 text-zinc-500">
+                            {{ selectedPlatformId === 'instagram' ? 'Kéo ảnh để đổi thứ tự carousel. Instagram sẽ đăng album native.' : 'Kéo ảnh để đổi vị trí. Facebook sẽ đăng 1 ảnh collage theo bố cục bên dưới.' }}
+                          </p>
+                        </div>
+                      </div>
+                      <span class="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-[11px] font-black text-emerald-600 dark:text-emerald-300">
+                        {{ selectedPlatformId === 'instagram' ? `${previewPhotos.length} ảnh album` : `${previewPhotos.length} ảnh -> 1 collage` }}
                       </span>
-                      <div class="min-w-0">
-                        <p class="text-xs font-black text-zinc-800 dark:text-zinc-100">
-                          {{ selectedPlatformId === 'instagram' ? 'Sắp xếp album Instagram' : 'Sắp xếp ảnh Facebook' }}
-                        </p>
-                        <p class="truncate text-[11px] text-zinc-500">
-                          {{ selectedPlatformId === 'instagram' ? 'Kéo ảnh để đổi thứ tự carousel · Instagram sẽ đăng album native' : 'Kéo ảnh để đổi thứ tự · Preview mô phỏng bố cục Facebook' }}
-                        </p>
+                    </div>
+                    <div v-if="selectedPlatformId === 'facebook'" class="select-none rounded-xl border border-zinc-200 bg-white p-1.5 dark:border-zinc-700 dark:bg-zinc-950">
+                      <div class="grid gap-1 sm:grid-cols-3">
+                        <button
+                          v-for="layout in availablePhotoLayouts"
+                          :key="layout.id"
+                          :class="[
+                            'min-h-11 cursor-pointer rounded-lg px-3 py-2 text-left transition',
+                            photoLayout === layout.id
+                              ? 'bg-emerald-500 text-white shadow-sm'
+                              : 'text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:hover:bg-zinc-800 dark:hover:text-white'
+                          ]"
+                          type="button"
+                          :disabled="posting || queueRunning"
+                          :title="layout.description"
+                          @click="photoLayout = layout.id"
+                        >
+                          <span class="block text-xs font-black">{{ layout.label }}</span>
+                          <span :class="['mt-0.5 block text-[10px] font-semibold leading-4', photoLayout === layout.id ? 'text-white/75' : 'text-zinc-500']">
+                            {{ layout.description }}
+                          </span>
+                        </button>
+                      </div>
+                      <div class="mt-2 flex flex-wrap items-center justify-between gap-2 border-t border-zinc-100 px-1.5 pt-2 text-[11px] dark:border-zinc-800">
+                        <span class="font-bold text-zinc-500">Đang chọn: {{ selectedPhotoLayout.label }}</span>
+                        <span class="font-semibold text-zinc-400">Đổi thứ tự bằng kéo thả hoặc nút trái/phải trên từng ảnh.</span>
                       </div>
                     </div>
-                    <span class="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-[11px] font-black text-emerald-600 dark:text-emerald-300">
-                      {{ previewPhotos.length }} {{ selectedPlatformId === 'instagram' ? 'ảnh album' : 'ảnh native' }}
-                    </span>
                   </div>
                   <div
                     :class="[
@@ -3539,6 +3984,20 @@ watch(selectedPlatformId, async () => {
                   </span>
                 </div>
                 <p class="mt-2 text-zinc-500">{{ item.message }}</p>
+                <div
+                  v-if="item.result?.screenshot?.imageBase64"
+                  class="mt-3 overflow-hidden rounded-lg border border-zinc-200 bg-zinc-950 dark:border-zinc-800"
+                >
+                  <div class="flex items-center justify-between gap-2 border-b border-zinc-800 px-2 py-1.5 text-[10px] font-extrabold uppercase text-zinc-400">
+                    <span>Ảnh kiểm tra</span>
+                    <span>{{ item.result.screenshotVerified ? 'Đã xác minh' : 'Chưa xác minh' }}</span>
+                  </div>
+                  <img
+                    :src="`data:image/png;base64,${item.result.screenshot.imageBase64}`"
+                    alt="Ảnh kiểm tra hàng loạt"
+                    class="max-h-56 w-full object-contain"
+                  />
+                </div>
               </article>
             </div>
           </div>
@@ -3566,7 +4025,15 @@ watch(selectedPlatformId, async () => {
           </div>
 
           <div v-else-if="composerScreenshotSrc" class="overflow-hidden rounded-lg border border-zinc-200 bg-zinc-950 dark:border-zinc-800">
-            <div class="border-b border-zinc-800 px-3 py-2 text-xs font-extrabold uppercase tracking-wide text-zinc-400">Ảnh trạng thái Facebook</div>
+            <div class="flex items-center justify-between gap-3 border-b border-zinc-800 px-3 py-2">
+              <span class="text-xs font-extrabold uppercase tracking-wide text-zinc-400">Ảnh trạng thái Facebook</span>
+              <span v-if="restoredComposerReviewInfo" class="rounded-full bg-sky-500/15 px-2 py-1 text-[10px] font-extrabold uppercase text-sky-300">
+                Ảnh phiên trước
+              </span>
+            </div>
+            <div v-if="restoredComposerReviewInfo" class="border-b border-zinc-800 px-3 py-2 text-[11px] leading-5 text-zinc-400">
+              Khôi phục từ {{ formatDate(restoredComposerReviewInfo.savedAt) }} · {{ restoredComposerReviewInfo.accountLabel }}
+            </div>
             <div class="grid aspect-[9/16] w-full place-items-center text-sm text-zinc-400">
               <img :src="composerScreenshotSrc" alt="Ảnh trạng thái Facebook" class="h-full w-full object-contain" />
             </div>
@@ -3588,8 +4055,8 @@ watch(selectedPlatformId, async () => {
               <article v-for="log in recentPostRuns" :key="log._id" class="rounded-lg bg-zinc-100 p-3 text-sm dark:bg-zinc-900">
                 <div class="flex flex-wrap items-start justify-between gap-2">
                   <p class="min-w-0 flex-1 font-bold leading-5">{{ formatPostRun(log).title }}</p>
-                  <span :class="['shrink-0 whitespace-nowrap rounded-full px-2.5 py-1 text-[10px] font-extrabold uppercase leading-none', log.level === 'error' ? 'bg-red-100 text-red-700' : log.level === 'warn' ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700']">
-                    {{ log.level === 'error' ? 'Lỗi' : log.level === 'warn' ? 'Cần kiểm tra' : 'Ổn' }}
+                  <span :class="['shrink-0 whitespace-nowrap rounded-full px-2.5 py-1 text-[10px] font-extrabold uppercase leading-none', formatPostRun(log).tone === 'error' ? 'bg-red-100 text-red-700' : formatPostRun(log).tone === 'warn' ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700']">
+                    {{ formatPostRun(log).badge }}
                   </span>
                 </div>
                 <p class="mt-1 line-clamp-2 text-zinc-500">{{ formatPostRun(log).detail }}</p>

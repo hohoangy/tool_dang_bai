@@ -7,9 +7,15 @@
     "dev": "npm-run-all --parallel dev:server dev:client",
     "dev:server": "npm --prefix server run dev",
     "dev:client": "npm --prefix client run dev",
+    "ld:helper": "node tools/ld-runtime-helper.mjs",
     "build": "npm --prefix client run build",
     "start": "npm --prefix server start",
     "seed": "npm --prefix server run seed",
+    "stress:fb-review": "node tools/mobile-facebook-review-stress.mjs",
+    "test:bulk-queue": "node tools/mobile-bulk-queue-sim.mjs",
+    "test:fb-review-matrix": "node tools/mobile-facebook-review-stress.mjs --locales vi,en --resolutions 720x1280,900x1600,1080x1920 --scenarios text:1,collage:1,video:1,share-chooser:1,system-ui-once:1",
+    "test:fb-review-real": "node tools/mobile-facebook-review-batch-real.mjs",
+    "test:fb-smoke-real": "node tools/mobile-facebook-smoke-real.mjs",
     "install:all": "npm install && npm --prefix server install && npm --prefix client install"
   },
   "devDependencies": {

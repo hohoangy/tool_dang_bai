@@ -1,10 +1,12 @@
 export {
   captureScreenshot,
   closeAccountSession,
+  getAccountPublishReadiness,
   getAccountRuntimeStatus,
   openAccountApp,
   openLdPlayer,
   probeDevice,
+  recoverAccountLdPlayer,
   remoteKey,
   remoteSwipe,
   remoteTap,

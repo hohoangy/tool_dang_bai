@@ -7,10 +7,12 @@ import { MobileAccountLog } from '../../models/mobile-account-log.model.js';
 import {
   captureScreenshot,
   closeAccountSession,
+  getAccountPublishReadiness,
   getAccountRuntimeStatus,
   openAccountApp,
   openLdPlayer,
   probeDevice,
+  recoverAccountLdPlayer,
   remoteKey,
   remoteSwipe,
   remoteTap,
@@ -194,6 +196,7 @@ const facebookPostSchema = z.object({
   text: z.string().min(1).max(5000),
   appPackage: z.string().optional().or(z.literal('')),
   autoSubmit: z.boolean().default(false),
+  textInputMode: z.enum(['stable', 'natural']).default('stable'),
   waitAfterSubmitMs: z.number().int().min(0).max(180_000).default(0),
   images: z.array(z.object({
     url: z.string().url(),
@@ -307,9 +310,23 @@ mobileRoutes.get('/accounts/:id/runtime-status', requireAuth, asyncHandler(async
   res.json({ status });
 }));
 
+mobileRoutes.get('/accounts/:id/readiness', requireAuth, asyncHandler(async (req, res) => {
+  const account = await findAccount(req.params.id, req.user._id);
+  const readiness = await getAccountPublishReadiness(account, req.user._id, req.query.appPackage, {
+    deep: req.query.deep !== 'false'
+  });
+  res.json({ readiness });
+}));
+
 mobileRoutes.post('/accounts/:id/remote/launch', requireAuth, asyncHandler(async (req, res) => {
   const account = await findAccount(req.params.id, req.user._id);
   const result = await openLdPlayer(account, req.user._id);
+  res.json({ account: sanitizeAccount(account), result });
+}));
+
+mobileRoutes.post('/accounts/:id/remote/recover-ld', requireAuth, asyncHandler(async (req, res) => {
+  const account = await findAccount(req.params.id, req.user._id);
+  const result = await recoverAccountLdPlayer(account, req.user._id);
   res.json({ account: sanitizeAccount(account), result });
 }));
 
