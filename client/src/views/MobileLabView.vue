@@ -18,12 +18,14 @@ const logs = ref([]);
 const loading = ref(false);
 const running = ref(false);
 const screenshotLoading = ref(false);
+const instagramHealthLoading = ref(false);
 const posting = ref(false);
 const mediaUploading = ref(false);
 const facebookOpening = ref(false);
 const selectedAccountId = ref('');
 const selectedPlatformId = ref('facebook');
 const screenshot = ref(null);
+const instagramHealth = ref(null);
 const postResult = ref(null);
 const remoteTextInput = ref('');
 const mediaInput = ref(null);
@@ -38,16 +40,16 @@ const runtimeStatusMissCount = ref(0);
 const composerReviewClosePending = ref(false);
 const technicalLogsOpen = ref(false);
 const workflowStage = ref('idle');
-const publishMode = ref('direct');
+const publishMode = ref('review');
 const facebookPostType = ref('imageText');
 const composerTab = ref('compose');
 const selectedQueueAccountIds = ref([]);
 const queueItems = ref([]);
 const queueRunning = ref(false);
-const queueDelaySeconds = ref(0);
+const queueDelaySeconds = ref(15);
 const queuePhase = ref('idle');
 const queueCurrentAccountId = ref('');
-const queueRunMode = ref('publish');
+const queueRunMode = ref('review');
 const scheduleDateTime = ref(defaultScheduleDateTime());
 const drafts = ref([]);
 const editingDraftId = ref('');
@@ -162,6 +164,7 @@ const selectedAccount = computed(() => {
 const selectedAccountLabel = computed(() => selectedAccount.value ? formatAccountLabel(selectedAccount.value) : `Chưa có profile ${selectedPlatform.value.label}`);
 const accountInitial = computed(() => selectedAccount.value?.displayName?.slice(0, 1)?.toUpperCase() || 'F');
 const screenshotSrc = computed(() => screenshot.value?.imageBase64 ? `data:image/png;base64,${screenshot.value.imageBase64}` : '');
+const instagramHealthChecks = computed(() => instagramHealth.value?.checks || []);
 const composerScreenshotSrc = computed(() => postResult.value?.screenshot?.imageBase64 ? `data:image/png;base64,${postResult.value.screenshot.imageBase64}` : '');
 const restoredComposerReviewInfo = computed(() => {
   if (!postResult.value?.restored) return null;
@@ -360,6 +363,7 @@ const scheduleQuickOptions = [
   { label: 'Tối nay', preset: 'tonight' },
   { label: 'Sáng mai', preset: 'tomorrow-morning' }
 ];
+const ldSafeDelaySeconds = 15;
 const queueReady = computed(() => !isBulkMode.value || selectedQueueAccounts.value.length > 0);
 const captionRequired = computed(() => selectedPlatformId.value !== 'instagram');
 const contentReady = computed(() => characterCount.value <= 5000 && (!captionRequired.value || characterCount.value > 0));
@@ -532,9 +536,11 @@ const operationalPostRunActions = new Set([
   'facebook_native_multi_image_unsupported',
   'facebook_post_failed_auth_required',
   'facebook_post_failed_ld_unstable',
+  'facebook_post_failed_ld_adb_bridge',
   'facebook_post_failed_gallery_selection',
   'facebook_post_failed_media_attach',
   'facebook_post_failed_ui_state',
+  'facebook_post_failed_post_submit_unverified',
   'facebook_post_failed',
   'instagram_post_finished',
   'instagram_post_submit_verified',
@@ -546,7 +552,10 @@ const operationalPostRunActions = new Set([
   'instagram_post_failed_cleanup',
   'instagram_post_failed_auth_required',
   'instagram_post_failed_ld_unstable',
+  'instagram_post_failed_ld_adb_bridge',
   'instagram_post_failed_ui_state',
+  'instagram_post_pre_submit_gate_failed',
+  'instagram_post_failed_post_submit_unverified',
   'instagram_post_failed'
 ]);
 function isTechnicalPostRunNoise(log) {
@@ -624,6 +633,10 @@ const postRunActionLabels = {
     title: 'LDPlayer/ADB chưa ổn định',
     detail: 'Tool đã dừng để tránh đăng sai. Restart LDPlayer hoặc chờ ADB ổn định rồi chạy lại.'
   },
+  facebook_post_failed_ld_adb_bridge: {
+    title: 'LDPlayer chưa mở ADB bridge',
+    detail: 'LDPlayer đã chạy nhưng chưa có cổng ADB để tool điều khiển. Mở LD thủ công tới Home và kiểm tra ADB Debugging.'
+  },
   facebook_post_failed_gallery_selection: {
     title: 'Gallery chưa xác nhận ảnh',
     detail: 'Facebook chưa ghi nhận đủ ảnh đã chọn; tool dừng để tránh bấm lặp.'
@@ -635,6 +648,10 @@ const postRunActionLabels = {
   facebook_post_failed_ui_state: {
     title: 'Facebook UI chưa ổn định',
     detail: 'Tool chưa nhận diện được màn hình an toàn để tiếp tục.'
+  },
+  facebook_post_failed_post_submit_unverified: {
+    title: 'Cần kiểm tra kết quả Facebook',
+    detail: 'Đã tới bước Đăng nhưng chưa xác minh được kết quả. Tool không tự đăng lại để tránh trùng bài.'
   },
   facebook_post_image_attached: {
     title: 'Ảnh đã sẵn sàng',
@@ -696,9 +713,21 @@ const postRunActionLabels = {
     title: 'LDPlayer/ADB chưa ổn định',
     detail: 'Tool đã dừng để tránh đăng sai. Restart LDPlayer hoặc chờ ADB ổn định rồi chạy lại.'
   },
+  instagram_post_failed_ld_adb_bridge: {
+    title: 'LDPlayer chưa mở ADB bridge',
+    detail: 'LDPlayer đã chạy nhưng chưa có cổng ADB để tool điều khiển. Mở LD thủ công tới Home và kiểm tra ADB Debugging.'
+  },
   instagram_post_failed_ui_state: {
     title: 'Instagram UI chưa ổn định',
     detail: 'Tool chưa nhận diện được màn hình an toàn để tiếp tục.'
+  },
+  instagram_post_pre_submit_gate_failed: {
+    title: 'Chưa đủ điều kiện Share',
+    detail: 'Tool đã dừng trước khi bấm Share vì composer Instagram chưa đạt đủ điều kiện an toàn.'
+  },
+  instagram_post_failed_post_submit_unverified: {
+    title: 'Cần kiểm tra kết quả Instagram',
+    detail: 'Đã tới bước Share nhưng chưa xác minh được kết quả. Tool không tự đăng lại để tránh trùng bài.'
   },
   instagram_post_state: {
     title: 'Đang đọc trạng thái Instagram',
@@ -721,7 +750,7 @@ const postResultSummary = computed(() => {
   if (postResult.value.submitVerified) {
     return {
       title: 'Đã xác minh bài đăng',
-      detail: `${selectedPlatform.value.label} đã có tín hiệu nhận bài.${elapsedDetail} Lưu lại screenshot/log để đối chiếu khi cần.`,
+      detail: `${postResult.value.resultMessage || `${selectedPlatform.value.label} đã có tín hiệu nhận bài.`}${elapsedDetail} Lưu lại screenshot/log để đối chiếu khi cần.`,
       tone: 'ok'
     };
   }
@@ -735,13 +764,23 @@ const postResultSummary = computed(() => {
       video_upload_timeout: 'Facebook tải video quá thời gian cho phép.',
       published_post_evidence_pending: 'Facebook đã rời composer nhưng chưa tìm thấy đúng bài mới trên feed.'
     };
-    const preSubmitReasons = new Set(['state_machine_pending', 'composer_editor_not_opening', 'next_not_advancing', 'caption_not_verified']);
-    const title = preSubmitReasons.has(postResult.value.submitReason)
+    const preSubmitReasons = new Set(['state_machine_pending', 'composer_editor_not_opening', 'next_not_advancing', 'caption_not_verified', 'pre_submit_gate_failed']);
+    const postSubmitUnverified = isPostSubmitUnverifiedResult(postResult.value);
+    const title = postSubmitUnverified
+      ? 'Cần kiểm tra kết quả bài đăng'
+      : isInstagramPreSubmitGateResult(postResult.value)
+      ? 'Chưa đủ điều kiện Share'
+      : preSubmitReasons.has(postResult.value.submitReason)
       ? 'Chưa gửi được bài'
       : 'Đã bấm Đăng nhưng cần kiểm tra';
+    const detail = postSubmitUnverified
+      ? `${postResult.value.resultMessage || 'Đã tới bước gửi bài nhưng chưa xác minh được kết quả; tool không tự đăng lại để tránh trùng bài.'}${elapsedDetail} Hãy kiểm tra feed/profile trong LDPlayer trước khi chạy tiếp.`
+      : isInstagramPreSubmitGateResult(postResult.value)
+      ? `${getInstagramPreSubmitGateMessage(postResult.value)}${elapsedDetail} Tool chưa bấm Share.`
+      : `${postResult.value.resultMessage || reasonDetails[postResult.value.submitReason] || 'Automation chưa xác nhận được bài đã lên feed.'}${elapsedDetail} Hãy xem ảnh trạng thái mới nhất.`;
     return {
       title,
-      detail: `${reasonDetails[postResult.value.submitReason] || 'Automation chưa xác nhận được bài đã lên feed.'}${elapsedDetail} Hãy xem ảnh trạng thái mới nhất.`,
+      detail,
       tone: 'warn'
     };
   }
@@ -769,7 +808,7 @@ const publishModes = [
     id: 'review',
     title: 'Mở composer để kiểm tra',
     icon: 'shield',
-    description: 'Nhập nội dung/media, chụp màn hình kiểm tra rồi tự tắt LDPlayer.'
+    description: 'Chế độ an toàn cho LDPlayer: nhập nội dung/media, chụp màn hình kiểm tra rồi tự tắt LD.'
   },
   {
     id: 'bulk',
@@ -844,13 +883,17 @@ const professionalKpis = computed(() => [
     label: 'Chế độ',
     value: currentPublishModeShortLabel.value,
     detail: isBulkMode.value
-      ? `${selectedQueueAccounts.value.length}/${facebookAccounts.value.length} profile · nghỉ ${queueDelaySeconds.value} giây`
+      ? `${selectedQueueAccounts.value.length}/${facebookAccounts.value.length} profile · ${queueRunMode.value === 'review' ? 'review' : 'đăng thật'} · nghỉ ${queueDelaySeconds.value} giây`
       : isScheduleMode.value
         ? scheduleStatus.value
-        : selectedAccount.value?.displayName || 'Chưa chọn profile',
-    tone: isBulkMode.value && !selectedQueueAccounts.value.length ? 'warn' : 'ok'
+        : isReviewMode.value
+          ? 'LD-safe: chỉ mở composer, chụp màn hình, không bấm đăng'
+          : selectedAccount.value?.displayName || 'Chưa chọn profile',
+    tone: (isBulkMode.value && !selectedQueueAccounts.value.length) || isDirectPublishModeRisky.value || isQueueDelayTooLow.value ? 'warn' : 'ok'
   }
 ]);
+const isDirectPublishModeRisky = computed(() => publishMode.value === 'direct');
+const isQueueDelayTooLow = computed(() => isBulkMode.value && queueRunMode.value === 'publish' && queueDelaySeconds.value < ldSafeDelaySeconds);
 const professionalActions = computed(() => {
   const actions = [];
   if (!previewCaption.value && captionRequired.value) {
@@ -928,6 +971,27 @@ const professionalActions = computed(() => {
       title: 'Chọn profile đăng',
       detail: 'Chọn ít nhất một profile để bắt đầu đăng hàng loạt.',
       tone: 'required'
+    });
+  }
+  if (isDirectPublishModeRisky.value) {
+    actions.push({
+      title: 'Đang bật đăng thật',
+      detail: 'Với LDPlayer và máy yếu, nên chạy review trước; chỉ đăng thật khi screenshot composer đã đúng profile, đúng nội dung và đúng media.',
+      tone: 'required'
+    });
+  }
+  if (isQueueDelayTooLow.value) {
+    actions.push({
+      title: 'Tăng thời gian nghỉ giữa các LD',
+      detail: `Máy yếu nên để tối thiểu ${ldSafeDelaySeconds} giây giữa mỗi profile để LDPlayer/ADB kịp ổn định.`,
+      tone: 'required'
+    });
+  }
+  if (isBulkMode.value && queueRunMode.value === 'review' && selectedQueueAccounts.value.length > 1) {
+    actions.push({
+      title: 'Queue đang ở chế độ an toàn',
+      detail: 'Tool sẽ mở từng LDPlayer để kiểm tra composer, không bấm đăng và không chạy song song.',
+      tone: 'optional'
     });
   }
   if (isScheduleMode.value && !scheduleReady.value) {
@@ -1255,6 +1319,33 @@ async function probeDevice() {
   }
 }
 
+async function runInstagramHealthCheck() {
+  if (!selectedAccount.value || selectedPlatformId.value !== 'instagram') return;
+  instagramHealthLoading.value = true;
+  instagramHealth.value = null;
+  try {
+    const { data } = await http.post(`/mobile/accounts/${selectedAccount.value._id}/instagram/health`, {
+      appPackage: getAccountAppPackage(selectedAccount.value)
+    });
+    instagramHealth.value = data.result;
+    if (data.result?.screenshot?.imageBase64) {
+      screenshot.value = data.result.screenshot;
+    }
+    if (data.result?.automationReady) {
+      ui.notify('Instagram health check đạt.');
+    } else if (data.result?.degraded) {
+      ui.notify('Instagram đã mở đúng, nhưng UIAutomator chưa đọc được UI.', 'error');
+    } else {
+      const failed = (data.result?.checks || []).find((check) => !check.ok);
+      ui.notify(failed?.detail || 'Instagram chưa đủ ổn định để automation.', 'error');
+    }
+  } catch (error) {
+    ui.notify(error.message, 'error');
+  } finally {
+    instagramHealthLoading.value = false;
+  }
+}
+
 async function refreshScreenshot() {
   if (!selectedAccount.value) return;
   screenshotLoading.value = true;
@@ -1366,6 +1457,13 @@ async function runPostWorkflow() {
       persistComposerReviewResult(account, data.result);
       workflowStage.value = 'review';
       scheduleComposerReviewClose(account);
+    } else if (isInstagramPreSubmitGateResult(data.result)) {
+      workflowStage.value = 'review';
+      ui.notify(getInstagramPreSubmitGateMessage(data.result), 'error');
+      await closeAccountAfterWorkflow(account, 'Đã dừng trước Share');
+    } else if (isPostSubmitUnverifiedResult(data.result)) {
+      workflowStage.value = 'review';
+      ui.notify(data.result.resultMessage || `Đã tới bước đăng ${selectedPlatform.value.label} nhưng chưa xác minh được kết quả. Không tự chạy lại để tránh trùng bài.`, 'error');
     } else if (data.result.submitVerified === false) {
       workflowStage.value = 'review';
       ui.notify(`Đã bấm đăng nhưng chưa xác nhận ${selectedPlatform.value.label} đã nhận bài. Hãy xem screenshot/log.`, 'error');
@@ -1470,8 +1568,8 @@ async function runQueueWorkflow() {
 
   const queueAccounts = [...selectedQueueAccounts.value];
   const interAccountDelaySeconds = Math.max(0, Math.min(Number(queueDelaySeconds.value) || 0, 600));
-  const queueRetryLimit = 1;
   const queueAutoSubmit = queueRunMode.value !== 'review';
+  const queueRetryLimit = queueAutoSubmit ? 1 : 0;
   posting.value = true;
   queueRunning.value = true;
   queuePhase.value = 'preparing';
@@ -1506,26 +1604,14 @@ async function runQueueWorkflow() {
           const queueSubmitWaitMs = queueAutoSubmit ? submitWaitMs.value : 0;
           updateQueueItem(account._id, {
             status: 'running',
-            message: queueAutoSubmit
-              ? (isFacebookVideoMode.value
-                ? 'Đang đăng và chờ xử lý video'
-                : isFacebookCollageMode.value
-                  ? `${selectedPhotoCount.value} ảnh sẽ đăng bằng 1 collage`
-                : uploadedPhotoCount.value
-                  ? `Đang đăng và chờ tải ${uploadedPhotoCount.value} ảnh`
-                : 'Đang đăng bài')
-              : (isFacebookVideoMode.value
-                ? 'Đang mở composer video để kiểm tra'
-                : isFacebookCollageMode.value
-                  ? `Đang mở composer kiểm tra ${selectedPhotoCount.value} ảnh dạng collage`
-                : 'Đang mở composer để kiểm tra')
+            message: getQueueRunningMessage(queueAutoSubmit)
           });
           const { data } = await submitPostForAccount(account, queueAutoSubmit, queueSubmitWaitMs);
           postResult.value = data.result;
           screenshot.value = data.result.screenshot || screenshot.value;
 
           if (!queueAutoSubmit) {
-            const reviewMessage = data.result.screenshotVerified
+            const reviewMessage = isComposerReviewReady(data.result)
               ? 'Đã chụp composer kiểm tra và đóng LDPlayer'
               : 'Đã mở kiểm tra nhưng screenshot chưa xác minh, đã đóng LDPlayer';
             updateQueueItem(account._id, {
@@ -1536,7 +1622,11 @@ async function runQueueWorkflow() {
             queuePhase.value = 'closing';
             await closeQueueAccount(account, reviewMessage);
           } else if (data.result.submitVerified === false) {
-            const reviewMessage = data.result.composerPending
+            const reviewMessage = isPostSubmitUnverifiedResult(data.result)
+              ? (data.result.resultMessage || 'Đã tới bước gửi bài nhưng chưa xác minh được kết quả; không tự đăng lại để tránh trùng bài')
+              : isInstagramPreSubmitGateResult(data.result)
+              ? getInstagramPreSubmitGateMessage(data.result)
+              : data.result.composerPending
               ? 'Chưa hoàn tất, đã lưu screenshot và đóng LDPlayer'
               : 'Chưa xác minh, đã lưu screenshot và đóng LDPlayer';
             updateQueueItem(account._id, {
@@ -1547,13 +1637,7 @@ async function runQueueWorkflow() {
             queuePhase.value = 'closing';
             await closeQueueAccount(account, reviewMessage);
           } else {
-            const successMessage = isFacebookVideoMode.value
-              ? 'Đã đăng video và xác minh'
-              : isFacebookCollageMode.value
-                ? 'Đã đăng collage và xác minh'
-              : uploadedPhotoCount.value
-                ? `Đã tải xong ${uploadedPhotoCount.value} ảnh và đăng bài`
-              : 'Đã đăng và xác minh';
+            const successMessage = getQueueSuccessMessage();
             updateQueueItem(account._id, {
               status: 'done',
               message: successMessage,
@@ -1565,15 +1649,18 @@ async function runQueueWorkflow() {
           break;
         } catch (error) {
           const message = getHttpErrorMessage(error);
-          const retryable = attempt < queueRetryLimit && isRetryableQueueError(error);
+          const postSubmitUnverified = isPostSubmitUnverifiedQueueError(error);
+          const retryable = !postSubmitUnverified && attempt < queueRetryLimit && isRetryableQueueError(error);
           updateQueueItem(account._id, {
-            status: retryable ? 'waiting' : 'failed',
-            message: retryable
+            status: postSubmitUnverified ? 'review' : (retryable ? 'waiting' : 'failed'),
+            message: postSubmitUnverified
+              ? 'Đã tới bước gửi bài nhưng chưa xác minh được kết quả; không tự đăng lại để tránh trùng bài'
+              : retryable
               ? `Lỗi tạm thời: ${message} · đang dọn LDPlayer để thử lại`
               : message
           });
           queuePhase.value = 'closing';
-          await closeQueueAccount(account, retryable ? 'Dọn LDPlayer trước khi chạy lại' : `Lỗi: ${message}`);
+          await closeQueueAccount(account, postSubmitUnverified ? 'Cần kiểm tra kết quả đăng' : (retryable ? 'Dọn LDPlayer trước khi chạy lại' : `Lỗi: ${message}`));
           if (!retryable) break;
           queuePhase.value = 'waiting';
           await wait(4_000);
@@ -1613,6 +1700,87 @@ async function runQueueWorkflow() {
     queuePhase.value = 'idle';
     queueCurrentAccountId.value = '';
   }
+}
+
+function getQueueRunningMessage(autoSubmit) {
+  if (selectedPlatformId.value === 'instagram') {
+    if (autoSubmit) {
+      return isInstagramAlbumMode.value
+        ? `Đang đăng album Instagram ${selectedPhotoCount.value} ảnh`
+        : 'Đang đăng ảnh Instagram';
+    }
+    return isInstagramAlbumMode.value
+      ? `Đang mở composer kiểm tra album Instagram ${selectedPhotoCount.value} ảnh`
+      : 'Đang mở composer kiểm tra ảnh Instagram';
+  }
+
+  if (autoSubmit) {
+    if (isFacebookVideoMode.value) return 'Đang đăng và chờ xử lý video';
+    if (isFacebookCollageMode.value) return `${selectedPhotoCount.value} ảnh sẽ đăng bằng 1 collage`;
+    if (uploadedPhotoCount.value) return `Đang đăng và chờ tải ${uploadedPhotoCount.value} ảnh`;
+    return 'Đang đăng bài';
+  }
+
+  if (isFacebookVideoMode.value) return 'Đang mở composer video để kiểm tra';
+  if (isFacebookCollageMode.value) return `Đang mở composer kiểm tra ${selectedPhotoCount.value} ảnh dạng collage`;
+  return 'Đang mở composer để kiểm tra';
+}
+
+function getQueueSuccessMessage() {
+  if (selectedPlatformId.value === 'instagram') {
+    return isInstagramAlbumMode.value
+      ? `Đã đăng album Instagram ${selectedPhotoCount.value} ảnh và xác minh`
+      : 'Đã đăng ảnh Instagram và xác minh';
+  }
+  if (isFacebookVideoMode.value) return 'Đã đăng video và xác minh';
+  if (isFacebookCollageMode.value) return 'Đã đăng collage và xác minh';
+  if (uploadedPhotoCount.value) return `Đã tải xong ${uploadedPhotoCount.value} ảnh và đăng bài`;
+  return 'Đã đăng và xác minh';
+}
+
+function isInstagramPreSubmitGateResult(result = {}) {
+  return selectedPlatformId.value === 'instagram'
+    && result?.autoSubmit
+    && result?.submitVerified === false
+    && result?.submitReason === 'pre_submit_gate_failed';
+}
+
+function isPostSubmitUnverifiedResult(result = {}) {
+  return result?.autoSubmit
+    && result?.submitVerified === false
+    && (
+      result?.safeToRetry === false
+      || result?.resultCategory === 'post_submit_unverified'
+      || /submit_unverified|published_post_evidence_pending|no_published_post_evidence|still_on_share_screen/i.test(String(result?.submitReason || result?.finalState || ''))
+    );
+}
+
+function isComposerReviewReady(result = {}) {
+  return Boolean(
+    result?.screenshotVerified
+    || result?.resultStatus === 'review_ready'
+    || result?.screenshotVerification?.ok
+  );
+}
+
+function getInstagramPreSubmitGateMessage(result = {}) {
+  const labels = {
+    foregroundOk: 'Instagram không còn ở foreground',
+    stateOk: 'chưa ở màn caption/share',
+    shareButtonOk: 'chưa thấy nút Share',
+    captionOk: 'caption chưa được xác minh',
+    mediaOk: 'chưa thấy media/preview'
+  };
+  const failed = Array.isArray(result?.preSubmitGate?.failedChecks)
+    ? result.preSubmitGate.failedChecks
+    : [];
+  const detail = failed
+    .map((item) => labels[item] || item)
+    .filter(Boolean)
+    .join(', ');
+  return detail
+    ? `Chưa đủ điều kiện Share: ${detail}. Đã lưu screenshot và đóng LDPlayer`
+    : 'Chưa đủ điều kiện Share. Đã lưu screenshot và đóng LDPlayer';
 }
 
 async function prepareQueueEnvironment() {
@@ -1664,6 +1832,7 @@ async function submitPostForAccount(account, autoSubmit, waitAfterSubmitMs = 0) 
     text: finalPostText.value.trim(),
     appPackage: selectedPlatform.value.packageName,
     autoSubmit,
+    cleanupAfterDryRun: selectedPlatformId.value === 'instagram' && !autoSubmit,
     textInputMode: 'stable',
     waitAfterSubmitMs,
     images: publishImages
@@ -2411,15 +2580,31 @@ function getHttpErrorMessage(error) {
 }
 
 function isRetryableQueueError(error) {
+  if (isPostSubmitUnverifiedQueueError(error)) return false;
   const apiError = error?.response?.data?.error;
   const details = apiError?.details || {};
-  if (details.retryable === true) return true;
-  if (Number(error?.response?.status) === 503) return true;
   const message = getHttpErrorMessage(error)
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase();
+  if (details.retryable === true) return true;
+  if (Number(error?.response?.status) === 503) return true;
   return /adb|ldplayer|device|system ui|khong phan hoi|not responding|offline|chua mo thanh cong|composer|media|video|facebook chua nhan/.test(message);
+}
+
+function isPostSubmitUnverifiedQueueError(error) {
+  const apiError = error?.response?.data?.error;
+  const details = apiError?.details || {};
+  const message = getHttpErrorMessage(error)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+  const originalMessage = String(details.originalMessage || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+  const postSubmitText = `${message} ${originalMessage} ${details.category || ''} ${details.code || ''}`;
+  return /post_submit|submit_unverified|still_on_share_screen|no_confirmation_after_share|da bam share|da bam dang|chua xac minh duoc ket qua|chua thay tin hieu xac nhan|van con o man share|van o man soan bai/.test(postSubmitText);
 }
 
 function formatPostRun(log) {
@@ -2444,6 +2629,14 @@ function formatPostRun(log) {
   if (log.action === 'instagram_post_finished' && log.level !== 'info') {
     return {
       title: 'Bài Instagram chưa được xác minh',
+      detail,
+      tone: 'warn',
+      badge: 'Cần kiểm tra'
+    };
+  }
+  if (log.metadata?.category === 'post_submit_unverified' || String(log.action || '').endsWith('_failed_post_submit_unverified')) {
+    return {
+      title: mapped?.title || 'Cần kiểm tra kết quả đăng',
       detail,
       tone: 'warn',
       badge: 'Cần kiểm tra'
@@ -2594,6 +2787,7 @@ watch(selectedAccountId, () => {
   runtimeStatusRequestId += 1;
   selectedRuntimeStatus.value = null;
   runtimeStatusMissCount.value = 0;
+  instagramHealth.value = null;
   cancelComposerReviewClose();
   resetDisplayedComposerReviewResult({ forceIdle: true });
   // Chỉ xóa trạng thái của profile đang chọn. Giữ activeLdPlayerAccountId
@@ -2647,6 +2841,7 @@ watch(selectedPlatformId, async () => {
   runtimeStatusRequestId += 1;
   selectedRuntimeStatus.value = null;
   runtimeStatusMissCount.value = 0;
+  instagramHealth.value = null;
   if (selectedPlatformId.value !== 'facebook') {
     facebookPostType.value = 'imageText';
     post.media = post.media.filter((item) => {
@@ -2844,6 +3039,16 @@ watch(selectedPlatformId, async () => {
               <Wifi class="h-4 w-4" />
               Kiểm tra ADB
             </button>
+            <button
+              v-if="selectedPlatformId === 'instagram'"
+              class="btn-soft h-9 px-3 text-xs"
+              :disabled="instagramHealthLoading || !canUseRemote"
+              @click="runInstagramHealthCheck"
+            >
+              <Loader2 v-if="instagramHealthLoading" class="h-4 w-4 animate-spin" />
+              <ShieldCheck v-else class="h-4 w-4" />
+              {{ instagramHealthLoading ? 'Đang kiểm tra...' : 'Health Instagram' }}
+            </button>
             <button class="btn-soft h-9 px-3 text-xs" :disabled="running || !canUseRemote" @click="remoteLaunch">
               <Smartphone class="h-4 w-4" />
               Khởi động LDPlayer
@@ -2877,6 +3082,41 @@ watch(selectedPlatformId, async () => {
               <div class="rounded-lg bg-white p-3 dark:bg-zinc-950">
                 <p class="text-xs font-extrabold uppercase tracking-wide text-zinc-500">{{ selectedPlatform.label }}</p>
                 <p class="mt-1 truncate text-sm font-extrabold">{{ facebookSessionStatusLabel }}</p>
+              </div>
+            </div>
+
+            <div
+              v-if="selectedPlatformId === 'instagram' && instagramHealth"
+              class="mt-4 rounded-lg border p-3"
+              :class="instagramHealth.automationReady ? 'border-emerald-500/40 bg-emerald-500/10' : 'border-amber-500/40 bg-amber-500/10'"
+            >
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <p class="text-xs font-extrabold uppercase tracking-wide text-zinc-500">Instagram health check</p>
+                  <h4 class="mt-1 text-sm font-extrabold">
+                    {{ instagramHealth.automationReady ? 'Sẵn sàng automation' : instagramHealth.degraded ? 'Mở app OK, UIAutomator hạn chế' : 'Chưa đủ ổn định' }}
+                  </h4>
+                </div>
+                <span
+                  class="rounded-full px-3 py-1 text-xs font-extrabold"
+                  :class="instagramHealth.automationReady ? 'bg-emerald-500 text-white' : 'bg-amber-500 text-black'"
+                >
+                  {{ instagramHealth.elapsedMs ? `${Math.round(instagramHealth.elapsedMs / 1000)}s` : 'N/A' }}
+                </span>
+              </div>
+              <div class="mt-3 grid gap-2 sm:grid-cols-2">
+                <div
+                  v-for="check in instagramHealthChecks"
+                  :key="check.key"
+                  class="flex gap-2 rounded-lg bg-white p-2 text-sm dark:bg-zinc-950"
+                >
+                  <CheckCircle2 v-if="check.ok" class="mt-0.5 h-4 w-4 shrink-0 text-emerald-500" />
+                  <XCircle v-else class="mt-0.5 h-4 w-4 shrink-0 text-rose-500" />
+                  <div class="min-w-0">
+                    <p class="font-extrabold">{{ check.label }}</p>
+                    <p class="mt-0.5 break-words text-xs text-zinc-500">{{ check.detail || 'Không có chi tiết.' }}</p>
+                  </div>
+                </div>
               </div>
             </div>
 

@@ -18,6 +18,7 @@ export async function runCommand(command, args, metadata = {}) {
   try {
     const result = await execFileAsync(executable, args, {
       windowsHide: metadata.windowsHide !== false,
+      cwd: metadata.cwd || getCommandCwd(executable),
       timeout: metadata.timeoutMs || 60_000,
       maxBuffer: metadata.maxBuffer || 1024 * 1024
     });
@@ -49,6 +50,7 @@ export async function runCommand(command, args, metadata = {}) {
         });
         const retry = await execFileAsync(executable, args, {
           windowsHide: metadata.windowsHide !== false,
+          cwd: metadata.cwd || getCommandCwd(executable),
           timeout: metadata.timeoutMs || 60_000,
           maxBuffer: metadata.maxBuffer || 1024 * 1024
         });
@@ -78,6 +80,14 @@ export async function runCommand(command, args, metadata = {}) {
       retriedAfterAdbRestart: Boolean(error.retryError)
     };
   }
+}
+
+function getCommandCwd(executable = '') {
+  const name = path.basename(String(executable || '')).toLowerCase();
+  if (['ldconsole.exe', 'dnconsole.exe', 'dnplayer.exe'].includes(name)) {
+    return path.dirname(executable);
+  }
+  return undefined;
 }
 
 export async function runBinaryCommand(command, args, metadata = {}) {
@@ -240,6 +250,9 @@ function summarizeCommandError(error) {
 }
 
 function mockCommandResult(command, args = [], startedAt = Date.now()) {
+  if (process.env.MOBILE_COMMAND_MOCK_TRACE === '1') {
+    console.log(`[mock-adb] ${command} ${args.map((item) => String(item)).join(' ')}`);
+  }
   const result = (stdout = '', extra = {}) => ({
     ok: true,
     command,
@@ -272,11 +285,12 @@ function mockCommandResult(command, args = [], startedAt = Date.now()) {
   const target = targetIndex >= 0 ? normalizedArgs[targetIndex] : 'emulator-5554';
   const commandArgs = targetIndex >= 0 ? normalizedArgs.slice(2) : normalizedArgs;
   const state = getMockTargetState(target);
+  const mockPlatform = getMockPlatform(state, normalizedArgs);
 
   if (commandArgs[0] === 'get-state') return result('device');
 
   if (commandArgs[0] === 'exec-out' && commandArgs[1] === 'uiautomator') {
-    return result(buildMockFacebookXml(state));
+    return result(mockPlatform === 'instagram' ? buildMockInstagramXml(state) : buildMockFacebookXml(state));
   }
 
   if (commandArgs[0] === 'shell') {
@@ -292,8 +306,22 @@ function mockCommandResult(command, args = [], startedAt = Date.now()) {
     }
     if (shell[0] === 'wm' && shell[1] === 'size') return result(`Physical size: ${state.width}x${state.height}`);
     if (shell[0] === 'wm' && shell[1] === 'density') return result('Physical density: 240');
+    if (shell[0] === 'wm' && shell[1] === 'reset') return result('');
+    if (shell[0] === 'dumpsys' && shell[1] === 'activity' && shell[2] === 'activities') {
+      if (mockPlatform === 'instagram') {
+        const activity = getMockInstagramActivity(state);
+        return result(`mResumedActivity: ActivityRecord{mock u0 com.instagram.android/${activity} t1}
+topResumedActivity=ActivityRecord{mock u0 com.instagram.android/${activity} t1}`);
+      }
+      return result(`mResumedActivity: ActivityRecord{mock u0 com.facebook.katana/${getMockFacebookActivity(state)} t1}`);
+    }
     if (shell[0] === 'dumpsys' && shell[1] === 'window') {
-      return result('mCurrentFocus=Window{mock u0 com.facebook.katana/.ComposerActivity}\nmFocusedApp=AppWindowToken{mock token=ActivityRecord{mock com.facebook.katana/.ComposerActivity}}\nmCurrentRotation=0');
+      if (mockPlatform === 'instagram') {
+        const activity = getMockInstagramActivity(state);
+        return result(`mCurrentFocus=Window{mock u0 com.instagram.android/${activity}}\nmFocusedApp=AppWindowToken{mock token=ActivityRecord{mock com.instagram.android/${activity}}}\nmCurrentRotation=0`);
+      }
+      const activity = getMockFacebookActivity(state);
+      return result(`mCurrentFocus=Window{mock u0 com.facebook.katana/${activity}}\nmFocusedApp=AppWindowToken{mock token=ActivityRecord{mock com.facebook.katana/${activity}}}\nmCurrentRotation=0`);
     }
     if (shell[0] === 'pidof') return result('12345');
     if (shell[0] === 'pm' && shell[1] === 'path') return result(`package:/data/app/${shell[2] || 'com.facebook.katana'}-mock/base.apk`);
@@ -303,14 +331,24 @@ function mockCommandResult(command, args = [], startedAt = Date.now()) {
     if (shell[0] === 'ime' && shell[1] === 'list') return result('mId=com.android.adbkeyboard/.AdbIME');
     if (shell[0] === 'ime' && shell[1] === 'set') return result('');
     if (shell[0] === 'uiautomator' && shell[1] === 'dump') return result('UI hierchary dumped to: /sdcard/window.xml');
-    if (shell[0] === 'cat' && shell[1] === '/sdcard/window.xml') return result(buildMockFacebookXml(state));
+    if (shell[0] === 'cat' && shell[1] === '/sdcard/window.xml') {
+      return result(mockPlatform === 'instagram' ? buildMockInstagramXml(state) : buildMockFacebookXml(state));
+    }
     if (shell[0] === 'am' && shell[1] === 'start') {
       const text = readArgValue(normalizedArgs, 'android.intent.extra.TEXT') || readArgValue(normalizedArgs, 'msg');
       if (text) state.text = text;
       state.scenario = readMockScenario(text) || readMockScenarioFromTarget(target) || state.scenario || 'text';
       state.mediaKind = String(readArgValue(normalizedArgs, '-t') || '').startsWith('video/') ? 'video' : 'image';
+      state.platform = getMockPlatform(state, normalizedArgs);
       state.mediaAttached = normalizedArgs.includes('android.intent.extra.STREAM')
         && state.scenario !== 'collage-text-only';
+      if (state.platform === 'instagram') {
+        state.instagramStage = state.mediaAttached ? 'next' : 'home';
+        state.instagramTapCount = 0;
+        state.mediaCount = normalizedArgs.includes('android.intent.action.SEND_MULTIPLE')
+          ? Math.max(2, String(readArgValue(normalizedArgs, 'android.intent.extra.STREAM') || '').split(',').filter(Boolean).length)
+          : (state.mediaAttached ? 1 : 0);
+      }
       if (state.mediaAttached && state.scenario === 'share-chooser') {
         state.shareChooserPending = true;
         state.shareTapCount = 0;
@@ -319,6 +357,12 @@ function mockCommandResult(command, args = [], startedAt = Date.now()) {
         state.systemAnrPending = true;
       }
       state.packageName = readArgValue(normalizedArgs, '-p') || state.packageName;
+      if (state.platform === 'facebook') {
+        const action = readArgValue(normalizedArgs, '-a');
+        const data = readArgValue(normalizedArgs, '-d');
+        const isShareIntent = action.includes('SEND') || normalizedArgs.includes('android.intent.extra.STREAM') || Boolean(text);
+        state.facebookStage = !isShareIntent && String(data || '').includes('fb://feed') ? 'home' : (isShareIntent ? 'composer' : 'home');
+      }
       return result('Starting: Intent { act=android.intent.action.SEND typ=text/plain cmp=com.facebook.katana/.ComposerActivity }');
     }
     if (shell[0] === 'am' && shell[1] === 'broadcast') {
@@ -334,7 +378,27 @@ function mockCommandResult(command, args = [], startedAt = Date.now()) {
       return result('');
     }
     if (shell[0] === 'input' && shell[1] === 'tap') {
-      if (state.shareChooserPending) {
+      if (state.platform === 'instagram') {
+        state.instagramTapCount = Number(state.instagramTapCount || 0) + 1;
+        const x = Number(shell[2] || 0);
+        const y = Number(shell[3] || 0);
+        if (state.instagramStage === 'home' && y > state.height * 0.55) {
+          state.instagramStage = 'gallery';
+          state.mediaCount = Math.max(1, Number(state.mediaCount || 1));
+        } else if (state.instagramStage === 'gallery' && y < state.height * 0.2 && x > state.width * 0.55) {
+          state.instagramStage = 'caption';
+        } else if (state.instagramStage === 'next' && y < state.height * 0.2 && x > state.width * 0.55) {
+          state.instagramStage = 'caption';
+        } else if (state.instagramStage === 'caption' && y < state.height * 0.2 && x > state.width * 0.55) {
+          state.instagramStage = state.scenario === 'submit-unverified'
+            ? 'caption'
+            : 'submitting';
+        } else if (state.instagramStage === 'caption' && y > state.height * 0.25 && y < state.height * 0.65) {
+          state.editorOpen = true;
+        } else if (state.instagramStage === 'gallery' && y > state.height * 0.55) {
+          state.mediaCount = Math.max(1, Number(state.mediaCount || 1) + 1);
+        }
+      } else if (state.shareChooserPending) {
         state.shareTapCount = Number(state.shareTapCount || 0) + 1;
         if (state.shareTapCount >= 2) state.shareChooserPending = false;
       } else {
@@ -354,6 +418,7 @@ function mockCommandResult(command, args = [], startedAt = Date.now()) {
     if (shell[0] === 'input' && shell[1] === 'keyevent') {
       if (state.systemAnrPending) state.systemAnrPending = false;
       if (shell[2] === '4') state.editorOpen = false;
+      if (state.platform === 'instagram' && shell[2] === '4') state.instagramStage = 'caption';
       if (shell[2] === '279') state.text = state.clipboard || state.text || '';
       if (shell[2] === '67') state.text = '';
       return result('');
@@ -375,7 +440,11 @@ function mockCommandResult(command, args = [], startedAt = Date.now()) {
         : 'Row: 0 _id=1001 _data=/sdcard/Pictures/SocialPilot/mock-image.jpg');
     }
     if (['monkey', 'pm', 'appops', 'content'].includes(shell[0])) return result('');
-    if (shell[0] === 'am' && ['force-stop', 'broadcast'].includes(shell[1])) return result('');
+    if (shell[0] === 'am' && ['force-stop', 'broadcast'].includes(shell[1])) {
+      if (shell[1] === 'force-stop' && String(shell[2] || '').includes('instagram')) state.instagramStage = 'home';
+      if (shell[1] === 'force-stop' && String(shell[2] || '').includes('facebook')) state.facebookStage = 'home';
+      return result('');
+    }
     if (/test -f|mkdir|touch|rm -f/i.test(shellText)) return result('');
   }
 
@@ -414,12 +483,19 @@ function getMockTargetState(target) {
   if (!mockAdbState.has(target)) {
     mockAdbState.set(target, {
       text: process.env.MOBILE_COMMAND_MOCK_TEXT || '',
-      packageName: 'com.facebook.katana',
+      packageName: String(env.mobileAutomation.commandMock || '').includes('instagram')
+        ? 'com.instagram.android'
+        : 'com.facebook.katana',
+      platform: String(env.mobileAutomation.commandMock || '').includes('instagram') ? 'instagram' : 'facebook',
       ...readMockTargetConfig(target),
       mediaAttached: false,
+      mediaCount: 0,
       shareChooserPending: false,
       systemAnrPending: false,
       shareTapCount: 0,
+      instagramTapCount: 0,
+      instagramStage: 'home',
+      facebookStage: 'home',
       clipboard: '',
       editorOpen: false,
       mediaKind: 'image'
@@ -428,20 +504,25 @@ function getMockTargetState(target) {
   return mockAdbState.get(target);
 }
 
+function getMockPlatform(state = {}, args = []) {
+  const text = `${env.mobileAutomation.commandMock || ''} ${state.packageName || ''} ${args.join(' ')}`.toLowerCase();
+  return text.includes('instagram') ? 'instagram' : 'facebook';
+}
+
 function readMockScenario(text = '') {
   const match = String(text).match(/\[scenario:([a-z0-9-]+)\]/i);
   return match?.[1] || '';
 }
 
 function readMockScenarioFromTarget(target = '') {
-  const match = String(target).match(/scenario-([a-z0-9-]+)/i);
+  const match = String(target).match(/scenario-([a-z0-9-]+?)(?:-locale-|-size-|$)/i);
   return match?.[1] || '';
 }
 
 function readMockTargetConfig(target = '') {
   const value = String(target);
   const sizeMatch = value.match(/size-(\d+)x(\d+)/i);
-  const localeMatch = value.match(/locale-([a-z-]+)/i);
+  const localeMatch = value.match(/locale-([a-z-]+?)(?:-size-|$)/i);
   return {
     scenario: readMockScenarioFromTarget(value) || 'text',
     locale: localeMatch?.[1]?.toLowerCase() || 'vi',
@@ -468,6 +549,7 @@ function buildMockFacebookXml(state = {}) {
     return buildMockSystemAnrXml();
   }
   if (state.shareChooserPending) return buildMockFacebookShareChooserXml(state);
+  if (state.facebookStage === 'home') return buildMockFacebookHomeXml(state);
   return buildMockFacebookComposerXml(state);
 }
 
@@ -478,6 +560,105 @@ function buildMockSystemAnrXml() {
   <node index="1" text="Close app" resource-id="" class="android.widget.TextView" package="android" content-desc="" clickable="true" enabled="true" bounds="[230,800][520,860]" />
   <node index="2" text="Wait" resource-id="" class="android.widget.TextView" package="android" content-desc="" clickable="true" enabled="true" bounds="[230,880][520,940]" />
 </hierarchy>`;
+}
+
+function buildMockInstagramXml(state = {}) {
+  if (state.systemAnrPending) {
+    state.systemAnrPending = false;
+    return buildMockSystemAnrXml();
+  }
+  const stage = state.instagramStage || (state.mediaAttached ? 'next' : 'home');
+  const labels = getMockInstagramLabels(state.locale);
+  const node = (index, attrs) => mockNode({ ...state, packageName: 'com.instagram.android' }, index, attrs);
+  const captionText = state.text || process.env.MOBILE_COMMAND_MOCK_TEXT || '';
+  if (stage === 'submitting') {
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy rotation="0">
+  ${node(0, { text: labels.sharing, className: 'android.widget.TextView', bounds: [330, 760, 570, 820] })}
+  ${node(1, { text: '', className: 'android.widget.ProgressBar', bounds: [420, 690, 480, 750] })}
+</hierarchy>`;
+  }
+  if (stage === 'caption') {
+    const shareNode = state.scenario === 'gate-no-share'
+      ? ''
+      : node(1, { text: labels.share, className: 'android.widget.Button', desc: labels.share, clickable: true, bounds: [720, 42, 870, 104] });
+    const mediaNode = state.scenario === 'gate-no-media'
+      ? ''
+      : node(3, { text: `${Number(state.mediaCount || 1)} media`, className: 'android.widget.ImageView', desc: labels.preview, clickable: true, bounds: [60, 620, 840, 1120] });
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy rotation="0">
+  ${node(0, { text: labels.newPost, className: 'android.widget.TextView', bounds: [330, 42, 570, 92] })}
+  ${shareNode}
+  ${node(2, { text: captionText || labels.caption, resourceId: 'com.instagram.android:id/caption_text_view', className: 'android.widget.EditText', desc: labels.caption, clickable: true, bounds: [60, 270, 840, 600] })}
+  ${mediaNode}
+</hierarchy>`;
+  }
+  if (stage === 'next') {
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy rotation="0">
+  ${node(0, { text: labels.newPost, className: 'android.widget.TextView', bounds: [330, 42, 570, 92] })}
+  ${node(1, { text: labels.next, className: 'android.widget.Button', desc: labels.next, clickable: true, bounds: [720, 42, 870, 104] })}
+  ${node(2, { text: `${Number(state.mediaCount || 1)} media`, className: 'android.widget.ImageView', desc: labels.preview, clickable: true, bounds: [0, 160, 900, 1040] })}
+</hierarchy>`;
+  }
+  if (stage === 'gallery') {
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy rotation="0">
+  ${node(0, { text: labels.newPost, resourceId: 'com.instagram.android:id/new_post_title', className: 'android.widget.TextView', bounds: [84, 0, 809, 84] })}
+  ${node(1, { text: labels.next, resourceId: 'com.instagram.android:id/next_button_textview', className: 'android.widget.TextView', desc: labels.next, clickable: true, bounds: [809, 0, 900, 84] })}
+  ${node(2, { text: '', resourceId: 'com.instagram.android:id/crop_image_view', className: 'android.widget.ImageView', desc: 'Photo preview thumbnail', bounds: [0, 84, 900, 984] })}
+  ${node(3, { text: 'Recents', resourceId: 'com.instagram.android:id/gallery_folder_menu_tv', className: 'android.widget.Button', bounds: [0, 1005, 185, 1040] })}
+  ${node(4, { text: labels.select, resourceId: 'com.instagram.android:id/multi_select_slide_button_alt', className: 'android.widget.Button', desc: 'Select multiple button', clickable: true, bounds: [772, 999, 882, 1047] })}
+  ${node(5, { text: '', resourceId: 'com.instagram.android:id/gallery_grid_item_thumbnail', className: 'android.widget.Button', desc: 'Selected Photo thumbnail created on July 25, 2026 8:34 AM', clickable: true, bounds: [302, 1064, 598, 1360] })}
+  ${node(6, { text: '', resourceId: 'com.instagram.android:id/gallery_grid_item_thumbnail', className: 'android.widget.Button', desc: 'Unselected Photo thumbnail created on July 25, 2026 8:33 AM', clickable: true, bounds: [601, 1064, 898, 1361] })}
+  ${node(7, { text: '', resourceId: 'com.instagram.android:id/gallery_grid_item_thumbnail', className: 'android.widget.Button', desc: 'Unselected Photo thumbnail created on July 25, 2026 8:33 AM', clickable: true, bounds: [2, 1363, 299, 1600] })}
+  ${node(8, { text: 'POST', resourceId: 'com.instagram.android:id/cam_dest_feed', className: 'android.widget.TextView', desc: 'POST', clickable: true, bounds: [404, 1529, 496, 1580] })}
+</hierarchy>`;
+  }
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy rotation="0">
+  ${node(0, { text: labels.home, className: 'android.widget.TextView', bounds: [330, 42, 570, 92] })}
+  ${node(1, { text: labels.create, className: 'android.widget.Button', desc: labels.create, clickable: true, bounds: [720, 1460, 870, 1568] })}
+</hierarchy>`;
+}
+
+function getMockInstagramActivity(state = {}) {
+  if (state.instagramStage === 'home') return '.activity.MainTabActivity';
+  if (state.instagramStage === 'submitting') return '.activity.MainTabActivity';
+  return '.creation.capture.MediaCaptureActivity';
+}
+
+function getMockFacebookActivity(state = {}) {
+  return state.facebookStage === 'home'
+    ? '.activity.FbMainTabActivity'
+    : '.ComposerActivity';
+}
+
+function getMockInstagramLabels(locale = 'vi') {
+  if (String(locale).toLowerCase().startsWith('en')) {
+    return {
+      newPost: 'Bài viết mới',
+      next: 'Tiếp',
+      share: 'Chia sẻ',
+      caption: 'Viết chú thích',
+      sharing: 'Sharing',
+      preview: 'Preview',
+      home: 'Instagram Home Feed',
+      create: 'Create',
+      select: 'Select'
+    };
+  }
+  return {
+    newPost: 'Bài viết mới',
+    next: 'Tiếp',
+    share: 'Chia sẻ',
+    caption: 'Viết chú thích',
+    sharing: 'Đang chia sẻ',
+    preview: 'Xem trước',
+    home: 'Instagram Home Feed',
+    create: 'Create',
+    select: 'Select'
+  };
 }
 
 function buildMockFacebookShareChooserXml(state = {}) {
@@ -525,6 +706,17 @@ function buildMockFacebookComposerXml(state = {}) {
 </hierarchy>`;
 }
 
+function buildMockFacebookHomeXml(state = {}) {
+  const labels = getMockFacebookLabels(state.locale);
+  const node = (index, attrs) => mockNode(state, index, attrs);
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy rotation="0">
+  ${node(0, { text: 'Trang chủ', className: 'android.widget.TextView', desc: 'Trang chủ', clickable: true, bounds: [42, 42, 180, 100] })}
+  ${node(1, { text: labels.placeholder, resourceId: 'com.facebook.katana:id/feed_composer_entry', className: 'android.widget.TextView', desc: labels.placeholder, clickable: true, bounds: [48, 170, 852, 250] })}
+  ${node(2, { text: 'Stories', className: 'android.widget.TextView', bounds: [48, 280, 180, 340] })}
+</hierarchy>`;
+}
+
 function getMockFacebookLabels(locale = 'vi') {
   if (String(locale).toLowerCase().startsWith('en')) {
     return {
@@ -550,7 +742,7 @@ function getMockFacebookLabels(locale = 'vi') {
 
 function mockNode(state, index, attrs = {}) {
   const bounds = scaleMockBounds(attrs.bounds || [0, 0, 1, 1], state);
-  return `<node index="${index}" text="${escapeXmlAttr(attrs.text || '')}" resource-id="${escapeXmlAttr(attrs.resourceId || '')}" class="${escapeXmlAttr(attrs.className || 'android.widget.TextView')}" package="${escapeXmlAttr(attrs.packageName || 'com.facebook.katana')}" content-desc="${escapeXmlAttr(attrs.desc || '')}" clickable="${attrs.clickable ? 'true' : 'false'}" enabled="${attrs.enabled === false ? 'false' : 'true'}" bounds="[${bounds[0]},${bounds[1]}][${bounds[2]},${bounds[3]}]" />`;
+  return `<node index="${index}" text="${escapeXmlAttr(attrs.text || '')}" resource-id="${escapeXmlAttr(attrs.resourceId || '')}" class="${escapeXmlAttr(attrs.className || 'android.widget.TextView')}" package="${escapeXmlAttr(attrs.packageName || state.packageName || 'com.facebook.katana')}" content-desc="${escapeXmlAttr(attrs.desc || '')}" clickable="${attrs.clickable ? 'true' : 'false'}" enabled="${attrs.enabled === false ? 'false' : 'true'}" bounds="[${bounds[0]},${bounds[1]}][${bounds[2]},${bounds[3]}]" />`;
 }
 
 function scaleMockBounds(bounds, state = {}) {

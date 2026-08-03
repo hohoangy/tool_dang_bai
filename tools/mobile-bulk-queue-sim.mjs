@@ -120,6 +120,70 @@ const scenarios = [
       preparesFailed: 1,
       closes: 0
     }
+  },
+  {
+    name: 'instagram_album_success_message_is_platform_specific',
+    platform: 'instagram',
+    postType: 'album',
+    mediaCount: 4,
+    accounts: ['LD1'],
+    plan: {
+      LD1: [{ type: 'success' }]
+    },
+    expect: {
+      statuses: { LD1: 'done' },
+      attempts: { LD1: 1 },
+      messages: { LD1: 'Đã đăng album Instagram 4 ảnh và xác minh' },
+      closes: 1
+    }
+  },
+  {
+    name: 'post_submit_unverified_never_retries',
+    platform: 'instagram',
+    accounts: ['LD1', 'LD2'],
+    plan: {
+      LD1: [{ type: 'error', message: 'Đã bấm Share nhưng chưa thấy tín hiệu xác nhận Instagram nhận bài.', retryable: true, phase: 'post_submit' }],
+      LD2: [{ type: 'success' }]
+    },
+    expect: {
+      statuses: { LD1: 'review', LD2: 'done' },
+      attempts: { LD1: 1, LD2: 1 },
+      messages: { LD1: 'Đã tới bước gửi bài nhưng chưa xác minh được kết quả; không tự đăng lại để tránh trùng bài' },
+      retryCleanups: 0,
+      closes: 2
+    }
+  },
+  {
+    name: 'facebook_post_submit_unverified_never_retries',
+    platform: 'facebook',
+    accounts: ['LD1', 'LD2'],
+    plan: {
+      LD1: [{ type: 'error', message: 'Đã bấm Đăng nhưng chưa xác nhận Facebook đã nhận bài. published_post_evidence_pending', retryable: true, phase: 'post_submit' }],
+      LD2: [{ type: 'success' }]
+    },
+    expect: {
+      statuses: { LD1: 'review', LD2: 'done' },
+      attempts: { LD1: 1, LD2: 1 },
+      messages: { LD1: 'Đã tới bước gửi bài nhưng chưa xác minh được kết quả; không tự đăng lại để tránh trùng bài' },
+      retryCleanups: 0,
+      closes: 2
+    }
+  },
+  {
+    name: 'instagram_pre_submit_gate_failed_is_review_not_retry',
+    platform: 'instagram',
+    accounts: ['LD1', 'LD2'],
+    plan: {
+      LD1: [{ type: 'review', composerPending: true, submitReason: 'pre_submit_gate_failed', preSubmitGate: { failedChecks: ['captionOk', 'shareButtonOk'] } }],
+      LD2: [{ type: 'success' }]
+    },
+    expect: {
+      statuses: { LD1: 'review', LD2: 'done' },
+      attempts: { LD1: 1, LD2: 1 },
+      messages: { LD1: 'Chưa đủ điều kiện Share: caption chưa được xác minh, chưa thấy nút Share. Đã lưu screenshot và đóng LDPlayer' },
+      retryCleanups: 0,
+      closes: 2
+    }
   }
 ];
 
@@ -152,6 +216,11 @@ function runScenario(scenario) {
   for (const [id, attempts] of Object.entries(scenario.expect.attempts || {})) {
     if (state.attempts[id] !== attempts) {
       errors.push(`attempts:${id}:expected=${attempts}:actual=${state.attempts[id] || 0}`);
+    }
+  }
+  for (const [id, message] of Object.entries(scenario.expect.messages || {})) {
+    if (state.items[id]?.message !== message) {
+      errors.push(`message:${id}:expected=${message}:actual=${state.items[id]?.message}`);
     }
   }
   if (scenario.expect.order && scenario.expect.order.join('|') !== state.order.join('|')) {
@@ -280,14 +349,16 @@ function runQueueSimulation(scenario) {
         state.attempts[id] = attempt + 1;
         const action = (scenario.plan[id] || [])[attempt] || { type: 'success' };
         if (action.type === 'success') {
-          state.items[id] = { status: 'done', message: 'Đã đăng và xác minh' };
+          state.items[id] = { status: 'done', message: getQueueSuccessMessageSimulation(scenario) };
           closeAccountSimulation(state, id, 'success');
           break;
         }
         if (action.type === 'review') {
           state.items[id] = {
             status: 'review',
-            message: action.screenshot
+            message: isInstagramPreSubmitGateAction(scenario, action)
+              ? getInstagramPreSubmitGateMessageSimulation(action)
+              : action.screenshot
               ? 'Đã chụp composer kiểm tra và đóng LDPlayer'
               : action.composerPending
                 ? 'Chưa hoàn tất, đã lưu screenshot và đóng LDPlayer'
@@ -301,10 +372,13 @@ function runQueueSimulation(scenario) {
           break;
         }
 
-        const retryable = action.retryable && attempt < retryLimit;
+        const postSubmitUnverified = isPostSubmitUnverifiedAction(action);
+        const retryable = !postSubmitUnverified && isRetryableQueueAction(action) && attempt < retryLimit;
         state.items[id] = {
-          status: retryable ? 'waiting' : 'failed',
-          message: retryable
+          status: postSubmitUnverified ? 'review' : (retryable ? 'waiting' : 'failed'),
+          message: postSubmitUnverified
+            ? 'Đã tới bước gửi bài nhưng chưa xác minh được kết quả; không tự đăng lại để tránh trùng bài'
+            : retryable
             ? `Lỗi tạm thời: ${action.message} · đang dọn LDPlayer để thử lại`
             : action.message
         };
@@ -342,6 +416,56 @@ function prepareQueueEnvironmentSimulation(scenario) {
 
 function closeAccountSimulation(state, account, reason) {
   state.events.push({ type: 'closes', account, reason });
+}
+
+function getQueueSuccessMessageSimulation(scenario = {}) {
+  if (scenario.platform === 'instagram') {
+    return scenario.postType === 'album'
+      ? `Đã đăng album Instagram ${scenario.mediaCount || 0} ảnh và xác minh`
+      : 'Đã đăng ảnh Instagram và xác minh';
+  }
+  if (scenario.postType === 'video') return 'Đã đăng video và xác minh';
+  if (scenario.postType === 'collage') return 'Đã đăng collage và xác minh';
+  if (scenario.mediaCount) return `Đã tải xong ${scenario.mediaCount} ảnh và đăng bài`;
+  return 'Đã đăng và xác minh';
+}
+
+function isInstagramPreSubmitGateAction(scenario = {}, action = {}) {
+  return scenario.platform === 'instagram' && action.submitReason === 'pre_submit_gate_failed';
+}
+
+function getInstagramPreSubmitGateMessageSimulation(action = {}) {
+  const labels = {
+    foregroundOk: 'Instagram không còn ở foreground',
+    stateOk: 'chưa ở màn caption/share',
+    shareButtonOk: 'chưa thấy nút Share',
+    captionOk: 'caption chưa được xác minh',
+    mediaOk: 'chưa thấy media/preview'
+  };
+  const failed = Array.isArray(action.preSubmitGate?.failedChecks)
+    ? action.preSubmitGate.failedChecks
+    : [];
+  const detail = failed
+    .map((item) => labels[item] || item)
+    .filter(Boolean)
+    .join(', ');
+  return detail
+    ? `Chưa đủ điều kiện Share: ${detail}. Đã lưu screenshot và đóng LDPlayer`
+    : 'Chưa đủ điều kiện Share. Đã lưu screenshot và đóng LDPlayer';
+}
+
+function isRetryableQueueAction(action = {}) {
+  if (!action.retryable) return false;
+  if (isPostSubmitUnverifiedAction(action)) return false;
+  return true;
+}
+
+function isPostSubmitUnverifiedAction(action = {}) {
+  const text = `${action.phase || ''} ${action.message || ''}`
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+  return /post_submit|submit_unverified|still_on_share_screen|no_confirmation_after_share|da bam share|da bam dang|chua thay tin hieu xac nhan/.test(text);
 }
 
 function createRandom(seed) {

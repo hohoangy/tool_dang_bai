@@ -1,5 +1,6 @@
 export {
   captureScreenshot,
+  checkInstagramHealth,
   closeAccountSession,
   getAccountPublishReadiness,
   getAccountRuntimeStatus,

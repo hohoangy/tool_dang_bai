@@ -6,6 +6,7 @@ import { MobileAccount } from '../../models/mobile-account.model.js';
 import { MobileAccountLog } from '../../models/mobile-account-log.model.js';
 import {
   captureScreenshot,
+  checkInstagramHealth,
   closeAccountSession,
   getAccountPublishReadiness,
   getAccountRuntimeStatus,
@@ -36,7 +37,7 @@ import { uniqueActiveLdPlayerAccounts } from '../../services/mobile/ldplayer-acc
 
 export const mobileRoutes = Router();
 
-function classifyMobilePublishError(error, platform, context = {}) {
+export function classifyMobilePublishError(error, platform, context = {}) {
   const rawMessage = String(error?.message || 'Workflow trả lỗi chưa xác định.');
   const normalized = rawMessage
     .normalize('NFD')
@@ -47,6 +48,65 @@ function classifyMobilePublishError(error, platform, context = {}) {
   const mediaCount = Number(context.imageCount || 0) + Number(context.videoCount || 0);
 
   const match = (...phrases) => phrases.some((phrase) => normalized.includes(phrase));
+  if (!isFacebook && match(
+    'pre_submit_gate_failed',
+    'caption_not_verified',
+    'caption_clear_failed',
+    'caption_missing_before_submit',
+    'dry_run_submit_risk_on_next',
+    'dry_run_next_not_advancing',
+    'next_text_missing_stuck',
+    'next_fallback_stuck'
+  )) {
+    return {
+      code: 'INSTAGRAM_PRE_SUBMIT_BLOCKED',
+      category: 'pre_submit_gate',
+      retryable: true,
+      action: 'instagram_post_pre_submit_gate_failed',
+      userMessage: 'Instagram chưa đủ điều kiện an toàn để bấm Share.',
+      recoveryHint: 'Tool chưa bấm Share. Kiểm tra screenshot, caption/media và trạng thái composer rồi chạy lại profile này nếu cần.'
+    };
+  }
+  if (!isFacebook && match(
+    'still_on_share_screen',
+    'no_confirmation_after_share',
+    'submit_unverified',
+    'da bam share',
+    'da bam dang',
+    'chua xac nhan app nhan bai',
+    'chua thay tin hieu xac nhan',
+    'van con o man share',
+    'van o man soan bai'
+  )) {
+    return {
+      code: `${platform.toUpperCase()}_POST_SUBMIT_UNVERIFIED`,
+      category: 'post_submit_unverified',
+      retryable: false,
+      action: `${prefix}_failed_post_submit_unverified`,
+      userMessage: 'Instagram đã tới bước gửi bài nhưng chưa xác minh được kết quả.',
+      recoveryHint: 'Không tự đăng lại để tránh trùng bài. Hãy kiểm tra app/screenshot gần nhất rồi quyết định chạy lại thủ công nếu cần.'
+    };
+  }
+  if (isFacebook && match(
+    'published_post_evidence_pending',
+    'no_published_post_evidence',
+    'submit_unverified',
+    'da bam dang',
+    'da toi buoc dang',
+    'chua xac nhan facebook da nhan bai',
+    'chua tim thay dung bai moi',
+    'facebook da roi man soan bai',
+    'khong tu chay lai de tranh trung bai'
+  )) {
+    return {
+      code: 'FACEBOOK_POST_SUBMIT_UNVERIFIED',
+      category: 'post_submit_unverified',
+      retryable: false,
+      action: 'facebook_post_failed_post_submit_unverified',
+      userMessage: 'Facebook đã tới bước Đăng nhưng chưa xác minh được kết quả.',
+      recoveryHint: 'Không tự đăng lại để tránh trùng bài. Hãy kiểm tra app/screenshot gần nhất rồi quyết định chạy lại thủ công nếu cần.'
+    };
+  }
   if (match('checkpoint', 'dang nhap', 'login', 'session expired', 'confirm your account')) {
     return {
       code: `${platform.toUpperCase()}_AUTH_REQUIRED`,
@@ -55,6 +115,24 @@ function classifyMobilePublishError(error, platform, context = {}) {
       action: `${prefix}_failed_auth_required`,
       userMessage: `${platform === 'facebook' ? 'Facebook' : 'Instagram'} cần đăng nhập hoặc xác minh tài khoản trước khi đăng tiếp.`,
       recoveryHint: 'Mở app trong đúng LDPlayer, xử lý login/checkpoint thủ công rồi bấm kiểm tra lại.'
+    };
+  }
+  if (match(
+    'ldplayer dang chay nhung chua mo cong adb',
+    'ldplayer đang chạy nhưng chưa mở cổng adb',
+    'ldplayer_adb_port_closed',
+    'cong adb localhost',
+    'cổng adb localhost',
+    'actively refused it',
+    '10061'
+  )) {
+    return {
+      code: 'LDPLAYER_ADB_BRIDGE_UNAVAILABLE',
+      category: 'ldplayer_adb_preflight',
+      retryable: false,
+      action: `${prefix}_failed_ld_adb_bridge`,
+      userMessage: 'LDPlayer đã chạy nhưng ADB bridge chưa mở nên tool không thể điều khiển app.',
+      recoveryHint: 'Mở LDPlayer thủ công đến màn Home, kiểm tra ADB Debugging trong LDPlayer, rồi chạy lại khi adb devices thấy emulator/device.'
     };
   }
   if (match('adb', 'device is not ready', 'offline', 'no_uiautomator_nodes', 'system ui', 'khong phan hoi', 'khong san sang', 'not responding')) {
@@ -316,6 +394,17 @@ mobileRoutes.get('/accounts/:id/readiness', requireAuth, asyncHandler(async (req
     deep: req.query.deep !== 'false'
   });
   res.json({ readiness });
+}));
+
+mobileRoutes.post('/accounts/:id/instagram/health', requireAuth, asyncHandler(async (req, res) => {
+  const account = await findAccount(req.params.id, req.user._id);
+  if (account.platform !== 'instagram') {
+    throw new ApiError(400, 'Profile này không phải Instagram.');
+  }
+  const result = await checkInstagramHealth(account, req.user._id, {
+    appPackage: req.body?.appPackage || 'com.instagram.android'
+  });
+  res.json({ account: sanitizeAccount(account), result });
 }));
 
 mobileRoutes.post('/accounts/:id/remote/launch', requireAuth, asyncHandler(async (req, res) => {
