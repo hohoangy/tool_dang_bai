@@ -1,13 +1,61 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
-import { AlertTriangle, BarChart3, CalendarClock, CheckCircle2, ChevronLeft, ChevronRight, Clock3, Eye, FileText, Gauge, Home, Image, Instagram as InstagramIcon, Keyboard, ListChecks, Loader2, LogOut, Moon, MousePointer2, Play, RefreshCcw, Save, Send, ShieldCheck, Smartphone, Sparkles, Sun, Terminal, Timer, Trash2, Undo2, Users, Video, Wifi, XCircle, Zap } from 'lucide-vue-next';
+import { AlertTriangle, BarChart3, CalendarClock, CheckCircle2, ChevronLeft, ChevronRight, Eye, FileText, Gauge, Home, Image, Instagram as InstagramIcon, Keyboard, ListChecks, Loader2, LogOut, Moon, MousePointer2, Play, RefreshCcw, Save, Send, ShieldCheck, Smartphone, Sparkles, Sun, Terminal, Timer, Trash2, Undo2, Users, Video, Wifi, XCircle, Zap } from 'lucide-vue-next';
 import { http } from '../api/http';
 import BaseCard from '../components/BaseCard.vue';
+import ComposerScreenshotPanel from '../components/ComposerScreenshotPanel.vue';
 import FacebookActivityIcon from '../components/FacebookActivityIcon.vue';
+import PostResultSummaryPanel from '../components/PostResultSummaryPanel.vue';
+import QueueProgressPanel from '../components/QueueProgressPanel.vue';
+import RecentPostRunsPanel from '../components/RecentPostRunsPanel.vue';
+import ReadinessPanel from '../components/ReadinessPanel.vue';
+import TechnicalLogsPanel from '../components/TechnicalLogsPanel.vue';
+import {
+  composerReviewResultStoragePrefix,
+  composerReviewResultTtlMs,
+  composerTabs,
+  draftStorageKey,
+  emojiGroups,
+  exclusiveLdSessionEnabled,
+  ldSafeDelaySeconds,
+  maxInstagramAlbumPhotos,
+  maxPhotos,
+  maxVideoSizeMb,
+  photoLayouts,
+  platforms,
+  publishModes,
+  runtimeStatusIntervalMs,
+  runtimeStatusMissLimit,
+  scheduleQuickOptions
+} from '../config/mobile-lab';
 import { useAuthStore } from '../stores/auth';
 import { useUiStore } from '../stores/ui';
-import { activeLdPlayerSlots, getLdPlayerSlot, uniqueActiveLdPlayerAccounts } from '../utils/ldplayer-account';
+import {
+  buildDraftFingerprint,
+  defaultScheduleDateTime,
+  getDraftContentType,
+  getDraftMediaSummary,
+  getPlatformDraftStorageKey,
+  hashSnapshotText,
+  normalizeTextFormatArtifacts,
+  parseHashtags,
+  toDateTimeLocal
+} from '../utils/composer-draft';
+import {
+  createDefaultMobileAccounts,
+  formatAccountDisplayName,
+  formatAccountLabel,
+  formatInstanceLabel,
+  getAccountOrder,
+  getLdPlayerSlot,
+  uniqueActiveLdPlayerAccounts
+} from '../utils/ldplayer-account';
+import {
+  formatPostRun,
+  formatTechnicalAction,
+  isOperationalPostRunLog
+} from '../utils/mobile-log-format';
 
 const ui = useUiStore();
 const auth = useAuthStore();
@@ -57,75 +105,13 @@ const clearComposerConfirming = ref(false);
 const draggedPreviewPhotoId = ref('');
 const photoLayout = ref('grid');
 
-const maxPhotos = 4;
-const maxInstagramAlbumPhotos = 10;
-const maxVideoSizeMb = 100;
-const draftStorageKey = 'socialpilot-platform-composer-drafts';
-const platformDraftStoragePrefix = `${draftStorageKey}-`;
-const composerReviewResultStoragePrefix = 'socialpilot-composer-review-result';
-const composerReviewResultTtlMs = 6 * 60 * 60 * 1000;
-const runtimeStatusIntervalMs = 15_000;
-const runtimeStatusMissLimit = 3;
-const exclusiveLdSessionEnabled = true;
 let runtimeStatusTimer = null;
 let runtimeStatusRequestId = 0;
 let clearComposerConfirmTimer = null;
 let composerReviewCloseTimer = null;
 let collageCache = { key: '', item: null };
 
-const platforms = [
-  {
-    id: 'facebook',
-    label: 'Facebook',
-    iconLabel: 'f',
-    iconClass: 'bg-[#1877F2] text-white',
-    packageName: 'com.facebook.katana',
-    status: 'ready',
-    description: 'Mo composer, nhap text, gan anh va dang truc tiep bang Facebook app trong LDPlayer.'
-  },
-  {
-    id: 'instagram',
-    label: 'Instagram',
-    iconLabel: '◎',
-    iconClass: 'bg-gradient-to-br from-[#F58529] via-[#DD2A7B] to-[#8134AF] text-white',
-    packageName: 'com.instagram.android',
-    status: 'ready',
-    description: 'Dang anh don hoac album qua Instagram app trong LDPlayer.'
-  }
-];
-
-const defaultLoginSteps = {
-  usernameTap: { x: 540, y: 760 },
-  passwordTap: { x: 540, y: 900 },
-  submitTap: { x: 540, y: 1060 }
-};
-
-function createDefaultMobileAccount(platform, index = 1) {
-  const platformLabel = platform === 'instagram' ? 'Instagram' : 'Facebook';
-  const appPackage = platform === 'instagram' ? 'com.instagram.android' : 'com.facebook.katana';
-  const instanceName = index === 1 ? 'LDPlayer' : `LDPlayer-${index - 1}`;
-  return {
-    platform,
-    displayName: `${platformLabel} Account ${String(index).padStart(2, '0')}`,
-    accountHandle: '',
-    instanceName,
-    adbHost: '',
-    deviceId: `emulator-${5554 + ((index - 1) * 2)}`,
-    status: 'ready',
-    notes: `Default LDPlayer profile ${index} for direct ${platformLabel} posting tests.`,
-    metadata: {
-      appPackage,
-      username: '',
-      password: '',
-      loginSteps: defaultLoginSteps
-    }
-  };
-}
-
-const defaultMobileAccounts = {
-  facebook: activeLdPlayerSlots.map((index) => createDefaultMobileAccount('facebook', index)),
-  instagram: activeLdPlayerSlots.map((index) => createDefaultMobileAccount('instagram', index))
-};
+const defaultMobileAccounts = createDefaultMobileAccounts();
 
 const post = reactive({
   title: '',
@@ -133,27 +119,6 @@ const post = reactive({
   hashtags: '',
   media: []
 });
-
-const composerTabs = [
-  { id: 'compose', label: 'Soạn' },
-  { id: 'preview', label: 'Xem trước' },
-  { id: 'queue', label: 'Bài đã lưu' }
-];
-
-const emojiGroups = [
-  {
-    label: 'Da dung gan day',
-    items: ['🤣', '😍', '😊', '😌', '😇', '😀', '😂', '☘️']
-  },
-  {
-    label: 'Mat cuoi va hinh nguoi',
-    items: ['😀', '😃', '😁', '😄', '😆', '🥺', '😅', '😂', '🤣', '🥲', '☺️', '😊', '😇', '🙂', '🙃', '😉', '😔', '😍', '🥰', '😘', '😗', '😙', '😚', '😋']
-  },
-  {
-    label: 'Cam xuc pho bien',
-    items: ['👍', '👏', '🙏', '💪', '🔥', '✨', '❤️', '💙', '💚', '💛', '🎉', '✅', '📌', '📷', '🚀', '⭐']
-  }
-];
 
 const selectedPlatform = computed(() => platforms.find((item) => item.id === selectedPlatformId.value) || platforms[0]);
 const selectedAccount = computed(() => {
@@ -176,12 +141,25 @@ const restoredComposerReviewInfo = computed(() => {
 });
 const latestLogs = computed(() => logs.value.slice(0, 80));
 const technicalLogs = computed(() => latestLogs.value.slice(0, 20));
-const technicalLogStats = computed(() => ({
-  total: technicalLogs.value.length,
-  shown: technicalLogs.value.length,
-  warnings: technicalLogs.value.filter((log) => log.level === 'warn').length,
-  errors: technicalLogs.value.filter((log) => log.level === 'error').length
-}));
+const formattedTechnicalLogs = computed(() => technicalLogs.value.map((log) => ({
+  ...log,
+  accountLabel: formatLog(log),
+  actionLabel: formatTechnicalAction(log),
+  levelLabel: formatLogLevel(log.level)
+})));
+const technicalLogStats = computed(() => {
+  const stats = {
+    total: formattedTechnicalLogs.value.length,
+    shown: formattedTechnicalLogs.value.length,
+    warnings: 0,
+    errors: 0
+  };
+  for (const log of formattedTechnicalLogs.value) {
+    if (log.level === 'warn') stats.warnings += 1;
+    if (log.level === 'error') stats.errors += 1;
+  }
+  return stats;
+});
 const canUseRemote = computed(() => Boolean(selectedAccount.value));
 const facebookAccounts = computed(() => accounts.value
   .filter((account) => account.platform === selectedPlatformId.value)
@@ -224,11 +202,6 @@ const hasComposerContent = computed(() => Boolean(
 const previewPhotos = computed(() => post.media.filter((item) => item.type === 'photo').slice(0, platformMaxPhotos.value));
 const facebookPreviewPhotos = computed(() => previewPhotos.value);
 const canArrangePhotos = computed(() => previewPhotos.value.length > 1);
-const photoLayouts = [
-  { id: 'grid', label: 'Lưới đều', description: 'Các ảnh có kích thước cân bằng' },
-  { id: 'focus-first', label: 'Ưu tiên ảnh đầu', description: 'Ảnh đầu lớn ở bên trái' },
-  { id: 'hero-top', label: 'Ảnh đầu phía trên', description: 'Ảnh đầu trải rộng phía trên' }
-];
 const availablePhotoLayouts = computed(() => {
   if (previewPhotos.value.length === 2) {
     return [
@@ -357,13 +330,6 @@ const scheduleStatus = computed(() => {
   if (!scheduleReady.value) return 'Thời gian đăng phải ở tương lai';
   return `Sẽ đăng lúc ${formatDate(scheduleDateTime.value)}`;
 });
-const scheduleQuickOptions = [
-  { label: '+30 phút', minutes: 30 },
-  { label: '+1 giờ', minutes: 60 },
-  { label: 'Tối nay', preset: 'tonight' },
-  { label: 'Sáng mai', preset: 'tomorrow-morning' }
-];
-const ldSafeDelaySeconds = 15;
 const queueReady = computed(() => !isBulkMode.value || selectedQueueAccounts.value.length > 0);
 const captionRequired = computed(() => selectedPlatformId.value !== 'instagram');
 const contentReady = computed(() => characterCount.value <= 5000 && (!captionRequired.value || characterCount.value > 0));
@@ -523,221 +489,18 @@ const contentQualityScore = computed(() => {
   if (!duplicateDraft.value && textLength > 0) score += 15;
   return Math.min(score, 100);
 });
-const operationalPostRunActions = new Set([
-  'facebook_post_finished',
-  'facebook_post_submit_verified',
-  'facebook_post_submit_unverified',
-  'facebook_post_submit_blocked',
-  'facebook_post_state_machine_pending',
-  'facebook_post_next_not_advancing',
-  'facebook_post_composer_editor_not_opening',
-  'facebook_post_image_attach_failed',
-  'facebook_post_video_upload_reverted',
-  'facebook_native_multi_image_unsupported',
-  'facebook_post_failed_auth_required',
-  'facebook_post_failed_ld_unstable',
-  'facebook_post_failed_ld_adb_bridge',
-  'facebook_post_failed_gallery_selection',
-  'facebook_post_failed_media_attach',
-  'facebook_post_failed_ui_state',
-  'facebook_post_failed_post_submit_unverified',
-  'facebook_post_failed',
-  'instagram_post_finished',
-  'instagram_post_submit_verified',
-  'instagram_post_submit_unverified',
-  'instagram_post_caption_missing_before_submit',
-  'instagram_post_state_machine_pending',
-  'instagram_post_album_unsupported_fast_stop',
-  'instagram_post_album_native_failed',
-  'instagram_post_failed_cleanup',
-  'instagram_post_failed_auth_required',
-  'instagram_post_failed_ld_unstable',
-  'instagram_post_failed_ld_adb_bridge',
-  'instagram_post_failed_ui_state',
-  'instagram_post_pre_submit_gate_failed',
-  'instagram_post_failed_post_submit_unverified',
-  'instagram_post_failed'
-]);
-function isTechnicalPostRunNoise(log) {
-  return String(log?.action || '').endsWith('_failed_ld_unstable')
-    || log?.metadata?.category === 'ldplayer_unstable'
-    || log?.metadata?.code === 'LDPLAYER_UNSTABLE';
-}
-
-const recentPostRuns = computed(() => latestLogs.value
-  .filter((log) => operationalPostRunActions.has(String(log.action || '')))
-  .filter((log) => !isTechnicalPostRunNoise(log))
-  .filter((log, index, items) => {
+const recentPostRuns = computed(() => {
+  const eligible = latestLogs.value.filter(isOperationalPostRunLog);
+  return eligible.filter((log, index, items) => {
     const accountId = String(log.accountId || '');
     return items.findIndex((item) => String(item.accountId || '') === accountId) === index;
   })
-  .slice(0, 3));
-const postRunActionLabels = {
-  facebook_post_finished: {
-    title: 'Đã hoàn tất thao tác đăng',
-    detail: 'Tool đã đi hết workflow đăng bài.'
-  },
-  facebook_post_submit_verified: {
-    title: 'Đã xác minh Facebook nhận bài',
-    detail: 'Facebook trả tín hiệu xác nhận sau khi bấm Đăng.'
-  },
-  facebook_post_submit_unverified: {
-    title: 'Chưa xác minh được bài đăng',
-    detail: 'Đã bấm Đăng nhưng chưa thấy tín hiệu xác nhận từ Facebook.'
-  },
-  facebook_post_submit_waiting: {
-    title: 'Đang chờ Facebook phản hồi',
-    detail: 'Facebook đang xử lý sau thao tác đăng.'
-  },
-  facebook_post_media_uploading: {
-    title: 'Đang tải ảnh lên Facebook',
-    detail: 'Giữ Facebook hoạt động cho đến khi quá trình tải hoàn tất.'
-  },
-  facebook_post_submit_still_in_composer: {
-    title: 'Facebook chưa nhận thao tác đăng',
-    detail: 'Nút Đăng vẫn còn hiển thị; bài chưa được gửi.'
-  },
-  facebook_post_video_upload_reverted: {
-    title: 'Facebook từ chối tải video',
-    detail: 'Facebook đã bắt đầu tải nhưng quay lại màn soạn bài. Hãy thử lại hoặc kiểm tra video/mạng.'
-  },
-  facebook_native_multi_image_unsupported: {
-    title: 'Nhiều ảnh native không hỗ trợ',
-    detail: 'Facebook trên LDPlayer không ổn định với SEND_MULTIPLE; tool sẽ dùng 1 ảnh collage cho nhiều ảnh.'
-  },
-  facebook_post_submit_blocked: {
-    title: 'Facebook bị chặn bởi checkpoint',
-    detail: 'Facebook yêu cầu đăng nhập hoặc xác minh thêm.'
-  },
-  facebook_post_state_machine_pending: {
-    title: 'Chưa tới được màn đăng bài',
-    detail: 'Automation chưa đưa Facebook về đúng trạng thái.'
-  },
-  facebook_post_next_not_advancing: {
-    title: 'Nút Tiếp không chuyển màn',
-    detail: 'Facebook không phản hồi sau nhiều lần bấm Tiếp; tool đã dừng để tránh lặp thao tác.'
-  },
-  facebook_post_composer_editor_not_opening: {
-    title: 'Composer không mở editor',
-    detail: 'Facebook hoặc System UI không phản hồi khi mở editor nhập nội dung.'
-  },
-  facebook_post_image_attach_failed: {
-    title: 'Gắn ảnh chưa thành công',
-    detail: 'Tool chưa xác nhận được ảnh trong composer.'
-  },
-  facebook_post_failed_auth_required: {
-    title: 'Facebook cần xác minh tài khoản',
-    detail: 'Cần xử lý login/checkpoint trong LDPlayer trước khi đăng tiếp.'
-  },
-  facebook_post_failed_ld_unstable: {
-    title: 'LDPlayer/ADB chưa ổn định',
-    detail: 'Tool đã dừng để tránh đăng sai. Restart LDPlayer hoặc chờ ADB ổn định rồi chạy lại.'
-  },
-  facebook_post_failed_ld_adb_bridge: {
-    title: 'LDPlayer chưa mở ADB bridge',
-    detail: 'LDPlayer đã chạy nhưng chưa có cổng ADB để tool điều khiển. Mở LD thủ công tới Home và kiểm tra ADB Debugging.'
-  },
-  facebook_post_failed_gallery_selection: {
-    title: 'Gallery chưa xác nhận ảnh',
-    detail: 'Facebook chưa ghi nhận đủ ảnh đã chọn; tool dừng để tránh bấm lặp.'
-  },
-  facebook_post_failed_media_attach: {
-    title: 'Media chưa gắn vào composer',
-    detail: 'Facebook chưa xác nhận media xuất hiện trong bài soạn.'
-  },
-  facebook_post_failed_ui_state: {
-    title: 'Facebook UI chưa ổn định',
-    detail: 'Tool chưa nhận diện được màn hình an toàn để tiếp tục.'
-  },
-  facebook_post_failed_post_submit_unverified: {
-    title: 'Cần kiểm tra kết quả Facebook',
-    detail: 'Đã tới bước Đăng nhưng chưa xác minh được kết quả. Tool không tự đăng lại để tránh trùng bài.'
-  },
-  facebook_post_image_attached: {
-    title: 'Ảnh đã sẵn sàng',
-    detail: 'Ảnh đã xuất hiện trong Facebook composer.'
-  },
-  facebook_post_wait_for_ui: {
-    title: 'Đang chờ Facebook chuyển màn',
-    detail: 'Tool đang đợi giao diện Facebook ổn định.'
-  },
-  facebook_post_state: {
-    title: 'Đang đọc trạng thái Facebook',
-    detail: 'Tool đang nhận diện màn hình hiện tại.'
-  },
-  facebook_post_failed: {
-    title: 'Đăng thất bại',
-    detail: 'Workflow dừng vì Facebook hoặc LDPlayer trả lỗi trong quá trình đăng.'
-  },
-  instagram_post_finished: {
-    title: 'Đã hoàn tất thao tác Instagram',
-    detail: 'Tool đã đi hết workflow đăng Instagram.'
-  },
-  instagram_post_submit_verified: {
-    title: 'Đã xác minh Instagram nhận bài',
-    detail: 'Instagram đã rời màn share sau khi bấm Share.'
-  },
-  instagram_post_submit_unverified: {
-    title: 'Chưa xác minh được bài Instagram',
-    detail: 'Đã bấm Share nhưng Instagram chưa rời màn đăng hoặc chưa trả tín hiệu đã chia sẻ.'
-  },
-  instagram_post_submit_waiting: {
-    title: 'Instagram đang xử lý',
-    detail: 'Instagram đang tải/chia sẻ bài sau khi bấm Share.'
-  },
-  instagram_post_caption_missing_before_submit: {
-    title: 'Chưa nhập được caption',
-    detail: 'Instagram đã rời màn soạn trước khi xác minh emoji/hashtag, tool đã dừng để tránh đăng thiếu nội dung.'
-  },
-  instagram_post_state_machine_pending: {
-    title: 'Chưa tới được màn đăng Feed',
-    detail: 'Automation chưa đưa Instagram về đúng trạng thái đăng trang cá nhân/feed.'
-  },
-  instagram_post_album_unsupported_fast_stop: {
-    title: 'Album Instagram chưa hỗ trợ trên LD này',
-    detail: 'Android trong LDPlayer không hỗ trợ SEND_MULTIPLE cho nhiều ảnh; tool đã dừng sớm để giữ ADB ổn định.'
-  },
-  instagram_post_album_native_failed: {
-    title: 'Album Instagram chưa mở được',
-    detail: 'Luồng Home/Create Album chưa ổn định trên LDPlayer hiện tại.'
-  },
-  instagram_post_failed_cleanup: {
-    title: 'Đã dọn Instagram sau lỗi',
-    detail: 'Tool đã force-stop Instagram và kiểm tra ADB để chuẩn bị cho lượt chạy tiếp theo.'
-  },
-  instagram_post_failed_auth_required: {
-    title: 'Instagram cần xác minh tài khoản',
-    detail: 'Cần xử lý login/checkpoint trong LDPlayer trước khi đăng tiếp.'
-  },
-  instagram_post_failed_ld_unstable: {
-    title: 'LDPlayer/ADB chưa ổn định',
-    detail: 'Tool đã dừng để tránh đăng sai. Restart LDPlayer hoặc chờ ADB ổn định rồi chạy lại.'
-  },
-  instagram_post_failed_ld_adb_bridge: {
-    title: 'LDPlayer chưa mở ADB bridge',
-    detail: 'LDPlayer đã chạy nhưng chưa có cổng ADB để tool điều khiển. Mở LD thủ công tới Home và kiểm tra ADB Debugging.'
-  },
-  instagram_post_failed_ui_state: {
-    title: 'Instagram UI chưa ổn định',
-    detail: 'Tool chưa nhận diện được màn hình an toàn để tiếp tục.'
-  },
-  instagram_post_pre_submit_gate_failed: {
-    title: 'Chưa đủ điều kiện Share',
-    detail: 'Tool đã dừng trước khi bấm Share vì composer Instagram chưa đạt đủ điều kiện an toàn.'
-  },
-  instagram_post_failed_post_submit_unverified: {
-    title: 'Cần kiểm tra kết quả Instagram',
-    detail: 'Đã tới bước Share nhưng chưa xác minh được kết quả. Tool không tự đăng lại để tránh trùng bài.'
-  },
-  instagram_post_state: {
-    title: 'Đang đọc trạng thái Instagram',
-    detail: 'Tool đang nhận diện màn hình hiện tại.'
-  },
-  instagram_post_failed: {
-    title: 'Đăng Instagram thất bại',
-    detail: 'Workflow dừng vì Instagram hoặc LDPlayer trả lỗi trong quá trình đăng.'
-  }
-};
+    .slice(0, 3);
+});
+const formattedRecentPostRuns = computed(() => recentPostRuns.value.map((log) => ({
+  ...log,
+  summary: formatPostRun(log)
+})));
 const postResultSummary = computed(() => {
   if (!postResult.value) return null;
   const elapsedMs = Number(postResult.value.perf?.totalMs) || 0;
@@ -797,42 +560,22 @@ const postResultSummary = computed(() => {
     tone: 'run'
   };
 });
-const publishModes = [
-  {
-    id: 'direct',
-    title: 'Đăng ngay',
-    icon: 'zap',
-    description: 'Kiểm tra thiết bị, mở app và bấm đăng tự động cho profile đang chọn.'
-  },
-  {
-    id: 'review',
-    title: 'Mở composer để kiểm tra',
-    icon: 'shield',
-    description: 'Chế độ an toàn cho LDPlayer: nhập nội dung/media, chụp màn hình kiểm tra rồi tự tắt LD.'
-  },
-  {
-    id: 'bulk',
-    title: 'Đăng hàng loạt',
-    icon: 'users',
-    description: 'Đăng tuần tự qua nhiều LDPlayer profile, có delay giữa mỗi lượt.'
-  },
-  {
-    id: 'schedule',
-    title: 'Lên lịch',
-    icon: 'timer',
-    description: 'Lưu thời gian đăng, nội dung và profile để theo dõi theo lịch.'
-  }
-];
 const primaryPublishModes = computed(() => publishModes.filter((mode) => mode.id !== 'bulk'));
 const queueStats = computed(() => {
-  const total = queueItems.value.length;
-  return {
-    total,
-    done: queueItems.value.filter((item) => item.status === 'done').length,
-    review: queueItems.value.filter((item) => item.status === 'review').length,
-    failed: queueItems.value.filter((item) => item.status === 'failed').length,
-    running: queueItems.value.filter((item) => item.status === 'running').length
+  const stats = {
+    total: queueItems.value.length,
+    done: 0,
+    review: 0,
+    failed: 0,
+    running: 0
   };
+  for (const item of queueItems.value) {
+    if (item.status === 'done') stats.done += 1;
+    if (item.status === 'review') stats.review += 1;
+    if (item.status === 'failed') stats.failed += 1;
+    if (item.status === 'running') stats.running += 1;
+  }
+  return stats;
 });
 const primaryActionLabel = computed(() => {
   if (queueRunning.value) return isQueueReviewMode.value ? 'Đang kiểm tra hàng loạt' : 'Đang đăng hàng loạt';
@@ -1044,40 +787,6 @@ function findPreferredAccount(items) {
     || items.find((account) => account.instanceName === 'LDPlayer')
     || items.find((account) => account.platform === selectedPlatformId.value)
     || items[0];
-}
-
-function formatInstanceLabel(account) {
-  const target = account?.deviceId || '';
-  const emulatorIndex = Number(target.match(/^emulator-(\d+)$/)?.[1]);
-  if (Number.isInteger(emulatorIndex) && emulatorIndex >= 5554) {
-    return `LDPlayer ${String(((emulatorIndex - 5554) / 2) + 1).padStart(2, '0')}`;
-  }
-  const instanceNumber = Number(account?.instanceName?.match(/-(\d+)$/)?.[1]);
-  if (Number.isInteger(instanceNumber)) return `LDPlayer ${String(instanceNumber + 1).padStart(2, '0')}`;
-  return account?.instanceName === 'LDPlayer' ? 'LDPlayer 01' : (account?.instanceName || 'LDPlayer');
-}
-
-function getAccountOrder(account) {
-  return getLdPlayerSlot(account);
-}
-
-function formatAccountDisplayName(account) {
-  const displayName = String(account?.displayName || '').trim();
-  if (account?.platform === 'instagram') {
-    return displayName || `Instagram Account ${String(getAccountOrder(account)).padStart(2, '0')}`;
-  }
-  if (account?.platform !== 'facebook') return displayName || 'Profile chưa đặt tên';
-
-  const accountNumber = displayName.match(/facebook\s*(?:account)?\s*0*(\d+)/i)?.[1]
-    || String(getAccountOrder(account));
-  if (/^facebook\s*(?:account)?\s*0*\d+$/i.test(displayName) && /^\d+$/.test(accountNumber)) {
-    return `Facebook Account ${String(Number(accountNumber)).padStart(2, '0')}`;
-  }
-  return displayName || `Facebook Account ${String(getAccountOrder(account)).padStart(2, '0')}`;
-}
-
-function formatAccountLabel(account) {
-  return `${formatAccountDisplayName(account)} · ${formatInstanceLabel(account)}`;
 }
 
 function isAuthError(error) {
@@ -2067,7 +1776,7 @@ function toggleQueueAccount(accountId) {
 
 function loadDrafts() {
   try {
-    const platformKey = getPlatformDraftStorageKey();
+    const platformKey = getPlatformDraftStorageKey(selectedPlatformId.value);
     const platformRaw = window.localStorage.getItem(platformKey);
     const legacyRaw = window.localStorage.getItem(draftStorageKey);
     const platformDrafts = platformRaw ? JSON.parse(platformRaw) : null;
@@ -2093,40 +1802,9 @@ function loadDrafts() {
 
 function persistDrafts() {
   window.localStorage.setItem(
-    getPlatformDraftStorageKey(),
+    getPlatformDraftStorageKey(selectedPlatformId.value),
     JSON.stringify(drafts.value.slice(0, 20))
   );
-}
-
-function getPlatformDraftStorageKey(platformId = selectedPlatformId.value) {
-  return `${platformDraftStoragePrefix}${platformId}`;
-}
-
-function getDraftContentType(draft = {}) {
-  if (draft.facebookPostType === 'video') return 'video';
-  return Array.isArray(draft.media) && draft.media.some((item) => item?.type === 'video')
-    ? 'video'
-    : 'imageText';
-}
-
-function getDraftMediaSummary(draft = {}) {
-  const media = Array.isArray(draft.media) ? draft.media : [];
-  const videoCount = media.filter((item) => item?.type === 'video').length;
-  const photoCount = media.filter((item) => item?.type !== 'video').length;
-  if (videoCount) return `${videoCount} video`;
-  if (photoCount) return `${photoCount} ảnh`;
-  return 'Chỉ nội dung';
-}
-
-function defaultScheduleDateTime() {
-  const date = new Date(Date.now() + 60 * 60 * 1000);
-  date.setMinutes(Math.ceil(date.getMinutes() / 5) * 5, 0, 0);
-  return toDateTimeLocal(date);
-}
-
-function toDateTimeLocal(date) {
-  const timezoneOffset = date.getTimezoneOffset() * 60000;
-  return new Date(date.getTime() - timezoneOffset).toISOString().slice(0, 16);
 }
 
 function applySchedulePreset(option) {
@@ -2145,17 +1823,6 @@ function applySchedulePreset(option) {
 
   target.setMinutes(Math.ceil(target.getMinutes() / 5) * 5, 0, 0);
   scheduleDateTime.value = toDateTimeLocal(target);
-}
-
-function parseHashtags(value = '') {
-  const raw = String(value || '').trim();
-  if (!raw) return [];
-  const normalized = raw
-    .split(/[\s,;]+/)
-    .map((tag) => tag.replace(/^#+/, '').replace(/[^\p{L}\p{N}_]/gu, ''))
-    .filter(Boolean)
-    .map((tag) => `#${tag}`);
-  return Array.from(new Map(normalized.map((tag) => [tag.toLocaleLowerCase(), tag])).values());
 }
 
 function saveDraft(status = 'draft', options = {}) {
@@ -2279,19 +1946,6 @@ function deleteDraft(draftId) {
   if (editingDraftId.value === draftId) editingDraftId.value = '';
   persistDrafts();
   ui.notify('Đã xóa nháp.');
-}
-
-function buildDraftFingerprint(draft = {}) {
-  const media = (Array.isArray(draft.media) ? draft.media : [])
-    .map((item) => `${item.type || 'photo'}:${item.uploadedUrl || item.url || ''}`)
-    .filter((item) => !item.endsWith(':'))
-    .sort();
-  return JSON.stringify({
-    platform: draft.platform || 'facebook',
-    facebookPostType: draft.facebookPostType || 'imageText',
-    text: normalizeTextFormatArtifacts(draft.text || '').trim(),
-    media
-  });
 }
 
 function duplicateComposer() {
@@ -2526,12 +2180,6 @@ function cleanCaption() {
   ui.notify('Đã dọn khoảng trắng và chuẩn hóa caption.');
 }
 
-function normalizeTextFormatArtifacts(value = '') {
-  return (value == null ? '' : String(value))
-    .replace(/\u0332{2,}/g, '\u0332')
-    .replace(/([^\s])\u0332(?=\u0332)/g, '$1\u0332');
-}
-
 function resetComposer() {
   post.title = '';
   post.text = '';
@@ -2607,59 +2255,9 @@ function isPostSubmitUnverifiedQueueError(error) {
   return /post_submit|submit_unverified|still_on_share_screen|no_confirmation_after_share|da bam share|da bam dang|chua xac minh duoc ket qua|chua thay tin hieu xac nhan|van con o man share|van o man soan bai/.test(postSubmitText);
 }
 
-function formatPostRun(log) {
-  const mapped = postRunActionLabels[log.action];
-  if (log.action === 'facebook_post_finished' && log.metadata?.autoSubmit === false) {
-    return {
-      title: 'Đã mở composer kiểm tra',
-      detail: 'Tool đã mở composer, không bấm đăng. Ảnh kiểm tra được lưu ở khung trạng thái phía trên nếu phiên hiện tại có snapshot.',
-      tone: 'ok',
-      badge: 'Ổn'
-    };
-  }
-  const detail = log.metadata?.recoveryHint || log.message || mapped?.detail || 'Tool vừa ghi nhận một bước trong workflow đăng bài.';
-  if (log.action === 'facebook_post_finished' && log.level !== 'info') {
-    return {
-      title: 'Bài đăng chưa được xác minh',
-      detail,
-      tone: 'warn',
-      badge: 'Cần kiểm tra'
-    };
-  }
-  if (log.action === 'instagram_post_finished' && log.level !== 'info') {
-    return {
-      title: 'Bài Instagram chưa được xác minh',
-      detail,
-      tone: 'warn',
-      badge: 'Cần kiểm tra'
-    };
-  }
-  if (log.metadata?.category === 'post_submit_unverified' || String(log.action || '').endsWith('_failed_post_submit_unverified')) {
-    return {
-      title: mapped?.title || 'Cần kiểm tra kết quả đăng',
-      detail,
-      tone: 'warn',
-      badge: 'Cần kiểm tra'
-    };
-  }
-  return {
-    title: mapped?.title || 'Cập nhật trạng thái đăng',
-    detail,
-    tone: log.level === 'error' ? 'error' : log.level === 'warn' ? 'warn' : 'ok',
-    badge: log.level === 'error' ? 'Lỗi' : log.level === 'warn' ? 'Cần kiểm tra' : 'Ổn'
-  };
-}
-
 function formatLog(log) {
   const target = accounts.value.find((account) => account._id === log.accountId);
   return target?.displayName || log.accountId;
-}
-
-function formatTechnicalAction(log) {
-  return postRunActionLabels[log.action]?.title
-    || String(log.action || 'Cập nhật kỹ thuật')
-      .replace(/^(facebook|instagram)_/, '')
-      .replaceAll('_', ' ');
 }
 
 function formatLogLevel(level) {
@@ -2685,15 +2283,6 @@ function getComposerReviewSnapshotContext(account = selectedAccount.value) {
     textPreview: text.slice(0, 120),
     characterCount: text.length
   };
-}
-
-function hashSnapshotText(value = '') {
-  let hash = 2166136261;
-  for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-  return (hash >>> 0).toString(16);
 }
 
 function persistComposerReviewResult(account, result) {
@@ -4113,267 +3702,51 @@ watch(selectedPlatformId, async () => {
         </div>
 
         <div class="space-y-3">
-          <div
-            :class="[
-              'overflow-hidden rounded-2xl border shadow-sm',
-              readinessTone === 'ok' ? 'border-emerald-200 bg-emerald-50/70 dark:border-emerald-900/60 dark:bg-emerald-950/10' : readinessTone === 'warn' ? 'border-amber-200 bg-amber-50/70 dark:border-amber-900/60 dark:bg-amber-950/10' : readinessTone === 'run' ? 'border-sky-200 bg-sky-50/70 dark:border-sky-900/60 dark:bg-sky-950/10' : 'border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950/20'
-            ]"
-          >
-            <div class="border-b border-black/5 p-4 dark:border-white/10">
-              <div class="flex items-center justify-between gap-3">
-                <div>
-                  <p class="text-xs font-extrabold uppercase tracking-wide text-zinc-500">Publish readiness</p>
-                  <h3 class="mt-1 text-xl font-black">{{ readinessLabel }}</h3>
-                </div>
-                <span
-                  :class="[
-                    'shrink-0 rounded-full px-3 py-1 text-xs font-extrabold uppercase',
-                    readinessTone === 'ok' ? 'bg-emerald-100 text-emerald-700' : readinessTone === 'warn' ? 'bg-amber-100 text-amber-700' : readinessTone === 'run' ? 'bg-sky-100 text-sky-700' : 'bg-zinc-100 text-zinc-700'
-                  ]"
-                >
-                  {{ readinessScore }}%
-                </span>
-              </div>
-              <p class="mt-2 text-sm leading-5 text-zinc-500">{{ readinessSummary }}</p>
-              <div class="mt-4 h-2 overflow-hidden rounded-full bg-black/10 dark:bg-white/10">
-                <div
-                  :class="[
-                    'h-full rounded-full transition-all',
-                    blockedPreflightItems.length ? 'bg-amber-400' : 'bg-emerald-500'
-                  ]"
-                  :style="{ width: `${readinessScore}%` }"
-                ></div>
-              </div>
-            </div>
+          <ReadinessPanel
+            :actions="professionalActions"
+            :label="readinessLabel"
+            :preflight-items="preflightItems"
+            :score="readinessScore"
+            :summary="readinessSummary"
+            :tone="readinessTone"
+          />
 
-            <div class="grid grid-cols-2 gap-px bg-zinc-200 dark:bg-zinc-800">
-              <div
-                v-for="item in preflightItems"
-                :key="item.label"
-                class="bg-white p-3 text-sm dark:bg-zinc-950"
-              >
-                <div class="mb-2 flex items-center justify-between gap-2">
-                  <p class="truncate text-xs font-extrabold uppercase tracking-wide text-zinc-500">{{ item.label }}</p>
-                  <CheckCircle2 v-if="item.ok" class="h-4 w-4 shrink-0 text-emerald-500" />
-                  <AlertTriangle v-else class="h-4 w-4 shrink-0 text-amber-500" />
-                </div>
-                <p class="line-clamp-2 text-xs leading-5 text-zinc-500">{{ item.detail }}</p>
-              </div>
-            </div>
-          </div>
+          <QueueProgressPanel
+            :items="queueItems"
+            :progress-percent="queueProgressPercent"
+            :stats="queueStats"
+          />
 
-          <div v-if="professionalActions.length" class="rounded-2xl border border-zinc-200 p-4 shadow-sm dark:border-zinc-800">
-            <div class="mb-3 flex items-center justify-between gap-3">
-              <div>
-                <p class="text-xs font-extrabold uppercase tracking-wide text-zinc-500">Pre-publish tasks</p>
-                <h3 class="mt-1 font-extrabold">Việc cần làm</h3>
-              </div>
-              <span class="rounded-full bg-zinc-100 px-3 py-1 text-xs font-extrabold text-zinc-600 dark:bg-zinc-900 dark:text-zinc-300">
-                {{ professionalActions.length }} mục
-              </span>
-            </div>
-            <div class="space-y-2">
-              <div
-                v-for="action in professionalActions"
-                :key="action.title"
-                class="flex items-start gap-3 rounded-xl border border-zinc-200 bg-zinc-50 p-3 text-sm dark:border-zinc-800 dark:bg-zinc-900"
-              >
-                <span
-                  :class="[
-                    'mt-0.5 grid h-5 w-5 shrink-0 place-items-center rounded-full text-[10px] font-black',
-                    action.tone === 'required' ? 'bg-amber-100 text-amber-700' : 'bg-zinc-200 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300'
-                  ]"
-                >
-                  {{ action.tone === 'required' ? '!' : 'i' }}
-                </span>
-                <div class="min-w-0">
-                  <p class="font-extrabold">{{ action.title }}</p>
-                  <p class="mt-1 text-xs leading-5 text-zinc-500">{{ action.detail }}</p>
-                </div>
-              </div>
-            </div>
-          </div>
+          <PostResultSummaryPanel :summary="postResultSummary" />
 
-          <div v-if="queueItems.length" class="rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
-            <div class="mb-3 flex items-center justify-between gap-3">
-              <div>
-                <p class="text-xs font-extrabold uppercase tracking-wide text-zinc-500">Tiến trình đăng</p>
-                <h3 class="mt-1 font-extrabold">{{ queueStats.done }} xong · {{ queueStats.review }} cần kiểm tra · {{ queueStats.failed }} lỗi</h3>
-              </div>
-              <span class="rounded-full bg-zinc-100 px-3 py-1 text-xs font-extrabold text-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
-                {{ queueStats.total }} lượt
-              </span>
-            </div>
-            <div class="mb-3 h-2 overflow-hidden rounded-full bg-zinc-100 dark:bg-zinc-900">
-              <div class="h-full rounded-full bg-sky-500 transition-all" :style="{ width: `${queueProgressPercent}%` }"></div>
-            </div>
-            <div class="app-scrollbar max-h-64 space-y-2 overflow-auto pr-1">
-              <article v-for="item in queueItems" :key="item.id" class="rounded-lg border border-zinc-200 p-3 text-sm dark:border-zinc-800">
-                <div class="flex items-center justify-between gap-2">
-                  <div class="min-w-0">
-                    <p class="truncate font-extrabold">{{ item.name }}</p>
-                    <p class="truncate text-xs text-zinc-500">{{ item.instanceName }}</p>
-                  </div>
-                  <span
-                    :class="[
-                      'rounded-full px-2 py-0.5 text-[11px] font-extrabold uppercase',
-                      item.status === 'done' ? 'bg-emerald-100 text-emerald-700' : item.status === 'failed' ? 'bg-red-100 text-red-700' : item.status === 'review' ? 'bg-amber-100 text-amber-700' : item.status === 'running' ? 'bg-sky-100 text-sky-700' : 'bg-zinc-100 text-zinc-700'
-                    ]"
-                  >
-                    {{ item.status === 'done' ? 'xong' : item.status === 'failed' ? 'lỗi' : item.status === 'review' ? 'kiểm tra' : item.status === 'running' ? 'đang chạy' : item.status === 'waiting' ? 'đợi' : 'chờ' }}
-                  </span>
-                </div>
-                <p class="mt-2 text-zinc-500">{{ item.message }}</p>
-                <div
-                  v-if="item.result?.screenshot?.imageBase64"
-                  class="mt-3 overflow-hidden rounded-lg border border-zinc-200 bg-zinc-950 dark:border-zinc-800"
-                >
-                  <div class="flex items-center justify-between gap-2 border-b border-zinc-800 px-2 py-1.5 text-[10px] font-extrabold uppercase text-zinc-400">
-                    <span>Ảnh kiểm tra</span>
-                    <span>{{ item.result.screenshotVerified ? 'Đã xác minh' : 'Chưa xác minh' }}</span>
-                  </div>
-                  <img
-                    :src="`data:image/png;base64,${item.result.screenshot.imageBase64}`"
-                    alt="Ảnh kiểm tra hàng loạt"
-                    class="max-h-56 w-full object-contain"
-                  />
-                </div>
-              </article>
-            </div>
-          </div>
+          <ComposerScreenshotPanel
+            :format-date="formatDate"
+            :restored-info="restoredComposerReviewInfo"
+            :screenshot-src="composerScreenshotSrc"
+            :submit-verified-without-screenshot="Boolean(postResult?.submitVerified && postResult?.screenshotVerified === false)"
+            :verified="Boolean(postResult?.screenshotVerified)"
+          />
 
-          <div v-if="postResultSummary" class="rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
-            <div class="flex items-start gap-3">
-              <CheckCircle2 v-if="postResultSummary.tone === 'ok'" class="mt-0.5 h-5 w-5 shrink-0 text-emerald-500" />
-              <Clock3 v-else-if="postResultSummary.tone === 'run'" class="mt-0.5 h-5 w-5 shrink-0 text-sky-500" />
-              <AlertTriangle v-else class="mt-0.5 h-5 w-5 shrink-0 text-amber-500" />
-              <div>
-                <p class="font-extrabold">{{ postResultSummary.title }}</p>
-                <p class="mt-1 text-sm leading-6 text-zinc-500">{{ postResultSummary.detail }}</p>
-              </div>
-            </div>
-          </div>
-
-          <div v-if="composerScreenshotSrc && postResult?.screenshotVerified" class="overflow-hidden rounded-lg border border-zinc-200 bg-zinc-950 dark:border-zinc-800">
-            <div class="flex items-center justify-between gap-3 border-b border-zinc-800 px-3 py-2">
-              <span class="text-xs font-extrabold uppercase tracking-wide text-zinc-400">Bài đăng đã đối chiếu</span>
-              <span class="rounded-full bg-emerald-500/15 px-2 py-1 text-[10px] font-extrabold uppercase text-emerald-400">Đúng nội dung</span>
-            </div>
-            <div class="grid aspect-[9/16] w-full place-items-center text-sm text-zinc-400">
-              <img :src="composerScreenshotSrc" alt="Ảnh bài đăng đã được đối chiếu nội dung" class="h-full w-full object-contain" />
-            </div>
-          </div>
-
-          <div v-else-if="composerScreenshotSrc" class="overflow-hidden rounded-lg border border-zinc-200 bg-zinc-950 dark:border-zinc-800">
-            <div class="flex items-center justify-between gap-3 border-b border-zinc-800 px-3 py-2">
-              <span class="text-xs font-extrabold uppercase tracking-wide text-zinc-400">Ảnh trạng thái Facebook</span>
-              <span v-if="restoredComposerReviewInfo" class="rounded-full bg-sky-500/15 px-2 py-1 text-[10px] font-extrabold uppercase text-sky-300">
-                Ảnh phiên trước
-              </span>
-            </div>
-            <div v-if="restoredComposerReviewInfo" class="border-b border-zinc-800 px-3 py-2 text-[11px] leading-5 text-zinc-400">
-              Khôi phục từ {{ formatDate(restoredComposerReviewInfo.savedAt) }} · {{ restoredComposerReviewInfo.accountLabel }}
-            </div>
-            <div class="grid aspect-[9/16] w-full place-items-center text-sm text-zinc-400">
-              <img :src="composerScreenshotSrc" alt="Ảnh trạng thái Facebook" class="h-full w-full object-contain" />
-            </div>
-          </div>
-
-          <div
-            v-else-if="postResult?.submitVerified && postResult?.screenshotVerified === false"
-            class="rounded-xl border border-amber-300/60 bg-amber-50 p-4 text-sm text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200"
-          >
-            Bài đã đăng thành công nhưng Facebook chưa đồng bộ bài mới lên feed để chụp ảnh xác minh. Hệ thống không hiển thị ảnh bài cũ để tránh gây nhầm lẫn.
-          </div>
-
-          <div class="rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
-            <div class="mb-3 flex items-center gap-2">
-              <Terminal class="h-4 w-4 text-zinc-500" />
-              <h3 class="font-extrabold">Kết quả đăng gần nhất</h3>
-            </div>
-            <div class="space-y-2">
-              <article v-for="log in recentPostRuns" :key="log._id" class="rounded-lg bg-zinc-100 p-3 text-sm dark:bg-zinc-900">
-                <div class="flex flex-wrap items-start justify-between gap-2">
-                  <p class="min-w-0 flex-1 font-bold leading-5">{{ formatPostRun(log).title }}</p>
-                  <span :class="['shrink-0 whitespace-nowrap rounded-full px-2.5 py-1 text-[10px] font-extrabold uppercase leading-none', formatPostRun(log).tone === 'error' ? 'bg-red-100 text-red-700' : formatPostRun(log).tone === 'warn' ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700']">
-                    {{ formatPostRun(log).badge }}
-                  </span>
-                </div>
-                <p class="mt-1 line-clamp-2 text-zinc-500">{{ formatPostRun(log).detail }}</p>
-                <p class="mt-2 text-xs text-zinc-500">{{ formatDate(log.createdAt) }}</p>
-              </article>
-              <p v-if="!recentPostRuns.length" class="rounded-lg border border-dashed border-zinc-300 p-4 text-sm text-zinc-500 dark:border-zinc-700">
-                Chưa có kết quả đăng {{ selectedPlatform.label }}.
-              </p>
-            </div>
-          </div>
+          <RecentPostRunsPanel
+            :format-date="formatDate"
+            :logs="formattedRecentPostRuns"
+            :platform-label="selectedPlatform.label"
+          />
         </div>
       </div>
     </BaseCard>
 
     <BaseCard>
-      <div class="flex flex-wrap items-center justify-between gap-3">
-        <div class="flex min-w-0 items-start gap-3">
-          <div class="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-zinc-100 text-zinc-600 dark:bg-zinc-900 dark:text-zinc-300">
-            <Terminal class="h-5 w-5" />
-          </div>
-          <div class="min-w-0">
-            <div class="flex flex-wrap items-center gap-2">
-              <h3 class="text-lg font-extrabold">Nhật ký kỹ thuật</h3>
-              <span class="rounded-full bg-zinc-100 px-2.5 py-1 text-[11px] font-extrabold uppercase text-zinc-600 dark:bg-zinc-900 dark:text-zinc-300">
-                Debug
-              </span>
-            </div>
-            <p class="mt-1 text-sm text-zinc-500">
-              Ẩn mặc định để không làm rối màn hình vận hành. Mở khi cần kiểm tra lỗi automation, ADB hoặc {{ selectedPlatform.label }} UI.
-            </p>
-          </div>
-        </div>
-
-        <div class="flex flex-wrap items-center gap-2">
-          <span class="rounded-full bg-zinc-100 px-3 py-1 text-xs font-bold text-zinc-600 dark:bg-zinc-900 dark:text-zinc-300">
-            {{ technicalLogStats.total }} log
-          </span>
-          <span v-if="technicalLogStats.warnings" class="rounded-full bg-amber-100 px-3 py-1 text-xs font-bold text-amber-700">
-            {{ technicalLogStats.warnings }} cảnh báo
-          </span>
-          <span v-if="technicalLogStats.errors" class="rounded-full bg-red-100 px-3 py-1 text-xs font-bold text-red-700">
-            {{ technicalLogStats.errors }} lỗi
-          </span>
-          <button class="btn-soft h-9 px-3 text-sm" type="button" @click="technicalLogsOpen = !technicalLogsOpen">
-            <Eye v-if="!technicalLogsOpen" class="h-4 w-4" />
-            <XCircle v-else class="h-4 w-4" />
-            {{ technicalLogsOpen ? 'Ẩn nhật ký' : 'Mở nhật ký' }}
-          </button>
-        </div>
-      </div>
-
-      <div v-if="technicalLogsOpen" class="mt-4 border-t border-zinc-200 pt-4 dark:border-zinc-800">
-        <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
-          <p class="text-sm font-bold text-zinc-500">
-            Hiển thị {{ technicalLogStats.shown }} log mới nhất trong {{ technicalLogStats.total }} log.
-          </p>
-          <button class="btn-soft h-8 px-3 text-xs" :disabled="loading" type="button" @click="load">
-            <RefreshCcw class="h-3.5 w-3.5" />
-            Làm mới log
-          </button>
-        </div>
-        <div class="app-scrollbar max-h-80 space-y-2 overflow-auto pr-1">
-          <article v-for="log in technicalLogs" :key="log._id" class="rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
-            <div class="flex flex-wrap items-center justify-between gap-2">
-              <p class="truncate font-bold">{{ formatLog(log) }} · {{ formatTechnicalAction(log) }}</p>
-              <span :class="['rounded-full px-2 py-1 text-xs font-bold uppercase', log.level === 'error' ? 'bg-red-100 text-red-700' : log.level === 'warn' ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700']">
-                {{ formatLogLevel(log.level) }}
-              </span>
-            </div>
-            <p class="mt-1 text-sm text-zinc-600 dark:text-zinc-300">{{ log.message }}</p>
-            <p class="mt-2 text-xs text-zinc-500">{{ formatDate(log.createdAt) }}</p>
-          </article>
-          <p v-if="!technicalLogs.length" class="rounded-lg border border-dashed border-zinc-300 p-5 text-sm text-zinc-500 dark:border-zinc-700">
-            Chưa có log kỹ thuật.
-          </p>
-        </div>
-      </div>
+      <TechnicalLogsPanel
+        :format-date="formatDate"
+        :loading="loading"
+        :logs="formattedTechnicalLogs"
+        :open="technicalLogsOpen"
+        :platform-label="selectedPlatform.label"
+        :stats="technicalLogStats"
+        @refresh="load"
+        @toggle="technicalLogsOpen = !technicalLogsOpen"
+      />
     </BaseCard>
     </div>
   </div>
