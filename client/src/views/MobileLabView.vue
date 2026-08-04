@@ -15,7 +15,6 @@ import {
   composerReviewResultStoragePrefix,
   composerReviewResultTtlMs,
   composerTabs,
-  draftStorageKey,
   emojiGroups,
   exclusiveLdSessionEnabled,
   ldSafeDelaySeconds,
@@ -31,12 +30,11 @@ import {
 } from '../config/mobile-lab';
 import { useAuthStore } from '../stores/auth';
 import { useUiStore } from '../stores/ui';
+import { useComposerDrafts } from '../composables/useComposerDrafts';
+import { useRuntimeStatusSummary } from '../composables/useRuntimeStatusSummary';
+import { useScheduleState } from '../composables/useScheduleState';
 import {
-  buildDraftFingerprint,
-  defaultScheduleDateTime,
-  getDraftContentType,
   getDraftMediaSummary,
-  getPlatformDraftStorageKey,
   hashSnapshotText,
   normalizeTextFormatArtifacts,
   parseHashtags,
@@ -98,9 +96,6 @@ const queueDelaySeconds = ref(15);
 const queuePhase = ref('idle');
 const queueCurrentAccountId = ref('');
 const queueRunMode = ref('review');
-const scheduleDateTime = ref(defaultScheduleDateTime());
-const drafts = ref([]);
-const editingDraftId = ref('');
 const clearComposerConfirming = ref(false);
 const draggedPreviewPhotoId = ref('');
 const photoLayout = ref('grid');
@@ -246,90 +241,40 @@ const isScheduleMode = computed(() => publishMode.value === 'schedule');
 const isQueueReviewMode = computed(() => isBulkMode.value && queueRunMode.value === 'review');
 // App sẽ được mở tự động khi bấm Đăng. Nút mở app chỉ còn là công cụ phụ
 // để xử lý login/checkpoint hoặc debug thủ công.
-const runtimeConfirmsFacebookApp = computed(() => Boolean(
-  selectedRuntimeStatus.value?.deviceReady
-  && selectedRuntimeStatus.value?.appReady
-));
-const facebookRuntimeWaiting = computed(() => Boolean(
-  selectedAccount.value?._id
-  && facebookSessionAccountId.value === selectedAccount.value._id
-  && runtimeStatusMissCount.value > 0
-  && !runtimeConfirmsFacebookApp.value
-));
-const facebookAppReady = computed(() => Boolean(
-  selectedAccount.value?._id
-  && (
-    runtimeConfirmsFacebookApp.value
-    || (
-      facebookSessionAccountId.value === selectedAccount.value._id
-      && !facebookRuntimeWaiting.value
-    )
-  )
-));
-const facebookAppInForeground = computed(() => Boolean(
-  selectedRuntimeStatus.value?.deviceReady
-  && selectedRuntimeStatus.value?.appInForeground
-));
-const facebookAppRunningInBackground = computed(() => Boolean(
-  selectedRuntimeStatus.value?.deviceReady
-  && selectedRuntimeStatus.value?.appProcessAlive
-  && !selectedRuntimeStatus.value?.appInForeground
-));
-const selectedDeviceReady = computed(() => Boolean(selectedRuntimeStatus.value?.deviceReady));
-const runtimeStatusDetail = computed(() => {
-  if (selectedRuntimeStatus.value?.readinessSummary && !selectedRuntimeStatus.value?.appReady) return selectedRuntimeStatus.value.readinessSummary;
-  if (facebookRuntimeWaiting.value) return `Đang chờ ${formatInstanceLabel(selectedAccount.value)} kết nối lại`;
-  if (facebookAppInForeground.value) return `${selectedPlatform.value.label} đang mở trên màn hình ${formatInstanceLabel(selectedAccount.value)}`;
-  if (facebookAppRunningInBackground.value) return `${selectedPlatform.value.label} đang chạy nền trong ${formatInstanceLabel(selectedAccount.value)}`;
-  if (facebookAppReady.value) return `${selectedPlatform.value.label} đã được nhận diện trong ${formatInstanceLabel(selectedAccount.value)}`;
-  if (!selectedDeviceReady.value) return `${formatInstanceLabel(selectedAccount.value)} chưa chạy hoặc ADB chưa kết nối`;
-  const foregroundPackage = selectedRuntimeStatus.value?.foregroundPackage;
-  if (foregroundPackage && foregroundPackage !== facebookAppPackage.value) {
-    return `${formatInstanceLabel(selectedAccount.value)} đang mở ứng dụng khác`;
-  }
-  return `${selectedPlatform.value.label} chưa ở màn hình hoạt động`;
+const {
+  runtimeConfirmsFacebookApp,
+  facebookRuntimeWaiting,
+  facebookAppReady,
+  facebookAppInForeground,
+  facebookAppRunningInBackground,
+  selectedDeviceReady,
+  runtimeStatusDetail,
+  facebookOpenButtonLabel,
+  facebookActivityLabel,
+  showFacebookActivityOverlay,
+  facebookSessionStatusLabel
+} = useRuntimeStatusSummary({
+  selectedRuntimeStatus,
+  selectedAccount,
+  selectedPlatform,
+  facebookSessionAccountId,
+  runtimeStatusMissCount,
+  facebookOpening,
+  queueRunning,
+  posting,
+  isReviewMode,
+  facebookAppPackage,
+  formatInstanceLabel
 });
-const facebookOpenButtonLabel = computed(() => {
-  if (facebookOpening.value) return `Đang mở ${selectedPlatform.value.label}`;
-  if (facebookAppReady.value) return `Đã mở ${selectedPlatform.value.label}`;
-  return `Mở ${selectedPlatform.value.label}`;
-});
-const facebookActivityLabel = computed(() => {
-  if (facebookOpening.value) return `Đang mở ${selectedPlatform.value.label}`;
-  if (queueRunning.value) return 'Đang đăng bài lên nhiều tài khoản';
-  if (posting.value && isReviewMode.value) return `Đang mở ${selectedPlatform.value.label} để kiểm tra`;
-  if (posting.value) return `Đang đăng bài lên ${selectedPlatform.value.label}`;
-  return '';
-});
-const showFacebookActivityOverlay = computed(() => facebookOpening.value || posting.value || queueRunning.value);
-const facebookSessionStatusLabel = computed(() => {
-  if (facebookRuntimeWaiting.value) return `Đang chờ ${formatInstanceLabel(selectedAccount.value)}`;
-  if (facebookAppInForeground.value) return `Đang mở ${selectedPlatform.value.label}`;
-  if (facebookAppRunningInBackground.value) return `${selectedPlatform.value.label} chạy nền`;
-  return facebookAppReady.value ? `Đã nhận diện ${selectedPlatform.value.label}` : `Chưa mở ${selectedPlatform.value.label}`;
-});
-const minScheduleDateTime = computed(() => toDateTimeLocal(new Date(Date.now() + 60 * 1000)));
-const minScheduleDate = computed(() => minScheduleDateTime.value.slice(0, 10));
-const scheduleDate = computed({
-  get: () => scheduleDateTime.value?.slice(0, 10) || minScheduleDate.value,
-  set: (value) => {
-    scheduleDateTime.value = value ? `${value}T${scheduleTime.value || '09:00'}` : '';
-  }
-});
-const scheduleTime = computed({
-  get: () => scheduleDateTime.value?.slice(11, 16) || '09:00',
-  set: (value) => {
-    scheduleDateTime.value = value ? `${scheduleDate.value || minScheduleDate.value}T${value}` : '';
-  }
-});
-const scheduleTimestamp = computed(() => scheduleDateTime.value ? new Date(scheduleDateTime.value).getTime() : 0);
-const scheduleReady = computed(() => !isScheduleMode.value || (Number.isFinite(scheduleTimestamp.value) && scheduleTimestamp.value > Date.now()));
-const scheduleStatus = computed(() => {
-  if (!isScheduleMode.value) return 'Không dùng lịch';
-  if (!scheduleDateTime.value) return 'Chưa chọn thời gian đăng';
-  if (!scheduleReady.value) return 'Thời gian đăng phải ở tương lai';
-  return `Sẽ đăng lúc ${formatDate(scheduleDateTime.value)}`;
-});
+const {
+  scheduleDateTime,
+  minScheduleDate,
+  scheduleDate,
+  scheduleTime,
+  scheduleReady,
+  scheduleStatus,
+  applySchedulePreset
+} = useScheduleState({ isScheduleMode, formatDate });
 const queueReady = computed(() => !isBulkMode.value || selectedQueueAccounts.value.length > 0);
 const captionRequired = computed(() => selectedPlatformId.value !== 'instagram');
 const contentReady = computed(() => characterCount.value <= 5000 && (!captionRequired.value || characterCount.value > 0));
@@ -350,33 +295,30 @@ const canRunWorkflow = computed(() => selectedPlatform.value.status === 'ready'
   && !posting.value
   && !queueRunning.value
   && !mediaUploading.value);
-const currentDraftFingerprint = computed(() => buildDraftFingerprint({
-  platform: selectedPlatformId.value,
-  facebookPostType: facebookPostType.value,
-  text: finalPostText.value.trim(),
-  media: post.media
-}));
-const editingDraft = computed(() => drafts.value.find((draft) => draft.id === editingDraftId.value) || null);
-const duplicateDraft = computed(() => drafts.value.find((draft) => (
-  draft.status === 'draft'
-  && draft.id !== editingDraftId.value
-  && buildDraftFingerprint(draft) === currentDraftFingerprint.value
-)));
-const editingDraftUnchanged = computed(() => {
-  if (!editingDraft.value) return false;
-  const savedTitle = String(editingDraft.value.managementTitle || '').trim();
-  return buildDraftFingerprint(editingDraft.value) === currentDraftFingerprint.value
-    && savedTitle === String(post.title || '').trim();
+const {
+  drafts,
+  editingDraftId,
+  duplicateDraft,
+  draftAlreadySaved,
+  imageTextDrafts,
+  videoDrafts,
+  scheduledDrafts,
+  loadDrafts,
+  saveDraft,
+  deleteDraft,
+  duplicateComposer
+} = useComposerDrafts({
+  post,
+  selectedPlatformId,
+  facebookPostType,
+  photoLayout,
+  finalPostText,
+  isFacebookVideoMode,
+  selectedAccount,
+  selectedAccountLabel,
+  formatDate,
+  notify: (...args) => ui.notify(...args)
 });
-const draftAlreadySaved = computed(() => Boolean(
-  finalPostText.value.trim()
-  && (duplicateDraft.value || editingDraftUnchanged.value)
-));
-const imageTextDrafts = computed(() => drafts.value.filter((draft) => getDraftContentType(draft) === 'imageText'));
-const videoDrafts = computed(() => drafts.value.filter((draft) => getDraftContentType(draft) === 'video'));
-const scheduledDrafts = computed(() => drafts.value
-  .filter((draft) => draft.status === 'scheduled')
-  .sort((a, b) => new Date(a.scheduledFor || a.createdAt) - new Date(b.scheduledFor || b.createdAt)));
 const composerChecks = computed(() => [
   {
     label: 'Hashtag',
@@ -1774,112 +1716,6 @@ function toggleQueueAccount(accountId) {
   selectedQueueAccountIds.value = [...selectedQueueAccountIds.value, accountId];
 }
 
-function loadDrafts() {
-  try {
-    const platformKey = getPlatformDraftStorageKey(selectedPlatformId.value);
-    const platformRaw = window.localStorage.getItem(platformKey);
-    const legacyRaw = window.localStorage.getItem(draftStorageKey);
-    const platformDrafts = platformRaw ? JSON.parse(platformRaw) : null;
-    const legacyDrafts = legacyRaw ? JSON.parse(legacyRaw) : [];
-    const storedDrafts = Array.isArray(platformDrafts)
-      ? platformDrafts
-      : (Array.isArray(legacyDrafts)
-        ? legacyDrafts.filter((draft) => (draft.platform || 'facebook') === selectedPlatformId.value)
-        : []);
-    drafts.value = Array.isArray(storedDrafts)
-      ? storedDrafts.map((draft) => ({
-        ...draft,
-        platform: draft.platform || selectedPlatformId.value,
-        facebookPostType: getDraftContentType(draft),
-        media: Array.isArray(draft.media) ? draft.media.filter((item) => item?.uploadedUrl || item?.url) : []
-      }))
-      : [];
-    if (!platformRaw && drafts.value.length) persistDrafts();
-  } catch {
-    drafts.value = [];
-  }
-}
-
-function persistDrafts() {
-  window.localStorage.setItem(
-    getPlatformDraftStorageKey(selectedPlatformId.value),
-    JSON.stringify(drafts.value.slice(0, 20))
-  );
-}
-
-function applySchedulePreset(option) {
-  const now = new Date();
-  const target = new Date(now);
-
-  if (option.minutes) {
-    target.setTime(now.getTime() + option.minutes * 60 * 1000);
-  } else if (option.preset === 'tonight') {
-    target.setHours(20, 0, 0, 0);
-    if (target <= now) target.setDate(target.getDate() + 1);
-  } else if (option.preset === 'tomorrow-morning') {
-    target.setDate(target.getDate() + 1);
-    target.setHours(9, 0, 0, 0);
-  }
-
-  target.setMinutes(Math.ceil(target.getMinutes() / 5) * 5, 0, 0);
-  scheduleDateTime.value = toDateTimeLocal(target);
-}
-
-function saveDraft(status = 'draft', options = {}) {
-  if (!finalPostText.value.trim()) {
-    ui.notify('Chưa có nội dung để lưu nháp.', 'error');
-    return;
-  }
-  if (status === 'draft' && duplicateDraft.value) {
-    ui.notify('Bài viết này đã có trong danh sách Bài đã lưu.', 'error');
-    return;
-  }
-  if (status === 'draft' && editingDraftUnchanged.value) {
-    ui.notify('Bài viết chưa có thay đổi mới để cập nhật.', 'error');
-    return;
-  }
-
-  const existingDraft = status === 'draft'
-    ? drafts.value.find((item) => item.id === editingDraftId.value)
-    : null;
-  const now = new Date().toISOString();
-  const customTitle = String(post.title || '').trim();
-  const draft = {
-    id: existingDraft?.id || `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    title: status === 'scheduled'
-      ? (customTitle || `Lịch đăng ${formatDate(options.scheduledFor)}`)
-      : (customTitle || `Bài nháp ${new Date().toLocaleString('vi-VN')}`),
-    managementTitle: customTitle,
-    type: isFacebookVideoMode.value ? 'video' : 'photo',
-    text: finalPostText.value.trim(),
-    rawText: normalizeTextFormatArtifacts(post.text),
-    hashtags: post.hashtags,
-    mediaCount: post.media.length,
-    media: post.media.map((item) => ({
-      id: item.id,
-      name: item.name,
-      type: item.type,
-      uploadedUrl: item.uploadedUrl,
-      mimeType: item.mimeType,
-      size: item.size
-    })).filter((item) => item.uploadedUrl),
-    platform: selectedPlatformId.value,
-    facebookPostType: facebookPostType.value,
-    photoLayout: photoLayout.value,
-    status,
-    createdAt: existingDraft?.createdAt || now,
-    updatedAt: now,
-    scheduledFor: options.scheduledFor || null,
-    targetAccountId: options.targetAccountId || selectedAccount.value?._id || null,
-    targetAccountLabel: options.targetAccountLabel || selectedAccountLabel.value
-  };
-  drafts.value = [draft, ...drafts.value.filter((item) => item.id !== draft.id)].slice(0, 20);
-  if (status === 'draft') editingDraftId.value = draft.id;
-  persistDrafts();
-  if (status !== 'scheduled') ui.notify(existingDraft ? 'Đã cập nhật bài đã lưu.' : 'Đã lưu bài viết.');
-  return draft;
-}
-
 function saveScheduledPost() {
   if (!scheduleReady.value) {
     ui.notify(scheduleStatus.value, 'error');
@@ -1939,17 +1775,6 @@ function loadDraft(draft) {
   ui.notify(restoredMediaCount
     ? `Đã tải nháp và khôi phục ${restoredMediaCount} tệp media.`
     : 'Đã tải nháp vào composer.');
-}
-
-function deleteDraft(draftId) {
-  drafts.value = drafts.value.filter((draft) => draft.id !== draftId);
-  if (editingDraftId.value === draftId) editingDraftId.value = '';
-  persistDrafts();
-  ui.notify('Đã xóa nháp.');
-}
-
-function duplicateComposer() {
-  saveDraft('draft');
 }
 
 function setFacebookPostType(type) {
