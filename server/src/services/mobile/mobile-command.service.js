@@ -31,6 +31,19 @@ export async function runCommand(command, args, metadata = {}) {
       stderr: result.stderr?.trim() || ''
     };
   } catch (error) {
+    const benignMonkey = normalizeBenignAdbMonkeyError(command, executable, args, error);
+    if (benignMonkey) {
+      return {
+        ok: true,
+        command,
+        args,
+        durationMs: Date.now() - startedAt,
+        stdout: error.stdout?.trim() || '',
+        stderr: error.stderr?.trim() || '',
+        toleratedError: summarizeCommandError(error),
+        toleratedReason: benignMonkey.reason
+      };
+    }
     if (
       isAdbExecutable(command, executable)
       && metadata.retryTransient !== false
@@ -80,6 +93,25 @@ export async function runCommand(command, args, metadata = {}) {
       retriedAfterAdbRestart: Boolean(error.retryError)
     };
   }
+}
+
+function normalizeBenignAdbMonkeyError(command, executable, args = [], error = {}) {
+  if (!isAdbExecutable(command, executable)) return null;
+  const shellIndex = args.indexOf('shell');
+  const monkeyIndex = args.indexOf('monkey');
+  if (shellIndex < 0 || monkeyIndex < 0 || monkeyIndex <= shellIndex) return null;
+
+  const stdout = String(error.stdout || '');
+  const stderr = String(error.stderr || '');
+  const combined = `${stdout}\n${stderr}`;
+  const injected = /Events injected:\s*[1-9]\d*/i.test(combined);
+  const benignDebug = /args:\s*\[|bash arg:|data="[^"]+"/i.test(combined)
+    && !/Error:|Exception|Killed|No activities found|monkey aborted|not found|inaccessible|permission denied/i.test(combined);
+  if (!injected && !benignDebug) return null;
+
+  return {
+    reason: injected ? 'adb_monkey_event_injected_with_stderr' : 'adb_monkey_debug_stderr'
+  };
 }
 
 function getCommandCwd(executable = '') {

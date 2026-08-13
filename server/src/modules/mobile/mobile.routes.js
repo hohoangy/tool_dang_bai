@@ -165,6 +165,26 @@ export function classifyMobilePublishError(error, platform, context = {}) {
       recoveryHint: 'Kiểm tra quyền ảnh/video của Facebook trong LDPlayer và thử lại với media nhỏ hơn.'
     };
   }
+  if (!isFacebook && match(
+    'home/create',
+    'splash',
+    'ui chua render',
+    'chua render',
+    'khong mo duoc thu vien anh',
+    'khong mo duoc thu vien album',
+    'khong mo duoc instagram home',
+    'instagram khong mo duoc thu vien',
+    'instagram dang foreground'
+  )) {
+    return {
+      code: 'INSTAGRAM_HOME_CREATE_UNSTABLE',
+      category: 'instagram_home_create',
+      retryable: true,
+      action: 'instagram_post_failed_home_create',
+      userMessage: 'Instagram chưa mở ổn định màn Home/Create hoặc thư viện ảnh.',
+      recoveryHint: 'Tool đã dừng và sẽ đóng LDPlayer sau lỗi retryable. Chờ vài giây rồi chạy lại profile này; nếu lặp lại, mở Instagram thủ công một lần đến Home rồi thử lại.'
+    };
+  }
   if (match('khong dua duoc', 'state machine', 'khong toi duoc', 'chua toi duoc', 'unknown_state')) {
     return {
       code: `${platform.toUpperCase()}_UI_STATE_UNSTABLE`,
@@ -524,9 +544,32 @@ mobileRoutes.post('/accounts/:id/instagram/post', requireAuth, asyncHandler(asyn
       recoveryHint: classification.recoveryHint,
       originalMessage: error.message
     });
+    if (shouldCloseInstagramAfterFailure(classification)) {
+      const close = await closeAccountSession(account, req.user._id, platformInput.appPackage)
+        .catch((closeError) => ({ ok: false, error: closeError?.message || String(closeError) }));
+      await writeLog(
+        req.user._id,
+        account._id,
+        close?.ok ? 'info' : 'warn',
+        close?.ok ? 'instagram_post_failed_session_closed' : 'instagram_post_failed_session_close_incomplete',
+        close?.ok
+          ? 'Đã tắt phiên LDPlayer sau lỗi Instagram để giải phóng RAM.'
+          : 'Chưa tắt sạch phiên LDPlayer sau lỗi Instagram.',
+        {
+          code: classification.code,
+          category: classification.category,
+          close
+        }
+      );
+    }
     throwClassifiedPublishError(error, classification);
   }
 }));
+
+function shouldCloseInstagramAfterFailure(classification = {}) {
+  if (!classification.retryable) return false;
+  return !['auth_required', 'post_submit_unverified', 'pre_submit_gate'].includes(classification.category);
+}
 
 mobileRoutes.post('/accounts/:id/run-login', requireAuth, asyncHandler(async (req, res) => {
   const input = runSchema.omit({ accountIds: true }).parse(req.body || {});
