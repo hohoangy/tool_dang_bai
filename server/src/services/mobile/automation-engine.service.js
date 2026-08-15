@@ -23,6 +23,7 @@ const instagramSharePrewarmCache = new Map();
 const instagramShareMethodCache = new Map();
 const facebookMediaRoot = '/sdcard/Pictures/SocialPilot';
 const facebookMediaCacheRoot = '/sdcard/Pictures/SocialPilotCache';
+const facebookMediaCleanupMaxRows = Math.max(10, Number(process.env.FACEBOOK_MEDIA_CLEANUP_MAX_ROWS || 80));
 const instagramPermissionCacheTtlMs = 10 * 60 * 1000;
 const uiDumpCacheTtlMs = 350;
 const androidUiReadyCacheTtlMs = 12_000;
@@ -42,6 +43,15 @@ const instagramComposerEmptyUiGraceMs = Math.max(3_000, Number(process.env.INSTA
 const instagramComposerEmptyUiSamples = Math.max(3, Number(process.env.INSTAGRAM_COMPOSER_EMPTY_UI_SAMPLES || 6));
 const instagramShareHandlerFocusGraceMs = Math.max(2_500, Number(process.env.INSTAGRAM_SHARE_HANDLER_FOCUS_GRACE_MS || 6_000));
 const instagramShareHandlerMaxWaitMs = Math.max(4_000, Number(process.env.INSTAGRAM_SHARE_HANDLER_MAX_WAIT_MS || 10_000));
+const ldExclusiveOpen = String(process.env.LD_EXCLUSIVE_OPEN || 'true').toLowerCase() !== 'false';
+const ldSafeLaunchDelayMs = Math.max(0, Number(process.env.LD_SAFE_LAUNCH_WAIT_MS || 90_000));
+const ldEngineWaitMs = Math.max(45_000, Number(process.env.LD_ENGINE_WAIT_MS || 180_000));
+const ldNoDeviceAfterProcessMs = Math.max(45_000, Number(process.env.LD_NO_DEVICE_AFTER_PROCESS_MS || 170_000));
+const ldMissingDeviceRecoveryWaitMs = Math.max(8_000, Number(process.env.LD_MISSING_DEVICE_RECOVERY_WAIT_MS || 75_000));
+const ldDirectConnectMinProcessMs = Math.max(10_000, Number(process.env.LD_DIRECT_CONNECT_MIN_PROCESS_MS || 90_000));
+const ldBetweenSessionsDelayMs = Math.max(0, Number(process.env.LD_BETWEEN_SESSIONS_DELAY_MS || 15_000));
+const ldAdbConnectRetryAttempts = Math.max(1, Number(process.env.LD_ADB_CONNECT_RETRY_ATTEMPTS || 6));
+const ldAdbConnectRetryDelayMs = Math.max(1_000, Number(process.env.LD_ADB_CONNECT_RETRY_DELAY_MS || 10_000));
 
 const defaultPackages = {
   facebook: 'com.facebook.katana',
@@ -123,6 +133,15 @@ const facebookMenuLabels = [
   'Dang xuat'
 ];
 const auxiliaryMenuLabels = ['Lựa chọn khác', 'Lua chon khac', 'Thêm nhãn AI', 'Them nhan AI'];
+const facebookAiLabelLabels = [
+  'AI label',
+  'Nhãn AI',
+  'Nhan AI',
+  'made with AI',
+  'realistic content',
+  'nội dung chân thực',
+  'noi dung chan thuc'
+];
 const doneLabels = ['Xong', 'Done'];
 const galleryLabels = ['Thư viện', 'Ảnh/video', 'Photo/video', 'Gallery'];
 const addMorePhotoLabels = [
@@ -366,6 +385,13 @@ export async function openLdPlayer(account, userId, options = {}) {
   let instance = await getLdPlayerInstanceInfo(account.instanceName);
   let ldRecovery = null;
   let preLaunchAdbReset = null;
+  let preEngineDirectConnect = null;
+  const exclusiveCleanup = ldExclusiveOpen && options.exclusiveOpen !== false
+    ? await ensureOnlyTargetLdPlayerRunning(account, userId, instance)
+    : null;
+  if (exclusiveCleanup?.stopped?.length) {
+    await delay(ldBetweenSessionsDelayMs);
+  }
   if (env.mobileAutomation.ldRuntimeHelperUrl && !account.adbHost && !instance?.running) {
     const helperLaunch = await launchLdPlayerViaRuntimeHelper(account, userId, instance);
     if (helperLaunch.ok) {
@@ -412,14 +438,47 @@ export async function openLdPlayer(account, userId, options = {}) {
     result.ok ? 'info' : 'error',
     'remote_launch_ldplayer',
     result.alreadyRunning ? `${account.instanceName} đang chạy, tiếp tục kiểm tra ADB.` : (result.ok ? 'Đã mở LDPlayer.' : 'Mở LDPlayer lỗi.'),
-    { ...result, service, instance, preLaunchAdbReset, bootPackage: options.bootPackage || '' }
+    { ...result, service, instance, preLaunchAdbReset, exclusiveCleanup, bootPackage: options.bootPackage || '' }
   );
   if (!result.ok) return { launch: result, connect: null, startServer: null };
 
   if (!result.alreadyRunning) {
-    const launchedInstance = await waitForLdPlayerProcess(account, Number.isFinite(Number(options.launchProcessWaitMs))
+    let launchedInstance = await waitForLdPlayerProcess(account, Number.isFinite(Number(options.launchProcessWaitMs))
       ? Number(options.launchProcessWaitMs)
       : 45_000);
+    if (!launchedInstance?.running) {
+      const expectedTarget = launchedInstance?.target || instance?.target || getDeviceTarget(account);
+      const directHost = account.adbHost || getLdPlayerAdbHostForTarget(expectedTarget);
+      const directConnect = directHost
+        ? await runCommand(env.mobileAutomation.adbPath, ['connect', directHost], { timeoutMs: 10_000 })
+        : null;
+      const readyTarget = await resolveStableDeviceTarget(expectedTarget, { preferDirect: isTcpAdbTarget(account?.adbHost) });
+      const state = readyTarget
+        ? await runCommand(env.mobileAutomation.adbPath, ['-s', readyTarget, 'get-state'], { timeoutMs: 5_000 })
+        : { ok: false, stdout: '' };
+      if (state.ok && String(state.stdout || '').trim() === 'device') {
+        launchedInstance = {
+          ...(launchedInstance || instance || {}),
+          running: true,
+          target: readyTarget,
+          recoveredByAdb: true
+        };
+        await writeLog(
+          userId,
+          account._id,
+          'warn',
+          'ldplayer_launch_no_process_but_adb_ready',
+          `${account.instanceName} list2 chưa cập nhật process nhưng ADB ${readyTarget} đang online; tiếp tục thay vì dừng sai.`,
+          {
+            before: instance,
+            after: launchedInstance,
+            directHost,
+            directConnect,
+            state
+          }
+        );
+      }
+    }
     if (!launchedInstance?.running) {
       const error = new Error(`${account.instanceName} nhận lệnh mở nhưng LDPlayer không tạo process. Hãy mở thử instance này bằng LDPlayer Manager hoặc chạy tool trong phiên desktop tương tác.`);
       error.code = 'LDPLAYER_LAUNCH_NO_PROCESS';
@@ -439,7 +498,22 @@ export async function openLdPlayer(account, userId, options = {}) {
       );
       throw error;
     }
-    await delay(Number.isFinite(Number(options.postLaunchDelayMs)) ? Number(options.postLaunchDelayMs) : 22_000);
+    const configuredPostLaunchDelayMs = Number(options.postLaunchDelayMs);
+    await delay(Number.isFinite(configuredPostLaunchDelayMs)
+      ? configuredPostLaunchDelayMs
+      : Math.max(env.mobileAutomation.launchWaitMs, ldSafeLaunchDelayMs));
+    instance = await getLdPlayerInstanceInfo(account.instanceName) || instance;
+    preEngineDirectConnect = await tryConnectLdPlayerAdbTarget(account, instance);
+    await writeLog(
+      userId,
+      account._id,
+      preEngineDirectConnect.ok ? 'info' : 'warn',
+      preEngineDirectConnect.ok ? 'ldplayer_pre_engine_direct_connect_ready' : 'ldplayer_pre_engine_direct_connect_wait',
+      preEngineDirectConnect.ok
+        ? `ADB ${preEngineDirectConnect.target} đã nối trực tiếp sau boot.`
+        : 'ADB localhost chưa sẵn sàng ngay sau boot; tiếp tục chờ engine.',
+      preEngineDirectConnect
+    );
   }
   const startServer = await runCommand(env.mobileAutomation.adbPath, ['start-server'], { timeoutMs: 10_000 });
   await writeLog(userId, account._id, startServer.ok ? 'info' : 'warn', 'remote_adb_start_server', startServer.ok ? 'ADB server đã sẵn sàng.' : 'Không khởi động được ADB server.', startServer);
@@ -450,12 +524,12 @@ export async function openLdPlayer(account, userId, options = {}) {
     ? configuredEngineWaitMs
     : wasRunningBeforeLaunch && !instance.engineReady
       ? 20_000
-      : Math.max(env.mobileAutomation.launchWaitMs, 105_000);
+      : Math.max(env.mobileAutomation.launchWaitMs, ldEngineWaitMs);
   let engine = await waitForLdPlayerEngine(account, engineWaitMs, {
     noDeviceAfterProcessMs: Number.isFinite(Number(options.engineNoDeviceAfterProcessMs))
       ? Number(options.engineNoDeviceAfterProcessMs)
-      : 110_000,
-    directConnectMinProcessMs: options.directConnectMinProcessMs,
+      : ldNoDeviceAfterProcessMs,
+    directConnectMinProcessMs: options.directConnectMinProcessMs ?? ldDirectConnectMinProcessMs,
     directConnectIntervalMs: options.directConnectIntervalMs
   });
   if (!engine.ok && engine.expectedTargetState === 'offline') {
@@ -490,7 +564,10 @@ export async function openLdPlayer(account, userId, options = {}) {
     );
     engine = await waitForLdPlayerEngine(account, Number.isFinite(Number(options.missingDeviceRecoveryWaitMs))
       ? Number(options.missingDeviceRecoveryWaitMs)
-      : 8_000);
+      : ldMissingDeviceRecoveryWaitMs, {
+      directConnectMinProcessMs: 0,
+      directConnectIntervalMs: 10_000
+    });
     if (!engine.ok && !options.skipAdbDeviceRecovery) {
       ldRecovery = await recoverLdPlayerAdbDevice(account, userId, {
         reason: 'adb_device_not_listed_after_launch',
@@ -566,14 +643,16 @@ export async function openLdPlayer(account, userId, options = {}) {
       devices: engine.devices,
       service,
       recovery: ldRecovery,
-      directConnectIssue
+      directConnectIssue,
+      preEngineDirectConnect
     };
     throw error;
   }
 
-  if (account.adbHost) {
-    const connect = await runCommand(env.mobileAutomation.adbPath, ['connect', account.adbHost]);
-    await writeLog(userId, account._id, connect.ok ? 'info' : 'error', 'remote_adb_connect', connect.ok ? `Đã nối ADB ${account.adbHost}.` : `Nối ADB lỗi ${account.adbHost}.`, connect);
+  const connectHost = account.adbHost || getLdPlayerAdbHostForTarget(engine.target || instance?.target || getDeviceTarget(account));
+  if (connectHost) {
+    const connect = await retryLdPlayerAdbConnect(account, userId, connectHost, engine.target || instance?.target || getDeviceTarget(account));
+    await writeLog(userId, account._id, connect.ok ? 'info' : 'error', 'remote_adb_connect', connect.ok ? `Đã nối ADB ${connectHost}.` : `Nối ADB lỗi ${connectHost}.`, connect);
     return { launch: result, connect, startServer, engine, target: engine.target || instance?.target || '' };
   }
   return { launch: result, connect: null, startServer, engine, target: engine.target || instance?.target || '' };
@@ -608,6 +687,47 @@ function buildLdPlayerLaunchArgs(account, instance, bootPackage = '') {
     ? ['--index', String(instance.index)]
     : ['--name', account.instanceName];
   return ['launch', ...selector];
+}
+
+async function ensureOnlyTargetLdPlayerRunning(account, userId, targetInstance = null) {
+  if (!account?.instanceName) return null;
+  const targetIndex = Number.isInteger(targetInstance?.index)
+    ? targetInstance.index
+    : inferLdPlayerIndex(account.instanceName);
+  if (!Number.isInteger(targetIndex)) return null;
+
+  const instances = await getLdPlayerInstances();
+  const runningOthers = instances.filter((instance) => instance.running && instance.index !== targetIndex);
+  if (!runningOthers.length) return { ok: true, stopped: [] };
+
+  const stopped = [];
+  for (const instance of runningOthers) {
+    const quit = await runCommand(env.mobileAutomation.ldconsolePath, ['quit', '--index', String(instance.index)], { timeoutMs: 10_000 });
+    stopped.push({
+      index: instance.index,
+      instanceName: instance.instanceName,
+      target: instance.target,
+      ok: quit.ok,
+      error: quit.error || quit.stderr || ''
+    });
+  }
+
+  await runCommand(env.mobileAutomation.adbPath, ['kill-server'], { timeoutMs: 10_000 });
+  await writeLog(
+    userId,
+    account._id,
+    stopped.every((item) => item.ok) ? 'info' : 'warn',
+    'ldplayer_exclusive_open_cleanup',
+    stopped.every((item) => item.ok)
+      ? `Đã đóng ${runningOthers.length} LDPlayer khác trước khi mở ${account.instanceName}.`
+      : `Đã thử đóng LDPlayer khác trước khi mở ${account.instanceName}.`,
+    { targetIndex, stopped }
+  );
+
+  return {
+    ok: stopped.every((item) => item.ok),
+    stopped
+  };
 }
 
 async function launchLdPlayerViaRuntimeHelper(account, userId, instance = null) {
@@ -1226,7 +1346,9 @@ async function ensureDeviceReady(account, userId, target, attempts = 8) {
   }
 
   await runCommand(env.mobileAutomation.adbPath, ['start-server'], { timeoutMs: 8_000 });
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+  const maxAttempts = Math.max(1, Number(attempts) || 1);
+  const useSafeLdRetryDelay = isEmulatorTarget(target) && maxAttempts >= ldAdbConnectRetryAttempts;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const state = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'get-state'], { timeoutMs: 10_000 });
     lastState = state;
     if (state.ok && String(state.stdout || '').trim() === 'device') {
@@ -1256,12 +1378,40 @@ async function ensureDeviceReady(account, userId, target, attempts = 8) {
       }
     }
 
-    if (account.adbHost && /^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(account.adbHost)) {
-      await runCommand(env.mobileAutomation.adbPath, ['disconnect', account.adbHost], { timeoutMs: 10_000 });
+    const connectHost = account.adbHost || getLdPlayerAdbHostForTarget(target) || getLdPlayerAdbHostForTarget(dynamicTarget);
+    if (connectHost && /^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(connectHost)) {
+      const output = `${state.stdout || ''} ${state.stderr || ''} ${state.error || ''}`.trim();
+      if (/offline|closed|refused|not found|not connected|no devices/i.test(output) || attempt === 1) {
+        await runCommand(env.mobileAutomation.adbPath, ['disconnect', connectHost], { timeoutMs: 10_000 });
+        if (/offline/i.test(output)) {
+          await runCommand(env.mobileAutomation.adbPath, ['kill-server'], { timeoutMs: 10_000 });
+          await delay(1_000);
+          await runCommand(env.mobileAutomation.adbPath, ['start-server'], { timeoutMs: 10_000 });
+        }
+      }
       await delay(400);
-      await runCommand(env.mobileAutomation.adbPath, ['connect', account.adbHost], { timeoutMs: 10_000 });
+      const connect = await runCommand(env.mobileAutomation.adbPath, ['connect', connectHost], { timeoutMs: 10_000 });
+      const connectedTarget = await resolveStableDeviceTarget(target, { preferDirect: isTcpAdbTarget(account?.adbHost) });
+      if (connectedTarget && connectedTarget !== target) {
+        const connectedState = await runCommand(env.mobileAutomation.adbPath, ['-s', connectedTarget, 'get-state'], { timeoutMs: 4_000 });
+        if (connectedState.ok && String(connectedState.stdout || '').trim() === 'device') {
+          accountRuntimeTargets.set(account._id, connectedTarget);
+          await writeLog(
+            userId,
+            account._id,
+            'info',
+            'adb_ready_after_direct_connect',
+            `ADB ${connectHost} đã sẵn sàng sau khi nối trực tiếp.`,
+            { connect, requestedTarget: target, resolvedTarget: connectedTarget, attempt }
+          );
+          return { ...connectedState, resolvedTarget: connectedTarget };
+        }
+      }
     }
-    await delay(attempt < 3 ? 800 : 1200);
+    const retryDelayMs = useSafeLdRetryDelay
+      ? ldAdbConnectRetryDelayMs
+      : attempt < 3 ? 800 : 1200;
+    await delay(attempt < maxAttempts ? retryDelayMs : 0);
   }
 
   await writeLog(userId, account._id, 'error', 'adb_not_ready', `ADB ${target} chưa sẵn sàng để mở app.`, lastState || {});
@@ -1349,6 +1499,69 @@ function shouldAllowDynamicTarget(account, target = '') {
 
 function isEmulatorTarget(value = '') {
   return /^emulator-\d+$/.test(String(value || ''));
+}
+
+function getLdPlayerAdbHostForTarget(target = '') {
+  const match = String(target || '').match(/^emulator-(\d+)$/);
+  if (!match) return '';
+  const consolePort = Number(match[1]);
+  if (!Number.isInteger(consolePort) || consolePort < 5554) return '';
+  return `127.0.0.1:${consolePort + 1}`;
+}
+
+function truncateLogText(value = '', maxLength = 900) {
+  const text = String(value || '');
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength)}... [truncated ${text.length - maxLength} chars]`;
+}
+
+function quoteAndroidShell(value = '') {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+async function retryLdPlayerAdbConnect(account, userId, adbHost, preferredTarget = '') {
+  let lastConnect = null;
+  const target = preferredTarget || getDeviceTarget(account);
+  for (let attempt = 1; attempt <= ldAdbConnectRetryAttempts; attempt += 1) {
+    lastConnect = await runCommand(env.mobileAutomation.adbPath, ['connect', adbHost], { timeoutMs: 10_000 });
+    const readyTarget = await resolveStableDeviceTarget(target, { preferDirect: isTcpAdbTarget(account?.adbHost) });
+    if (readyTarget) {
+      const state = await runCommand(env.mobileAutomation.adbPath, ['-s', readyTarget, 'get-state'], { timeoutMs: 4_000 });
+      if (state.ok && String(state.stdout || '').trim() === 'device') {
+        return {
+          ...lastConnect,
+          ok: true,
+          attempt,
+          adbHost,
+          resolvedTarget: readyTarget,
+          state
+        };
+      }
+    }
+    const output = `${lastConnect?.stdout || ''} ${lastConnect?.stderr || ''} ${lastConnect?.error || ''}`.trim();
+    if (/offline/i.test(output)) {
+      await runCommand(env.mobileAutomation.adbPath, ['kill-server'], { timeoutMs: 10_000 });
+      await delay(1_000);
+      await runCommand(env.mobileAutomation.adbPath, ['start-server'], { timeoutMs: 10_000 });
+    }
+    await delay(attempt < ldAdbConnectRetryAttempts ? ldAdbConnectRetryDelayMs : 0);
+  }
+
+  await writeLog(
+    userId,
+    account._id,
+    'warn',
+    'adb_direct_connect_retry_failed',
+    `ADB ${adbHost} chưa sẵn sàng sau ${ldAdbConnectRetryAttempts} lần nối.`,
+    { adbHost, preferredTarget, lastConnect }
+  );
+  return {
+    ...(lastConnect || {}),
+    ok: false,
+    adbHost,
+    preferredTarget,
+    attempts: ldAdbConnectRetryAttempts
+  };
 }
 
 function hasActiveSystemUiAnr(windowOutput = '') {
@@ -1818,14 +2031,15 @@ async function ensurePortraitOrientation(account, userId, target) {
   };
 }
 
-async function runFacebookPublishPreflight(account, userId, target, config, mediaCount = 0) {
+async function runFacebookPublishPreflight(account, userId, target, config, mediaCount = 0, options = {}) {
   const startedAt = Date.now();
   const steps = [];
+  const reviewMode = options.reviewMode === true || config.autoSubmit === false;
 
   const adbStable = await ensureAdbStable(account, userId, target, {
     phase: 'facebook_publish_preflight',
-    stableChecks: 3,
-    maxAttempts: 8
+    stableChecks: reviewMode ? 1 : 3,
+    maxAttempts: reviewMode ? 3 : 8
   });
   steps.push(adbStable);
   if (!adbStable.ok) {
@@ -1841,8 +2055,8 @@ async function runFacebookPublishPreflight(account, userId, target, config, medi
 
   const systemUi = await waitForSystemUiHealthy(account, userId, target, {
     phase: 'facebook_publish_preflight',
-    stableChecks: 2,
-    maxAttempts: mediaCount > 1 ? 8 : 5
+    stableChecks: reviewMode ? 1 : 2,
+    maxAttempts: reviewMode ? 3 : (mediaCount > 1 ? 8 : 5)
   });
   steps.push(systemUi);
   if (!systemUi.ok) {
@@ -1856,7 +2070,7 @@ async function runFacebookPublishPreflight(account, userId, target, config, medi
     };
   }
 
-  const storage = await ensureAndroidStorageReady(account, userId, target, 6);
+  const storage = await ensureAndroidStorageReady(account, userId, target, reviewMode ? 3 : 6);
   steps.push(storage);
   if (!storage.ok) {
     return {
@@ -3410,8 +3624,9 @@ async function resolveFacebookOpenState(target, state) {
         uiautomatorUnavailable: true
       };
     }
+    const composerTitleNode = findNodeInNodes(nodes, postTitleLabels);
     const stillInComposer = Boolean(
-      findNodeInNodes(nodes, postTitleLabels)
+      (composerTitleNode && Number(composerTitleNode.top) < 180)
       || findNodeInNodes(nodes, doneLabels, { exact: true })
       || findNodeInNodes(nodes, closeComposerLabels, { exact: true })
       || findNodeInNodes(nodes, discardPostLabels, { exact: true })
@@ -3760,11 +3975,15 @@ async function ensureLdPlayerInstanceStopped(account, userId, target, expectedPr
         const device = target
           ? await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'get-state'], { timeoutMs: 1_000 })
           : { ok: false };
+        const killServer = await runCommand(env.mobileAutomation.adbPath, ['kill-server'], { timeoutMs: 10_000 });
+        if (ldBetweenSessionsDelayMs) await delay(ldBetweenSessionsDelayMs);
         const cleanup = {
           ok: true,
           attempt,
           stableStoppedChecks,
-          adbStillOnline: Boolean(device.ok)
+          adbStillOnline: Boolean(device.ok),
+          adbKillServer: killServer.ok,
+          settleMs: ldBetweenSessionsDelayMs
         };
         await writeLog(userId, account._id, 'info', 'remote_close_ldplayer_confirmed', `${account.instanceName} đã dừng hoàn toàn.`, cleanup);
         return cleanup;
@@ -4325,10 +4544,28 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
   }
 
   target = await resolveStableDeviceTarget(target);
-  let device = await ensureDeviceReady(account, userId, target, 2);
-  target = device.resolvedTarget || target;
+  const initialInstance = await getLdPlayerInstanceInfo(account.instanceName);
+  let device = null;
+  const existingDevice = await ensureDeviceReady(account, userId, target, 1);
+  if (existingDevice.ok && String(existingDevice.stdout || '').trim() === 'device') {
+    device = existingDevice;
+    target = device.resolvedTarget || target;
+  }
+  if (!device && initialInstance && !initialInstance.running) {
+    await writeLog(userId, account._id, 'info', 'facebook_post_launch_before_adb_probe', `${account.instanceName} đang tắt; mở LDPlayer trước khi kiểm tra ADB để tránh chạm ADB quá sớm.`);
+    await openLdPlayer(account, userId, { bootPackage: config.appPackage });
+    const launchedTarget = await getLdPlayerDeviceTarget(account.instanceName);
+    target = await resolveStableDeviceTarget(launchedTarget || getDeviceTarget(account) || target);
+    device = await ensureDeviceReady(account, userId, target, 30);
+    target = device.resolvedTarget || target;
+  } else if (!device) {
+    device = await ensureDeviceReady(account, userId, target, 2);
+    target = device.resolvedTarget || target;
+  }
   if (!device.ok || String(device.stdout || '').trim() !== 'device') {
-    const instance = await getLdPlayerInstanceInfo(account.instanceName);
+    const instance = initialInstance?.running
+      ? initialInstance
+      : await getLdPlayerInstanceInfo(account.instanceName);
     target = await resolveStableDeviceTarget(instance?.target || getDeviceTarget(account) || target);
     if (instance && !instance.running) {
       await writeLog(userId, account._id, 'info', 'facebook_post_launch_immediately', `${account.instanceName} đang tắt, mở ngay thay vì chờ ADB.`);
@@ -4371,7 +4608,8 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
     userId,
     target,
     config,
-    videos.length || images.length
+    videos.length || images.length,
+    { reviewMode: !config.autoSubmit }
   );
   steps.push(...publishPreflight.steps);
   if (!publishPreflight.ok) {
@@ -4467,11 +4705,14 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
       perf.mark('image_prepared', { imageCount: preparedImages.length });
       await assertDeviceConnected(target, 'trước khi mở Facebook composer');
       await resetFacebookAppBeforeComposer(account, userId, target, config.appPackage, steps);
-      const useDirectImageShare = isCollageImage || shouldUseFacebookImageShareIntent(account, text);
+      const useDirectImageShare = isCollageImage || shouldUseFacebookImageShareIntent(account, text, { autoSubmit: config.autoSubmit });
       openHome = await openFacebookComposer(account, userId, target, config, text, useDirectImageShare ? preparedImages : [], 'image');
       perf.mark('composer_opened', { method: openHome.method || '', directImageShare: useDirectImageShare, isCollageImage });
       if (useDirectImageShare && openHome.method === 'image_share_intent') {
-        let imageComposer = await waitForFacebookMediaComposer(target, text, 'image', config.autoSubmit ? 12_000 : 20_000);
+        const patientImageComposerWaitMs = /LDPlayer-3/i.test(String(account?.instanceName || ''))
+          ? (config.autoSubmit ? 18_000 : 12_000)
+          : (config.autoSubmit ? 12_000 : 8_000);
+        let imageComposer = await waitForFacebookMediaComposer(target, text, 'image', patientImageComposerWaitMs);
         let genericShare = null;
         if (!imageComposer.ok && imageComposer.state !== 'share_chooser') {
           genericShare = await openFacebookGenericShareComposer(
@@ -4484,7 +4725,9 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
           );
           if (genericShare.ok) {
             openHome = genericShare;
-            imageComposer = await waitForFacebookMediaComposer(target, text, 'image', config.autoSubmit ? 15_000 : 22_000);
+            imageComposer = await waitForFacebookMediaComposer(target, text, 'image', /LDPlayer-3/i.test(String(account?.instanceName || ''))
+              ? (config.autoSubmit ? 20_000 : 14_000)
+              : (config.autoSubmit ? 15_000 : 10_000));
           }
         }
         const canContinueFromShareChooser = imageComposer.state === 'share_chooser';
@@ -4571,8 +4814,38 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
     steps.push(...stateMachine.steps);
     perf.mark('state_machine_finished', {
       finalState: stateMachine.finalState,
-      submitVerified: stateMachine.submitVerified ?? false
+      submitVerified: stateMachine.submitVerified ?? false,
+      submitTapped: Boolean(stateMachine.submitTapped)
     });
+
+    const canRecoverBeforeSubmit = config.autoSubmit
+      && !stateMachine.submitVerified
+      && isFacebookSafePreSubmitRetryReason(stateMachine.submitReason || '', stateMachine.finalState || '')
+      && Number(payload.__facebookRecoverAttempt || 0) < 1;
+    if (canRecoverBeforeSubmit) {
+      const retryCleanup = await cleanupFacebookFailedComposer(account, userId, target, config, stateMachine.submitReason || stateMachine.finalState || 'pre_submit_retry');
+      steps.push(...retryCleanup.steps);
+      await writeLog(
+        userId,
+        account._id,
+        retryCleanup.ok ? 'warn' : 'error',
+        retryCleanup.ok ? 'facebook_post_pre_submit_recover_retry' : 'facebook_post_pre_submit_recover_failed',
+        retryCleanup.ok
+          ? 'Facebook dừng trước bước Đăng; đã reset phiên và chạy lại một lần để tránh lỗi LD/UI tạm thời.'
+          : 'Facebook dừng trước bước Đăng nhưng không cleanup được phiên; không retry để tránh đăng sai.',
+        {
+          reason: stateMachine.submitReason,
+          finalState: stateMachine.finalState,
+          retryCleanup
+        }
+      );
+      if (retryCleanup.ok) {
+        return publishFacebookPostViaMobile(account, userId, {
+          ...payload,
+          __facebookRecoverAttempt: Number(payload.__facebookRecoverAttempt || 0) + 1
+        });
+      }
+    }
 
     const submitVerified = stateMachine.submitVerified ?? false;
     const submitReason = stateMachine.submitReason || (config.autoSubmit && stateMachine.composerPending ? 'state_machine_pending' : '');
@@ -4586,7 +4859,13 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
     });
     const finishedLevel = config.autoSubmit && !submitVerified ? 'warn' : 'info';
     const reachedSubmitPhase = ['submitted', 'submit_unverified', 'home'].includes(stateMachine.finalState)
-      || ['home_after_next', 'published_post_evidence_pending', 'upload_completed_and_post_visible', 'published_post_visible'].includes(submitReason);
+      || [
+        'home_after_next',
+        'published_post_evidence_pending',
+        'upload_completed_and_post_visible',
+        'upload_completed_main_tab_with_expected_text',
+        'published_post_visible'
+      ].includes(submitReason);
     const finishedMessage = config.autoSubmit && !submitVerified
       ? (reachedSubmitPhase
         ? 'Đã bấm Đăng nhưng chưa xác nhận Facebook đã nhận bài.'
@@ -4613,6 +4892,7 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
       submitReason,
       screenshot: stateMachine.screenshot,
       screenshotVerified: Boolean(stateMachine.screenshotVerified),
+      submitTapped: Boolean(stateMachine.submitTapped),
       resultStatus: resultStatus.status,
       resultCategory: resultStatus.category,
       resultMessage: resultStatus.message,
@@ -4629,12 +4909,12 @@ export async function publishFacebookPostViaMobile(account, userId, payload = {}
   }
 }
 
-function shouldUseFacebookImageShareIntent(account, text = '') {
+function shouldUseFacebookImageShareIntent(account, text = '', options = {}) {
   const instanceName = String(account?.instanceName || '');
   // LDPlayer-3 has repeatedly stalled after Facebook accepts an image share
   // intent. Keep this instance on the slower gallery path; other instances use
   // the faster direct share path and still have a fallback if validation fails.
-  if (/LDPlayer-3/i.test(instanceName)) return false;
+  if (/LDPlayer-3/i.test(instanceName) && options.autoSubmit !== false) return false;
 
   // For one-image posts, direct share is safer than gallery because Facebook's
   // gallery can surface stale LDPlayer images ahead of the file we just pushed.
@@ -4670,6 +4950,43 @@ async function resetFacebookAppBeforeComposer(account, userId, target, appPackag
   );
   if (reset.ok) await delay(550);
   return reset;
+}
+
+async function cleanupFacebookFailedComposer(account, userId, target, config, reason = 'pre_submit_retry') {
+  const steps = [];
+  const back = await runCommand(env.mobileAutomation.adbPath, ['-s', target, 'shell', 'input', 'keyevent', '4'], { timeoutMs: 8_000 });
+  steps.push(back);
+  await delay(500);
+
+  const nodes = await dumpVisibleNodes(target);
+  const discardNode = findNodeInNodes(nodes, discardPostLabels, { exact: true, preferBottomRight: true });
+  let discarded = false;
+  if (discardNode) {
+    const point = {
+      x: Math.round((discardNode.left + discardNode.right) / 2),
+      y: Math.round((discardNode.top + discardNode.bottom) / 2)
+    };
+    const discard = await tapAndLog(userId, account._id, target, 'facebook_post_pre_submit_discard_failed_draft', point);
+    steps.push(discard);
+    discarded = Boolean(discard.ok);
+    await delay(700);
+  }
+
+  const reset = await resetFacebookAppBeforeComposer(account, userId, target, config.appPackage || defaultPackages.facebook, steps);
+  const mediaCleanup = await cleanupFacebookMediaLibrary(account, userId, target, reason);
+  steps.push(...mediaCleanup.steps);
+  const device = await ensureDeviceReady(account, userId, target, 4);
+  steps.push(device);
+  const ok = Boolean(reset.ok && mediaCleanup.ok && device.ok && String(device.stdout || '').trim() === 'device');
+  return {
+    ok,
+    reason,
+    discarded,
+    resetOk: Boolean(reset.ok),
+    mediaCleanupOk: Boolean(mediaCleanup.ok),
+    deviceOk: Boolean(device.ok),
+    steps
+  };
 }
 
 export async function publishInstagramPostViaMobile(account, userId, payload = {}) {
@@ -5078,11 +5395,45 @@ function isFacebookPostSubmitUnverifiedReason(reason = '', finalState = '') {
     'published_post_evidence_pending',
     'no_published_post_evidence',
     'submit_unverified',
+    'still_in_composer',
     'home_after_next',
     'video_upload_timeout',
     'background_upload_in_progress'
   ].includes(String(reason || ''))
     || ['submit_unverified', 'home'].includes(String(finalState || ''));
+}
+
+function isFacebookSafePreSubmitRetryReason(reason = '', finalState = '') {
+  const value = String(reason || '');
+  if (isFacebookPostSubmitUnverifiedReason(value, finalState)) return false;
+  if ([
+    'confirmation_label',
+    'published_post_detail_visible',
+    'published_post_visible',
+    'upload_completed_and_post_visible',
+    'upload_completed_main_tab_with_expected_text',
+    'blocked_after_submit',
+    'still_in_composer',
+    'video_upload_reverted_to_composer'
+  ].includes(value)) {
+    return false;
+  }
+  return [
+    'pre_submit_gate_failed',
+    'next_not_advancing',
+    'composer_editor_not_opening',
+    'caption_not_verified',
+    'caption_not_verified_no_edit',
+    'caption_visible_not_verified',
+    'stale_composer_no_edit',
+    'caption_clear_failed',
+    'review_caption_not_verified',
+    'state_machine_pending',
+    'state_machine_timeout',
+    'next_text_missing_stuck',
+    'next_fallback_stuck'
+  ].includes(value)
+    || ['ready_to_post', 'composer', 'text_editor', 'stale_composer', 'unknown', 'system_anr'].includes(String(finalState || ''));
 }
 
 async function cleanupInstagramDryRunComposer(account, userId, target, config) {
@@ -8178,6 +8529,7 @@ async function cleanupFacebookMediaLibrary(account, userId, target, reason) {
   const steps = [];
   const mediaUris = ['content://media/external/images/media', 'content://media/external/video/media'];
   let deletedMediaRows = 0;
+  let skippedMediaRows = 0;
   const mediaDeletes = [];
 
   for (const mediaUri of mediaUris) {
@@ -8194,14 +8546,16 @@ async function cleanupFacebookMediaLibrary(account, userId, target, reason) {
     ], { timeoutMs: 20_000 });
     steps.push(query);
 
-    const mediaIds = query.ok
+    const allMediaIds = query.ok
       ? String(query.stdout || '')
         .split(/\r?\n/)
         .filter((row) => row.includes(`${facebookMediaRoot}/`) || row.includes(`${facebookMediaCacheRoot}/`))
         .map((row) => row.match(/_id=(\d+)/)?.[1])
         .filter(Boolean)
       : [];
+    const mediaIds = allMediaIds.slice(0, facebookMediaCleanupMaxRows);
     deletedMediaRows += mediaIds.length;
+    skippedMediaRows += Math.max(0, allMediaIds.length - mediaIds.length);
 
     const deletes = await Promise.all(mediaIds.map((mediaId) => runCommand(
       env.mobileAutomation.adbPath,
@@ -8222,35 +8576,45 @@ async function cleanupFacebookMediaLibrary(account, userId, target, reason) {
   }
   steps.push(...mediaDeletes);
 
+  const cleanupScript = [
+    'for d in',
+    `${facebookMediaRoot}/[0-9]*-*`,
+    `${facebookMediaCacheRoot}/[0-9]*-*`,
+    '; do',
+    '[ -e "$d" ] || continue;',
+    'rm -rf "$d" 2>/dev/null || true;',
+    'done;'
+  ].join(' ');
   const removeFiles = await runCommand(env.mobileAutomation.adbPath, [
     '-s',
     target,
     'shell',
-    'rm',
-    '-rf',
-    facebookMediaRoot,
-    facebookMediaCacheRoot
+    'sh',
+    '-c',
+    quoteAndroidShell(cleanupScript)
   ], { timeoutMs: 20_000 });
   steps.push(removeFiles);
 
   const mediaStoreOk = mediaDeletes.every((result) => result.ok);
-  const ok = removeFiles.ok;
+  const ok = mediaStoreOk && removeFiles.ok;
   await writeLog(
     userId,
     account._id,
-    'info',
+    ok ? 'info' : 'warn',
     'facebook_post_media_cleanup',
     ok
-      ? 'Đã dọn ảnh tạm của phiên đăng khỏi LDPlayer.'
-      : 'Không xóa được thư mục media tạm; tool sẽ thử lại trước phiên đăng tiếp theo.',
+      ? 'Đã dọn media tạm Facebook theo session.'
+      : 'Dọn media tạm Facebook chưa sạch hoàn toàn; tool vẫn tiếp tục để tránh kẹt phiên.',
     {
       reason,
       deletedMediaRows,
+      skippedMediaRows,
+      maxRows: facebookMediaCleanupMaxRows,
       mediaStoreOk,
       removeFiles: {
         ok: removeFiles.ok,
-        stderr: removeFiles.stderr,
-        error: removeFiles.error
+        stderr: truncateLogText(removeFiles.stderr),
+        error: truncateLogText(removeFiles.error)
       }
     }
   );
@@ -8836,6 +9200,9 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
   const imageCount = images.length;
   let screenshot = null;
   let finalState = 'unknown';
+  const patientLd = /LDPlayer-3/i.test(String(account?.instanceName || '')) || options.patientLd === true;
+  const maxStateMachineAttempts = patientLd ? 18 : 12;
+  const maxEmptyUiRecovery = patientLd ? 4 : 2;
 
   if (attachedImageCount) {
     await writeLog(
@@ -8852,7 +9219,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
     );
   }
 
-  for (let attempt = 1; attempt <= 12; attempt += 1) {
+  for (let attempt = 1; attempt <= maxStateMachineAttempts; attempt += 1) {
     const state = await resolveFacebookOpenState(target, await detectFacebookState(target, text));
     if (state.hasTargetText) textEntered = true;
     if (
@@ -8922,7 +9289,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
 
     if (state.name === 'unknown' && state.reason === 'no_uiautomator_nodes') {
       await assertDeviceConnected(target, 'trong lúc điều khiển Facebook');
-      if (emptyUiRecoveryCount >= 2) {
+      if (emptyUiRecoveryCount >= maxEmptyUiRecovery) {
         screenshot = await captureScreenshot(account, userId, 'facebook_ui_nodes_unavailable');
         throw new Error('Facebook hoặc System UI không phản hồi trên LDPlayer. Đã dừng sớm để tránh workflow chạy treo.');
       }
@@ -8944,6 +9311,27 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
           stableChecks: 2,
           maxAttempts: 8,
           initialDelayMs: 600
+        });
+        steps.push(healthy);
+      } else if (!textEntered && patientLd && emptyUiRecoveryCount < maxEmptyUiRecovery) {
+        const launch = await launchFacebookWarm(target, config.appPackage);
+        steps.push(launch);
+        await writeLog(
+          userId,
+          account._id,
+          launch.ok ? 'warn' : 'error',
+          'facebook_post_empty_ui_soft_reopen_app',
+          launch.ok
+            ? 'LD3 mất UI nodes tạm thời; mở lại Facebook Home thay vì force-stop sớm.'
+            : 'LD3 mất UI nodes và mở lại Facebook Home chưa thành công.',
+          { launch, attempt, recoveryCount: emptyUiRecoveryCount }
+        );
+        await delay(postStepDelay(1.2));
+        healthy = await waitForSystemUiHealthy(account, userId, target, {
+          phase: 'facebook_empty_ui_soft_reopen',
+          stableChecks: 1,
+          maxAttempts: 4,
+          initialDelayMs: 500
         });
         steps.push(healthy);
       } else {
@@ -9101,6 +9489,21 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
     }
 
     if (state.name === 'stale_composer') {
+      const captionGuard = await confirmFacebookCaptionBeforeEdit(account, userId, target, text, state, 'facebook_post_stale_caption_guard');
+      steps.push(...captionGuard.steps);
+      if (captionGuard.ok) {
+        textEntered = true;
+        await writeLog(userId, account._id, 'info', 'facebook_post_stale_caption_settled', 'Composer bị nhận diện stale nhưng caption đã ổn định đúng; bỏ qua bước edit để tránh sửa sai nội dung.', {
+          state,
+          guard: captionGuard
+        });
+        await delay(postStepDelay(0.8));
+        continue;
+      }
+      if (!captionGuard.shouldEdit) {
+        return stopFacebookBeforeCaptionEdit(account, userId, target, finalState, steps, state, captionGuard, config.autoSubmit, 'caption_visible_not_verified');
+      }
+
       if (textEntered && isComposerPlaceholderText(state.observedText) && placeholderComposerWaits < 2) {
         placeholderComposerWaits += 1;
         await writeLog(
@@ -9119,43 +9522,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
         continue;
       }
 
-      const editor = await tapTextOrPoint(
-        account,
-        userId,
-        target,
-        state.observedText ? [state.observedText] : composerLabels,
-        { x: 450, y: 360 },
-        'facebook_post_edit_stale_text',
-        { exact: Boolean(state.observedText) }
-      );
-      steps.push(editor);
-      await delay(postStepDelay(1.25));
-      const replace = await replaceFocusedText(target, text, { inputMode: config.textInputMode });
-      await writeLog(userId, account._id, replace.ok ? 'info' : 'error', 'facebook_post_replace_stale_text', replace.ok ? 'Đã thay nội dung draft cũ bằng nội dung mới.' : 'Không thay được nội dung draft cũ.', replace);
-      if (!replace.ok) throw new Error(replace.error || replace.stderr || 'Không thay được nội dung draft cũ.');
-      steps.push(replace);
-      textEntered = true;
-      await delay(postStepDelay(1.25));
-      const verifiedInput = await verifyFacebookComposerCaptionAfterInput(
-        account,
-        userId,
-        target,
-        text,
-        config.textInputMode,
-        'facebook_post_replace_stale_text_verified'
-      );
-      steps.push(...verifiedInput.steps);
-      if (!verifiedInput.ok) {
-        screenshot = await captureScreenshot(account, userId, 'facebook_post_caption_missing_after_replace');
-        throw new Error('Facebook đã mở composer nhưng chưa xác minh được nội dung sau khi nhập. Đã dừng để tránh báo thành công sai.');
-      }
-      const editorState = await detectFacebookState(target, text);
-      if (editorState.name === 'text_editor') {
-        const done = await tapTextOrPoint(account, userId, target, doneLabels, config.doneTap || { x: 844, y: 70 }, 'facebook_post_done_replaced_text', { exact: true });
-        steps.push(done);
-        await delay(postStepDelay(1.25));
-      }
-      continue;
+      return stopFacebookBeforeCaptionEdit(account, userId, target, finalState, steps, state, captionGuard, config.autoSubmit, 'stale_composer_no_edit');
     }
 
     if (state.name === 'ready_to_post') {
@@ -9182,12 +9549,18 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
         continue;
       }
 
-      const repaired = await repairFacebookCaptionIfNeeded(account, userId, target, text, state);
-      if (repaired.changed) {
-        steps.push(...repaired.steps);
+      if (!state.captionVerified) {
+        const captionGuard = await confirmFacebookCaptionBeforeEdit(account, userId, target, text, state, 'facebook_post_ready_caption_no_edit_guard');
+        steps.push(...captionGuard.steps);
+        if (captionGuard.ok) {
+          textEntered = true;
+        } else {
+          return stopFacebookBeforeCaptionEdit(account, userId, target, finalState, steps, state, captionGuard, config.autoSubmit, captionGuard.visibleTargetText
+            ? 'caption_visible_not_verified'
+            : 'caption_not_verified_no_edit');
+        }
+      } else {
         textEntered = true;
-        await delay(postStepDelay(1.25));
-        continue;
       }
 
       if (!config.autoSubmit) {
@@ -9198,6 +9571,8 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
           screenshot,
           steps,
           composerPending: false,
+          submitVerified: false,
+          submitReason: 'review_mode',
           screenshotVerified: screenshotVerification.ok,
           screenshotVerification
         };
@@ -9237,7 +9612,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
         continue;
       }
 
-      const submitted = await submitFacebookPost(
+      const submitted = await submitFacebookPostWithGate(
         account,
         userId,
         target,
@@ -9247,7 +9622,8 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
         'facebook_post_submit_tap',
         imageCount,
         state.submitPoint,
-        mediaKind
+        mediaKind,
+        state
       );
       return submitted;
     }
@@ -9374,12 +9750,18 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
           continue;
         }
 
-        const repaired = await repairFacebookCaptionIfNeeded(account, userId, target, text, state);
-        if (repaired.changed) {
-          steps.push(...repaired.steps);
+        if (!state.captionVerified) {
+          const captionGuard = await confirmFacebookCaptionBeforeEdit(account, userId, target, text, state, 'facebook_post_composer_caption_no_edit_guard');
+          steps.push(...captionGuard.steps);
+          if (captionGuard.ok) {
+            textEntered = true;
+          } else {
+            return stopFacebookBeforeCaptionEdit(account, userId, target, finalState, steps, state, captionGuard, config.autoSubmit, captionGuard.visibleTargetText
+              ? 'caption_visible_not_verified'
+              : 'caption_not_verified_no_edit');
+          }
+        } else {
           textEntered = true;
-          await delay(postStepDelay(1.25));
-          continue;
         }
 
         if (!config.autoSubmit) {
@@ -9390,6 +9772,8 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
             screenshot,
             steps,
             composerPending: false,
+            submitVerified: false,
+            submitReason: 'review_mode',
             screenshotVerified: screenshotVerification.ok,
             screenshotVerification
           };
@@ -9401,7 +9785,7 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
           await delay(postStepDelay(0.8));
           continue;
         }
-        const submitted = await submitFacebookPost(
+        const submitted = await submitFacebookPostWithGate(
           account,
           userId,
           target,
@@ -9411,7 +9795,8 @@ async function runFacebookPostStateMachine(account, userId, target, config, text
           'facebook_post_submit_from_composer',
           imageCount,
           state.submitPoint,
-          mediaKind
+          mediaKind,
+          state
         );
         return submitted;
       }
@@ -9646,71 +10031,164 @@ async function repairFacebookCaptionIfNeeded(account, userId, target, text, stat
     return { changed: false, steps: [], verification: { ok: true, source: 'detect_facebook_state' } };
   }
 
+  const guard = await confirmFacebookCaptionBeforeEdit(account, userId, target, expected, state, 'facebook_post_repair_caption_guard');
+  if (guard.ok) {
+    return { changed: false, steps: guard.steps, verification: guard.verification, guard };
+  }
+  if (!guard.shouldEdit) {
+    await writeLog(
+      userId,
+      account._id,
+      'warn',
+      'facebook_post_repair_caption_skipped_visible_text',
+      'Đã thấy caption mục tiêu trong composer nhưng chưa xác minh tuyệt đối; bỏ qua replace để tránh sửa sai nội dung.',
+      guard
+    );
+    return {
+      changed: false,
+      steps: guard.steps,
+      verification: guard.verification,
+      guard,
+      skipped: true,
+      reason: 'target_text_visible_not_safe_to_edit'
+    };
+  }
+
   const nodes = await dumpVisibleNodes(target);
   const verification = verifyCompleteCaption(nodes, expected);
   if (verification.ok) return { changed: false, steps: [], verification };
 
-  const steps = [];
-  const textNode = findFacebookComposerTextNode(nodes, state);
-  const focusPoint = textNode
-    ? {
-      x: Math.round((textNode.left + textNode.right) / 2),
-      y: Math.round((textNode.top + textNode.bottom) / 2)
-    }
-    : { x: 450, y: 385 };
-
-  const focus = await tapNodeOrPoint(
-    account,
-    userId,
-    target,
-    textNode,
-    focusPoint,
-    'facebook_post_repair_caption_focus',
-    { nodeSource: 'caption_text_node' }
-  );
-  steps.push(focus);
-  await delay(postStepDelay(1.1));
-
-  const replace = await replaceFocusedText(target, expected, { inputMode: 'stable' });
   await writeLog(
     userId,
     account._id,
-    replace.ok ? 'info' : 'error',
-    'facebook_post_repair_caption',
-    replace.ok ? 'Đã nhập lại caption bằng Unicode-safe input.' : 'Không nhập lại được caption Unicode.',
+    'warn',
+    'facebook_post_repair_caption_disabled',
+    'Đã tắt cơ chế repair/replace caption tự động; dừng để retry composer sạch thay vì sửa nội dung trong composer.',
     {
-      ...replace,
       verification,
-      focusPoint,
-      textNode
+      state,
+      visibleLabels: summarizeVisibleLabels(nodes, 16)
     }
-  );
-  steps.push(replace);
-  if (!replace.ok) throw new Error(replace.error || replace.stderr || 'Không nhập lại được caption Unicode.');
-
-  await delay(postStepDelay(1.1));
-  const editorState = await detectFacebookState(target, expected);
-  if (editorState.name === 'text_editor') {
-    const done = await tapTextOrPoint(account, userId, target, doneLabels, { x: 846, y: 72 }, 'facebook_post_done_repaired_caption', { exact: true });
-    steps.push(done);
-    await delay(postStepDelay(1.25));
-  }
-
-  const repairedNodes = await dumpVisibleNodes(target);
-  const repairedVerification = verifyCompleteCaption(repairedNodes, expected);
-  await writeLog(
-    userId,
-    account._id,
-    repairedVerification.ok ? 'info' : 'warn',
-    'facebook_post_repair_caption_verified',
-    repairedVerification.ok ? 'Đã xác nhận caption Unicode đúng sau khi nhập lại.' : 'Caption vẫn chưa khớp hoàn toàn sau khi nhập lại.',
-    repairedVerification
   );
 
   return {
-    changed: true,
+    changed: false,
+    steps: [],
+    verification,
+    skipped: true,
+    reason: 'caption_repair_disabled'
+  };
+}
+
+async function stopFacebookBeforeCaptionEdit(account, userId, target, finalState, steps = [], state = {}, captionGuard = {}, autoSubmit = false, reason = 'caption_not_verified_no_edit') {
+  const screenshot = await captureCleanFacebookReviewScreenshot(account, userId, target, `facebook_post_${reason}`);
+  await writeLog(
+    userId,
+    account._id,
+    'warn',
+    `facebook_post_${reason}`,
+    autoSubmit
+      ? 'Caption chưa đạt gate và tool không edit/replace; dừng trước Đăng để reset/retry composer sạch.'
+      : 'Caption chưa đạt gate và tool không edit/replace; trả screenshot kiểm tra, không sửa nội dung trong composer.',
+    {
+      state,
+      guard: captionGuard,
+      autoSubmit,
+      screenshotOk: Boolean(screenshot?.ok)
+    }
+  );
+  return {
+    finalState,
+    screenshot,
     steps,
-    verification: repairedVerification
+    composerPending: true,
+    submitVerified: false,
+    submitReason: reason,
+    screenshotVerified: false,
+    captionGuard
+  };
+}
+
+async function confirmFacebookCaptionBeforeEdit(account, userId, target, text, state = {}, action = 'facebook_caption_pre_edit_guard') {
+  const expected = cleanClipboardText(text).trim();
+  const steps = [];
+  let lastVerification = null;
+  let lastState = state;
+  let visibleTargetText = Boolean(state.hasTargetText);
+  let observedText = state.observedText || '';
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    if (attempt > 1) {
+      await delay(postStepDelay(0.75));
+      invalidateUiDump(target);
+    }
+    const nodes = await dumpVisibleNodes(target);
+    lastVerification = verifyCompleteCaption(nodes, expected);
+    lastState = await resolveFacebookOpenState(target, await detectFacebookState(target, expected, nodes));
+    visibleTargetText = visibleTargetText || Boolean(lastState.hasTargetText) || screenHasText(nodes, expected);
+    observedText = lastState.observedText || observedText;
+    if (lastVerification.ok || lastState.captionVerified) {
+      await writeLog(
+        userId,
+        account._id,
+        'info',
+        `${action}_pass`,
+        'Caption đã xác minh đúng trước khi cần edit; bỏ qua thao tác sửa nội dung.',
+        {
+          attempt,
+          state: lastState,
+          verification: lastVerification
+        }
+      );
+      return {
+        ok: true,
+        shouldEdit: false,
+        visibleTargetText: true,
+        attempts: attempt,
+        steps,
+        state: lastState,
+        verification: lastVerification
+      };
+    }
+  }
+
+  const normalizedObserved = normalizeSearchText(observedText);
+  const normalizedExpected = normalizeSearchText(expected);
+  const observedIsDifferentDraft = Boolean(
+    normalizedObserved
+    && normalizedExpected
+    && !isComposerPlaceholderText(normalizedObserved)
+    && normalizedObserved !== normalizedExpected
+    && !normalizedObserved.includes(normalizedExpected)
+  );
+  const shouldEdit = Boolean(!visibleTargetText || observedIsDifferentDraft);
+  await writeLog(
+    userId,
+    account._id,
+    shouldEdit ? 'info' : 'warn',
+    `${action}_result`,
+    shouldEdit
+      ? 'Không thấy caption mục tiêu trong composer; cho phép edit/replace nội dung.'
+      : 'Caption mục tiêu đang hiển thị nhưng verifier chưa xác minh tuyệt đối; không edit để tránh làm sai nội dung.',
+    {
+      state: lastState,
+      verification: lastVerification,
+      visibleTargetText,
+      observedText,
+      observedIsDifferentDraft,
+      shouldEdit
+    }
+  );
+
+  return {
+    ok: false,
+    shouldEdit,
+    visibleTargetText,
+    observedIsDifferentDraft,
+    attempts: 3,
+    steps,
+    state: lastState,
+    verification: lastVerification
   };
 }
 
@@ -9737,7 +10215,7 @@ async function waitForFacebookMediaComposer(target, text, mediaKind = 'image', t
     attempt += 1;
     invalidateUiDump(target);
     const nodes = await dumpVisibleNodes(target);
-    lastState = await detectFacebookState(target, text, nodes);
+    lastState = await resolveFacebookOpenState(target, await detectFacebookState(target, text, nodes));
     const hasTargetText = screenHasText(nodes, text);
     const hasAttachedMedia = hasFacebookAttachedMediaEvidence(nodes, mediaKind, lastState);
     const textRequirementOk = mediaKind === 'image' ? true : hasTargetText;
@@ -9778,8 +10256,103 @@ async function waitForFacebookMediaComposer(target, text, mediaKind = 'image', t
   };
 }
 
+async function submitFacebookPostWithGate(account, userId, target, config, text, steps, action, mediaCount = 0, knownSubmitPoint = null, mediaKind = 'image', state = {}) {
+  const nodes = await dumpVisibleNodes(target);
+  const refreshedState = await resolveFacebookOpenState(target, await detectFacebookState(target, text, nodes));
+  const gate = await validateFacebookPreSubmitGate(
+    account,
+    userId,
+    target,
+    nodes,
+    refreshedState?.name ? refreshedState : state,
+    text,
+    mediaCount,
+    mediaKind,
+    knownSubmitPoint
+  );
+  if (!gate.ok) {
+    const screenshot = await captureScreenshot(account, userId, 'facebook_post_pre_submit_gate_failed');
+    await writeLog(
+      userId,
+      account._id,
+      'warn',
+      'facebook_post_pre_submit_gate_failed',
+      'Dừng trước khi bấm Đăng vì pre-submit gate Facebook chưa đạt; phiên này có thể recover/retry an toàn.',
+      gate
+    );
+    return {
+      finalState: gate.state?.name || state?.name || 'pre_submit_gate_failed',
+      screenshot,
+      steps,
+      composerPending: true,
+      submitVerified: false,
+      submitReason: 'pre_submit_gate_failed',
+      preSubmitGate: gate
+    };
+  }
+  await writeLog(userId, account._id, 'info', 'facebook_post_pre_submit_gate_pass', 'Pre-submit gate Facebook đạt điều kiện, chuẩn bị bấm Đăng.', gate);
+  return submitFacebookPost(account, userId, target, config, text, steps, action, mediaCount, gate.submitPoint || knownSubmitPoint, mediaKind);
+}
+
+async function validateFacebookPreSubmitGate(account, userId, target, nodes = [], state = {}, text = '', mediaCount = 0, mediaKind = 'image', knownSubmitPoint = null) {
+  const foreground = await getForegroundAndroidPackage(target);
+  const expectedText = cleanClipboardText(text).trim();
+  const submitNode = findSemanticSubmitButton(nodes);
+  const submitPoint = submitNode
+    ? {
+      x: Math.round((submitNode.left + submitNode.right) / 2),
+      y: Math.round((submitNode.top + submitNode.bottom) / 2)
+    }
+    : (state.submitPoint || knownSubmitPoint || null);
+  const captionVerification = verifyCompleteCaption(nodes, expectedText);
+  const captionRequired = Boolean(expectedText);
+  const attachedMedia = hasFacebookAttachedMediaEvidence(nodes, mediaKind, state) || Boolean(state.hasAttachedImage);
+  const checks = {
+    foregroundOk: foreground.packageName === defaultPackages.facebook,
+    stateOk: ['ready_to_post', 'composer'].includes(state.name),
+    captionOk: !captionRequired || Boolean(state.captionVerified || captionVerification.ok),
+    mediaOk: Number(mediaCount || 0) <= 0 || attachedMedia,
+    submitOk: Boolean(submitPoint)
+  };
+  const failedChecks = Object.entries(checks)
+    .filter(([, ok]) => !ok)
+    .map(([name]) => name);
+  return {
+    ok: failedChecks.length === 0,
+    failedChecks,
+    checks,
+    foreground,
+    state: {
+      name: state.name,
+      reason: state.reason,
+      hasTargetText: Boolean(state.hasTargetText),
+      captionVerified: Boolean(state.captionVerified),
+      hasAttachedImage: Boolean(state.hasAttachedImage),
+      submitPoint: state.submitPoint || null,
+      nextPoint: state.nextPoint || null
+    },
+    submitPoint,
+    expected: {
+      mediaCount: Number(mediaCount || 0),
+      mediaKind,
+      captionRequired,
+      textPreview: expectedText.slice(0, 80)
+    },
+    evidence: {
+      submitLabel: submitNode?.label || submitNode?.text || submitNode?.desc || '',
+      captionVerification,
+      attachedMedia,
+      visibleLabels: summarizeVisibleLabels(nodes, 16)
+    }
+  };
+}
+
 async function submitFacebookPost(account, userId, target, config, text, steps, action, mediaCount = 0, knownSubmitPoint = null, mediaKind = 'image') {
-  const submitAttempts = await buildSubmitTapAttempts(target, knownSubmitPoint);
+  const aiLabel = await enableFacebookAiLabelIfRequired(account, userId, target);
+  steps.push(aiLabel);
+  if (aiLabel.changed) await delay(postStepDelay(0.8));
+
+  const submitAttempts = (await buildSubmitTapAttempts(target, knownSubmitPoint)).slice(0, 1);
   let submitAccepted = false;
   let submitProgressSeen = false;
 
@@ -9794,7 +10367,7 @@ async function submitFacebookPost(account, userId, target, config, text, steps, 
     );
     steps.push(submit);
 
-    await delay(index === 0 ? (mediaCount > 0 ? 2_500 : 450) : (mediaCount > 0 ? 1_500 : 700));
+    await delay(index === 0 ? (mediaCount > 0 ? 2_500 : 2_800) : (mediaCount > 0 ? 1_500 : 1_200));
     const nodes = await dumpVisibleNodes(target);
     const progress = findPostingProgressNode(nodes);
     const confirmation = findNodeInNodes(nodes, postedConfirmationLabels);
@@ -9838,8 +10411,8 @@ async function submitFacebookPost(account, userId, target, config, text, steps, 
           userId,
           account._id,
           'warn',
-          'facebook_post_submit_button_returned',
-          'Nút Đăng chỉ tạm ẩn khi video đang hoàn tất tải; tiếp tục thử lại sau khi composer ổn định.',
+          'facebook_post_submit_button_returned_no_retry',
+          'Sau khi đã tap Đăng, nút Đăng còn/hiện lại; không tap lại để tránh đăng trùng, chuyển sang xác minh.',
           {
             attempt: index + 1,
             method: attempt.method,
@@ -9847,8 +10420,8 @@ async function submitFacebookPost(account, userId, target, config, text, steps, 
             state: transitionState
           }
         );
-        await delay(900);
-        continue;
+        submitAccepted = true;
+        break;
       }
       await writeLog(
         userId,
@@ -9865,15 +10438,16 @@ async function submitFacebookPost(account, userId, target, config, text, steps, 
       break;
     }
 
-    await writeLog(userId, account._id, 'warn', 'facebook_post_submit_retry', submitStillVisible
-      ? 'Nút đăng vẫn còn hiển thị, thử bấm lại.'
-      : 'Chưa thấy tín hiệu Facebook nhận bài, kiểm tra lại trước khi thử bấm lần nữa.', {
+    await writeLog(userId, account._id, 'warn', 'facebook_post_submit_no_retry_after_tap', submitStillVisible
+      ? 'Nút đăng vẫn còn hiển thị sau tap đầu; không bấm lại để tránh đăng trùng.'
+      : 'Chưa thấy tín hiệu Facebook nhận bài sau tap đầu; không bấm lại, chuyển sang xác minh.', {
       attempt: index + 1,
       point: attempt.point,
       method: attempt.method,
       matchedSubmit: submitStillVisible
     });
-    await delay(postStepDelay());
+    submitAccepted = Boolean(submit.ok);
+    break;
   }
 
   const verification = await verifyFacebookPostSubmit(
@@ -9903,7 +10477,71 @@ async function submitFacebookPost(account, userId, target, config, text, steps, 
     steps,
     composerPending: verification?.composerPending ?? true,
     submitVerified: Boolean(verification?.ok),
-    submitReason: verification?.reason || ''
+    submitReason: verification?.reason || '',
+    submitTapped: submitAccepted
+  };
+}
+
+async function enableFacebookAiLabelIfRequired(account, userId, target) {
+  const nodes = await dumpVisibleNodes(target);
+  const hasAiRequirement = Boolean(findNodeInNodes(nodes, facebookAiLabelLabels, { exact: false }));
+  if (!hasAiRequirement) return { ok: true, skipped: true, reason: 'ai_label_not_visible' };
+
+  const switchNode = nodes
+    .filter((node) => {
+      const className = String(node.className || '');
+      if (!/Switch|CheckBox|Toggle/i.test(className) && !node.clickable) return false;
+      const width = Math.max(0, Number(node.right) - Number(node.left));
+      const height = Math.max(0, Number(node.bottom) - Number(node.top));
+      return width >= 40
+        && height >= 30
+        && Number(node.right) >= 500
+        && Number(node.top) >= 700;
+    })
+    .sort((a, b) => (b.right - a.right) || (b.bottom - a.bottom))[0];
+
+  if (!switchNode?.bounds) {
+    await writeLog(userId, account._id, 'warn', 'facebook_post_ai_label_toggle_missing', 'Facebook yêu cầu AI label nhưng không tìm thấy toggle để bật.', {
+      labels: summarizeVisibleLabels(nodes, 20)
+    });
+    return { ok: false, changed: false, reason: 'ai_label_toggle_missing' };
+  }
+
+  if (switchNode.checked) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'ai_label_already_enabled',
+      toggle: switchNode.bounds
+    };
+  }
+
+  const point = nodeToPoint(switchNode);
+  const tap = await tapAndLog(userId, account._id, target, 'facebook_post_enable_ai_label', point);
+  await delay(postStepDelay(0.6));
+  const afterNodes = await dumpVisibleNodes(target);
+  const afterSwitch = afterNodes
+    .filter((node) => /Switch|CheckBox|Toggle/i.test(String(node.className || '')) || node.clickable)
+    .filter((node) => Number(node.right) >= 500 && Number(node.top) >= 700)
+    .sort((a, b) => (b.right - a.right) || (b.bottom - a.bottom))[0];
+  const enabled = Boolean(afterSwitch?.checked);
+  await writeLog(
+    userId,
+    account._id,
+    enabled ? 'info' : 'warn',
+    'facebook_post_ai_label_enabled',
+    enabled
+      ? 'Đã bật AI label trước khi bấm Post.'
+      : 'Đã tap AI label nhưng chưa xác nhận được toggle đã bật.',
+    { point, before: switchNode.bounds, after: afterSwitch?.bounds || null, tap }
+  );
+
+  return {
+    ok: tap.ok,
+    changed: true,
+    enabled,
+    point,
+    tap
   };
 }
 
@@ -9990,6 +10628,49 @@ function hasFacebookAttachedMediaEvidence(nodes = [], mediaKind = 'image', state
   });
 }
 
+function isFacebookMainTabActivity(active = {}) {
+  return active?.packageName === defaultPackages.facebook
+    && /(?:FbMainTabActivity|MainTab|NewsFeed|Feed)/i.test(active?.activityName || '');
+}
+
+function hasExpectedTextInEditor(nodes = [], expectedText = '') {
+  if (!expectedText) return false;
+  return nodes.some((node) => (
+    String(node.className || '').includes('EditText')
+    && screenHasText([node], expectedText)
+  ));
+}
+
+function hasVisibleFacebookComposerTitle(nodes = []) {
+  const composerTitleNode = findNodeInNodes(nodes, postTitleLabels);
+  return Boolean(composerTitleNode && Number(composerTitleNode.top) < 180);
+}
+
+function detectFacebookMainTabPublishedText(nodes = [], text = '', state = {}) {
+  const expectedText = cleanClipboardText(text).trim();
+  if (!expectedText || !screenHasText(nodes, expectedText)) {
+    return { ok: false, reason: 'expected_text_not_visible' };
+  }
+  if (!isFacebookMainTabActivity(state?.active)) {
+    return { ok: false, reason: 'not_facebook_main_tab' };
+  }
+  if (hasExpectedTextInEditor(nodes, expectedText)) {
+    return { ok: false, reason: 'expected_text_still_in_editor' };
+  }
+  if (hasVisibleFacebookComposerTitle(nodes)) {
+    return { ok: false, reason: 'composer_title_visible' };
+  }
+  if (state?.submitPoint || state?.nextPoint) {
+    return { ok: false, reason: 'composer_action_visible' };
+  }
+  return {
+    ok: true,
+    reason: 'main_tab_activity_with_expected_text',
+    hasTargetText: true,
+    active: state.active
+  };
+}
+
 function isFacebookSubmitLabelMatch(value, label) {
   if (!value || !label) return false;
   if (value === label) return true;
@@ -10068,7 +10749,7 @@ async function verifyFacebookPostSubmit(
       break;
     }
 
-    lastState = await detectFacebookState(target, text, nodes);
+    lastState = await resolveFacebookOpenState(target, await detectFacebookState(target, text, nodes));
     if (lastState.name === 'blocked') {
       const screenshot = await captureScreenshot(account, userId, 'facebook_post_submit_blocked');
       await writeLog(userId, account._id, 'error', 'facebook_post_submit_blocked', 'Facebook chuyển sang đăng nhập/checkpoint sau khi bấm Đăng.', {
@@ -10078,13 +10759,36 @@ async function verifyFacebookPostSubmit(
       return { ok: false, reason: 'blocked_after_submit', screenshot, composerPending: true, finalState: 'blocked' };
     }
 
+    const mainTabPublishedText = sawPostingProgress
+      ? detectFacebookMainTabPublishedText(nodes, text, lastState)
+      : { ok: false, reason: 'no_posting_progress_seen' };
+    if (mainTabPublishedText.ok) {
+      const screenshot = await captureScreenshot(account, userId, 'facebook_published_post_verified');
+      await writeLog(userId, account._id, 'info', 'facebook_post_submit_verified', 'Facebook đã đăng xong và quay về feed có đúng nội dung bài vừa đăng.', {
+        attempt,
+        elapsedMs: Date.now() - verificationStartedAt,
+        mediaCount,
+        mediaKind,
+        sawPostingProgress,
+        state: lastState,
+        detailEvidence: mainTabPublishedText,
+        screenshotVerified: true,
+        method: 'main_tab_expected_text_after_posting'
+      });
+      return {
+        ok: true,
+        reason: 'upload_completed_main_tab_with_expected_text',
+        screenshot,
+        screenshotVerified: true,
+        composerPending: false,
+        finalState: 'submitted'
+      };
+    }
+
     if (!['ready_to_post', 'composer', 'text_editor', 'stale_composer'].includes(lastState.name)) {
       const expectedText = cleanClipboardText(text).trim();
       const hasExpectedText = expectedText && screenHasText(nodes, expectedText);
-      const expectedTextInEditor = nodes.some((node) => (
-        node.className.includes('EditText')
-        && screenHasText([node], expectedText)
-      ));
+      const expectedTextInEditor = hasExpectedTextInEditor(nodes, expectedText);
       const publishedDetail = detectFacebookPublishedPostDetail(nodes, text, lastState);
       if ((lastState.name === 'home' && hasExpectedText && !expectedTextInEditor) || publishedDetail.ok) {
         const screenshot = await captureScreenshot(account, userId, 'facebook_published_post_verified');
@@ -10280,10 +10984,7 @@ async function captureFacebookPublishedPostEvidence(account, userId, target, tex
     if (findPostingProgressNode(nodes)) uploadInProgress = true;
     const state = await detectFacebookState(target, expectedText, nodes);
     const hasExpectedText = screenHasText(nodes, expectedText);
-    const expectedTextInEditor = nodes.some((node) => (
-      node.className.includes('EditText')
-      && screenHasText([node], expectedText)
-    ));
+    const expectedTextInEditor = hasExpectedTextInEditor(nodes, expectedText);
     const publishedDetail = detectFacebookPublishedPostDetail(nodes, expectedText, state);
     if ((state.name === 'home' && hasExpectedText && !expectedTextInEditor) || publishedDetail.ok) {
       const screenshot = await captureScreenshot(account, userId, 'facebook_published_post_verified');
@@ -10333,6 +11034,12 @@ async function captureFacebookPublishedPostEvidence(account, userId, target, tex
     await delay(attempt < 3 ? 700 : 1_000);
   }
 
+  const profileEvidence = await captureFacebookPublishedPostEvidenceFromProfile(account, userId, target, expectedText);
+  if (profileEvidence.verified) {
+    return profileEvidence;
+  }
+  uploadInProgress = uploadInProgress || Boolean(profileEvidence.uploadInProgress);
+
   await writeLog(
     userId,
     account._id,
@@ -10347,8 +11054,272 @@ async function captureFacebookPublishedPostEvidence(account, userId, target, tex
     screenshot: null,
     verified: false,
     uploadInProgress,
-    reason: uploadInProgress ? 'background_upload_in_progress' : 'published_text_not_visible'
+    reason: uploadInProgress ? 'background_upload_in_progress' : (profileEvidence.reason || 'published_text_not_visible')
   };
+}
+
+async function captureFacebookPublishedPostEvidenceFromProfile(account, userId, target, expectedText = '') {
+  const expected = cleanClipboardText(expectedText).trim();
+  if (!expected) return { screenshot: null, verified: false, reason: 'empty_post_text' };
+
+  const openProfile = await openFacebookProfileEvidenceSurface(account, userId, target);
+  await delay(1_400);
+  invalidateUiDump(target);
+  let uploadInProgress = false;
+
+  for (let attempt = 1; attempt <= 7; attempt += 1) {
+    const nodes = await dumpVisibleNodes(target);
+    if (findPostingProgressNode(nodes)) uploadInProgress = true;
+    const state = await detectFacebookState(target, expected, nodes);
+    const hasExpectedText = screenHasText(nodes, expected);
+    const expectedTextInEditor = hasExpectedTextInEditor(nodes, expected);
+    const publishedDetail = detectFacebookPublishedPostDetail(nodes, expected, state);
+    if (hasExpectedText && !expectedTextInEditor) {
+      const screenshot = await captureScreenshot(account, userId, 'facebook_profile_published_post_verified');
+      await writeLog(
+        userId,
+        account._id,
+        'info',
+        'facebook_profile_published_post_evidence_verified',
+        publishedDetail.ok
+          ? 'Đã đối chiếu đúng bài text trên trang cá nhân.'
+          : 'Đã thấy đúng nội dung bài text trên bề mặt profile sau khi feed không hiển thị bài mới.',
+        {
+          attempt,
+          openProfile,
+          state,
+          detailEvidence: publishedDetail,
+          textPreview: expected.slice(0, 80)
+        }
+      );
+      return {
+        screenshot,
+        verified: true,
+        reason: publishedDetail.ok ? 'profile_published_post_detail_visible' : 'profile_published_text_visible',
+        attempt,
+        openProfile
+      };
+    }
+
+    if (attempt === 2) {
+      await pullRefreshFacebookSurface(target, nodes);
+    } else if (attempt === 4 || attempt === 6) {
+      await scrollFacebookSurfaceDown(target, nodes);
+    }
+    invalidateUiDump(target);
+    await delay(attempt < 3 ? 800 : 1_100);
+  }
+
+  await writeLog(
+    userId,
+    account._id,
+    'warn',
+    'facebook_profile_published_post_evidence_pending',
+    'Feed không hiện bài text mới và profile fallback cũng chưa thấy nội dung để xác minh.',
+    {
+      openProfile,
+      textPreview: expected.slice(0, 80),
+      uploadInProgress
+    }
+  );
+  return {
+    screenshot: null,
+    verified: false,
+    uploadInProgress,
+    reason: uploadInProgress ? 'background_upload_in_progress' : 'profile_published_text_not_visible',
+    openProfile
+  };
+}
+
+async function openFacebookProfileEvidenceSurface(account, userId, target) {
+  const handle = normalizeFacebookAccountHandle(account?.accountHandle || account?.metadata?.profile?.link || account?.metadata?.profileUrl || '');
+  if (handle) {
+    const profileUrl = /^https?:\/\//i.test(handle) ? handle : `https://www.facebook.com/${handle}`;
+    const deepLink = `fb://facewebmodal/f?href=${encodeURIComponent(profileUrl)}`;
+    const launch = await runCommand(env.mobileAutomation.adbPath, [
+      '-s',
+      target,
+      'shell',
+      'am',
+      'start',
+      '-W',
+      '-a',
+      'android.intent.action.VIEW',
+      '-d',
+      deepLink,
+      '-p',
+      defaultPackages.facebook,
+      '-f',
+      '0x14000000'
+    ], { timeoutMs: 12_000 });
+    await writeLog(
+      userId,
+      account._id,
+      launch.ok ? 'info' : 'warn',
+      'facebook_profile_evidence_deeplink',
+      launch.ok ? 'Đã mở profile Facebook bằng accountHandle để xác minh bài text.' : 'Không mở được profile bằng accountHandle; fallback sang Home/avatar.',
+      { handle, profileUrl, launch }
+    );
+    if (launch.ok && !/error:|unable to resolve|not found/i.test(`${launch.stdout || ''}\n${launch.stderr || ''}`)) {
+      return { ok: true, method: 'profile_deeplink', handle, profileUrl, launch };
+    }
+  }
+
+  const home = await launchFacebookWarm(target, defaultPackages.facebook);
+  await delay(1_200);
+  invalidateUiDump(target);
+  const nodes = await dumpVisibleNodes(target);
+  const size = getScreenBoundsFromNodes(nodes);
+  const targetNode = findFacebookProfileTabNode(nodes, size) || findFacebookHomeProfileAvatar(nodes, size);
+  const method = targetNode?.profileEvidenceMethod || (targetNode ? 'home_avatar_node' : 'profile_tab_fallback_point');
+  const point = targetNode
+    ? nodeToPoint(targetNode)
+    : { x: Math.round(size.width * 0.93), y: Math.round(size.height * 0.09) };
+  const tap = await tapAndLog(userId, account._id, target, 'facebook_profile_evidence_tap_profile', point, {
+    timeoutMs: 8_000
+  });
+  await delay(1_200);
+  invalidateUiDump(target);
+  const afterTapNodes = await dumpVisibleNodes(target);
+  const stillHome = Boolean(findNodeInNodes(afterTapNodes, composerLabels) || findNodeInNodes(afterTapNodes, facebookHomeLabels));
+  let fallbackTap = null;
+  if (tap.ok && stillHome && method !== 'home_avatar_node') {
+    const avatar = findFacebookHomeProfileAvatar(afterTapNodes, getScreenBoundsFromNodes(afterTapNodes));
+    if (avatar) {
+      fallbackTap = await tapAndLog(userId, account._id, target, 'facebook_profile_evidence_tap_avatar_fallback', nodeToPoint(avatar), {
+        timeoutMs: 8_000
+      });
+      await delay(1_000);
+      invalidateUiDump(target);
+    }
+  }
+  await writeLog(
+    userId,
+    account._id,
+    tap.ok || fallbackTap?.ok ? 'info' : 'warn',
+    'facebook_profile_evidence_navigation',
+    tap.ok || fallbackTap?.ok ? 'Đã mở bề mặt profile Facebook để xác minh bài text.' : 'Không mở được bề mặt profile Facebook.',
+    {
+      home,
+      method,
+      targetNode,
+      point,
+      tap,
+      stillHomeAfterTap: stillHome,
+      fallbackTap
+    }
+  );
+  return { ok: Boolean(tap.ok || fallbackTap?.ok), method: fallbackTap?.ok ? 'home_avatar_fallback_after_profile_tab' : method, home, targetNode, point, tap, stillHomeAfterTap: stillHome, fallbackTap };
+}
+
+function normalizeFacebookAccountHandle(value = '') {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  if (/^https?:\/\//i.test(raw)) return raw;
+  return raw
+    .replace(/^@+/, '')
+    .replace(/^facebook\.com\//i, '')
+    .replace(/^www\.facebook\.com\//i, '')
+    .replace(/^\/+|\/+$/g, '')
+    .trim();
+}
+
+function findFacebookHomeProfileAvatar(nodes = [], size = {}) {
+  const width = Number(size.width || 720);
+  const height = Number(size.height || 1280);
+  const topMin = Math.round(height * 0.09);
+  const topMax = Math.round(height * 0.34);
+  return nodes
+    .filter((node) => {
+      const className = String(node.className || '');
+      if (!/ImageView|Button|ViewGroup/i.test(className)) return false;
+      const left = Number(node.left);
+      const top = Number(node.top);
+      const right = Number(node.right);
+      const bottom = Number(node.bottom);
+      const nodeWidth = Math.max(0, right - left);
+      const nodeHeight = Math.max(0, bottom - top);
+      if (left > Math.round(width * 0.24)) return false;
+      if (top < topMin || top > topMax) return false;
+      if (nodeWidth < 28 || nodeHeight < 28 || nodeWidth > 140 || nodeHeight > 140) return false;
+      const label = normalizeSearchText(`${node.text} ${node.desc} ${node.resourceId}`);
+      return node.clickable || /profile|avatar|ảnh đại diện|anh dai dien|trang cá nhân|trang ca nhan/i.test(label);
+    })
+    .sort((a, b) => Number(a.top) - Number(b.top))[0] || null;
+}
+
+function findFacebookProfileTabNode(nodes = [], size = {}) {
+  const width = Number(size.width || 720);
+  const height = Number(size.height || 1280);
+  const topMax = Math.round(height * 0.17);
+  const rightMin = Math.round(width * 0.72);
+  const labelMatches = nodes
+    .filter((node) => {
+      const label = normalizeSearchText(`${node.text} ${node.desc} ${node.resourceId} ${node.raw}`);
+      if (!/profile|trang ca nhan|trang cá nhân|account|tai khoan|tài khoản/i.test(label)) return false;
+      if (Number(node.top) > Math.round(height * 0.28)) return false;
+      return Boolean(node.clickable || /Button|ImageView|ViewGroup/i.test(String(node.className || '')));
+    })
+    .map((node) => ({ ...node, profileEvidenceMethod: 'profile_tab_label' }));
+  if (labelMatches.length) {
+    return labelMatches.sort((a, b) => Number(b.right) - Number(a.right))[0];
+  }
+
+  return nodes
+    .filter((node) => {
+      const className = String(node.className || '');
+      if (!/ImageView|Button|ViewGroup/i.test(className)) return false;
+      const left = Number(node.left);
+      const top = Number(node.top);
+      const right = Number(node.right);
+      const bottom = Number(node.bottom);
+      const nodeWidth = Math.max(0, right - left);
+      const nodeHeight = Math.max(0, bottom - top);
+      if (left < rightMin || top > topMax) return false;
+      if (nodeWidth < 24 || nodeHeight < 24 || nodeWidth > 110 || nodeHeight > 110) return false;
+      return Boolean(node.clickable || /profile|tab|navigation|shortcut/i.test(`${node.resourceId || ''} ${node.desc || ''} ${node.raw || ''}`));
+    })
+    .sort((a, b) => Number(b.right) - Number(a.right))
+    .map((node) => ({ ...node, profileEvidenceMethod: 'profile_tab_geometry' }))[0] || null;
+}
+
+function getScreenBoundsFromNodes(nodes = []) {
+  return {
+    width: nodes.reduce((maximum, node) => Math.max(maximum, Number(node.right) || 0), 720) || 720,
+    height: nodes.reduce((maximum, node) => Math.max(maximum, Number(node.bottom) || 0), 1280) || 1280
+  };
+}
+
+async function pullRefreshFacebookSurface(target, nodes = []) {
+  const size = getScreenBoundsFromNodes(nodes);
+  return runCommand(env.mobileAutomation.adbPath, [
+    '-s',
+    target,
+    'shell',
+    'input',
+    'swipe',
+    String(Math.round(size.width * 0.5)),
+    String(Math.round(size.height * 0.24)),
+    String(Math.round(size.width * 0.5)),
+    String(Math.round(size.height * 0.68)),
+    '500'
+  ], { timeoutMs: 8_000 });
+}
+
+async function scrollFacebookSurfaceDown(target, nodes = []) {
+  const size = getScreenBoundsFromNodes(nodes);
+  return runCommand(env.mobileAutomation.adbPath, [
+    '-s',
+    target,
+    'shell',
+    'input',
+    'swipe',
+    String(Math.round(size.width * 0.5)),
+    String(Math.round(size.height * 0.78)),
+    String(Math.round(size.width * 0.5)),
+    String(Math.round(size.height * 0.34)),
+    '520'
+  ], { timeoutMs: 8_000 });
 }
 
 function findPostingProgressNode(nodes) {
@@ -11127,14 +12098,11 @@ function detectFacebookPublishedPostDetail(nodes = [], text = '', state = {}) {
     return { ok: false, reason: 'expected_text_not_visible' };
   }
 
-  const expectedTextInEditor = nodes.some((node) => (
-    node.className.includes('EditText')
-    && screenHasText([node], expectedText)
-  ));
-  if (expectedTextInEditor) return { ok: false, reason: 'expected_text_still_in_editor' };
+  if (hasExpectedTextInEditor(nodes, expectedText)) {
+    return { ok: false, reason: 'expected_text_still_in_editor' };
+  }
 
-  const hasPostComposerTitle = Boolean(findNodeInNodes(nodes, postTitleLabels));
-  if (hasPostComposerTitle || ['ready_to_post', 'composer', 'text_editor', 'stale_composer'].includes(state?.name)) {
+  if (hasVisibleFacebookComposerTitle(nodes) || ['ready_to_post', 'composer', 'text_editor', 'stale_composer'].includes(state?.name)) {
     return { ok: false, reason: 'composer_still_visible' };
   }
 

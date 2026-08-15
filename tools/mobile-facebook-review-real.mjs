@@ -10,17 +10,23 @@ const args = parseArgs(process.argv.slice(2));
 const text = args.text
   || `test composer khong dang that ${new Date().toISOString().slice(0, 19).replace('T', ' ')}`;
 const images = await Promise.all(args.images.map((image) => resolveUploadImage(image)));
+const instanceName = args.instanceName || 'LDPlayer';
+const deviceId = args.deviceId || 'emulator-5554';
+const adbHost = args.adbHost || '';
+const label = args.label || '01';
+const autoSubmit = parseBooleanFlag(args.autoSubmit);
+const waitAfterSubmitMs = Math.max(0, Number(args.waitAfterSubmitMs || (autoSubmit ? 90_000 : 0)));
 
 const account = {
-  _id: 'facebook-account-01-real-review',
-  id: 'facebook-account-01-real-review',
+  _id: `facebook-account-${label}-real-review`,
+  id: `facebook-account-${label}-real-review`,
   userId: 'manual-test-user',
   platform: 'facebook',
-  displayName: 'Facebook Account 01',
+  displayName: `Facebook Account ${label}`,
   accountHandle: '',
-  instanceName: 'LDPlayer',
-  adbHost: '',
-  deviceId: 'emulator-5554',
+  instanceName,
+  adbHost,
+  deviceId,
   status: 'ready',
   notes: 'Manual real composer review test.',
   metadata: {
@@ -33,13 +39,13 @@ let result = null;
 let closeResult = null;
 
 try {
-  console.log(`Starting Facebook composer review. autoSubmit=false text="${text}" images=${images.length}`);
+  console.log(`Starting Facebook composer ${autoSubmit ? 'publish' : 'review'}. autoSubmit=${autoSubmit} text="${text}" images=${images.length}`);
   result = await publishFacebookPostViaMobile(account, account.userId, {
     text,
     appPackage: 'com.facebook.katana',
-    autoSubmit: false,
+    autoSubmit,
     textInputMode: 'stable',
-    waitAfterSubmitMs: 0,
+    waitAfterSubmitMs,
     images,
     videos: []
   });
@@ -73,7 +79,7 @@ try {
   }, null, 2));
   process.exitCode = 1;
 } finally {
-  console.log('Closing LDPlayer session after composer review.');
+  console.log(`Closing LDPlayer session after composer ${autoSubmit ? 'publish' : 'review'}.`);
   closeResult = await closeAccountSession(account, account.userId, 'com.facebook.katana').catch((error) => ({
     ok: false,
     error: error.message
@@ -98,7 +104,13 @@ async function saveScreenshot(screenshot) {
 function parseArgs(argv) {
   const parsed = {
     images: [],
-    text: ''
+    text: '',
+    instanceName: '',
+    deviceId: '',
+    adbHost: '',
+    label: '',
+    autoSubmit: false,
+    waitAfterSubmitMs: ''
   };
   const textParts = [];
 
@@ -122,11 +134,69 @@ function parseArgs(argv) {
       parsed.text = arg.slice('--text='.length);
       continue;
     }
+    if (arg === '--instanceName') {
+      parsed.instanceName = argv[index + 1] || '';
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith('--instanceName=')) {
+      parsed.instanceName = arg.slice('--instanceName='.length);
+      continue;
+    }
+    if (arg === '--deviceId') {
+      parsed.deviceId = argv[index + 1] || '';
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith('--deviceId=')) {
+      parsed.deviceId = arg.slice('--deviceId='.length);
+      continue;
+    }
+    if (arg === '--adbHost') {
+      parsed.adbHost = argv[index + 1] || '';
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith('--adbHost=')) {
+      parsed.adbHost = arg.slice('--adbHost='.length);
+      continue;
+    }
+    if (arg === '--label') {
+      parsed.label = argv[index + 1] || '';
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith('--label=')) {
+      parsed.label = arg.slice('--label='.length);
+      continue;
+    }
+    if (arg === '--autoSubmit') {
+      parsed.autoSubmit = true;
+      continue;
+    }
+    if (arg.startsWith('--autoSubmit=')) {
+      parsed.autoSubmit = arg.slice('--autoSubmit='.length);
+      continue;
+    }
+    if (arg === '--waitAfterSubmitMs') {
+      parsed.waitAfterSubmitMs = argv[index + 1] || '';
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith('--waitAfterSubmitMs=')) {
+      parsed.waitAfterSubmitMs = arg.slice('--waitAfterSubmitMs='.length);
+      continue;
+    }
     textParts.push(arg);
   }
 
   if (!parsed.text) parsed.text = textParts.join(' ').trim();
   return parsed;
+}
+
+function parseBooleanFlag(value) {
+  if (value === true) return true;
+  return /^(1|true|yes|y)$/i.test(String(value || ''));
 }
 
 function splitImageArgs(value = '') {

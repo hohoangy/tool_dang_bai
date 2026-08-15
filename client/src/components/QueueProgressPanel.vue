@@ -11,11 +11,15 @@ defineProps({
   progressPercent: {
     type: Number,
     default: 0
+  },
+  reviewMode: {
+    type: Boolean,
+    default: false
   }
 });
 
-function statusLabel(status) {
-  if (status === 'done') return 'xong';
+function statusLabel(status, reviewMode = false) {
+  if (status === 'done') return reviewMode ? 'đúng nội dung' : 'xong';
   if (status === 'failed') return 'lỗi';
   if (status === 'review') return 'kiểm tra';
   if (status === 'running') return 'đang chạy';
@@ -29,7 +33,9 @@ function statusLabel(status) {
     <div class="mb-3 flex items-center justify-between gap-3">
       <div>
         <p class="text-xs font-extrabold uppercase tracking-wide text-zinc-500">Tiến trình đăng</p>
-        <h3 class="mt-1 font-extrabold">{{ stats.done }} xong · {{ stats.review }} cần kiểm tra · {{ stats.failed }} lỗi</h3>
+        <h3 class="mt-1 font-extrabold">
+          {{ stats.done }} {{ reviewMode ? 'đúng nội dung' : 'xong' }} · {{ stats.review }} cần kiểm tra · {{ stats.failed }} lỗi
+        </h3>
       </div>
       <span class="rounded-full bg-zinc-100 px-3 py-1 text-xs font-extrabold text-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
         {{ stats.total }} lượt
@@ -51,7 +57,7 @@ function statusLabel(status) {
               item.status === 'done' ? 'bg-emerald-100 text-emerald-700' : item.status === 'failed' ? 'bg-red-100 text-red-700' : item.status === 'review' ? 'bg-amber-100 text-amber-700' : item.status === 'running' ? 'bg-sky-100 text-sky-700' : 'bg-zinc-100 text-zinc-700'
             ]"
           >
-            {{ statusLabel(item.status) }}
+            {{ statusLabel(item.status, reviewMode) }}
           </span>
         </div>
         <p class="mt-2 text-zinc-500">{{ item.message }}</p>

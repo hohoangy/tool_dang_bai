@@ -1262,11 +1262,12 @@ async function runQueueWorkflow() {
           screenshot.value = data.result.screenshot || screenshot.value;
 
           if (!queueAutoSubmit) {
-            const reviewMessage = isComposerReviewReady(data.result)
-              ? 'Đã chụp composer kiểm tra và đóng LDPlayer'
+            const reviewReady = isComposerReviewReady(data.result);
+            const reviewMessage = reviewReady
+              ? 'Đã chụp composer kiểm tra, đúng nội dung và đóng LDPlayer'
               : 'Đã mở kiểm tra nhưng screenshot chưa xác minh, đã đóng LDPlayer';
             updateQueueItem(account._id, {
-              status: 'review',
+              status: reviewReady ? 'done' : 'review',
               message: reviewMessage,
               result: data.result
             });
@@ -1333,7 +1334,9 @@ async function runQueueWorkflow() {
     }
 
     workflowStage.value = queueStats.value.failed ? 'failed' : (queueStats.value.review ? 'review' : 'verified');
-    ui.notify(`Đăng hàng loạt hoàn tất: ${queueStats.value.done} thành công, ${queueStats.value.review} cần kiểm tra, ${queueStats.value.failed} lỗi.`);
+    ui.notify(isQueueReviewMode.value
+      ? `Kiểm tra hàng loạt hoàn tất: ${queueStats.value.done} đúng nội dung, ${queueStats.value.review} cần kiểm tra, ${queueStats.value.failed} lỗi.`
+      : `Đăng hàng loạt hoàn tất: ${queueStats.value.done} thành công, ${queueStats.value.review} cần kiểm tra, ${queueStats.value.failed} lỗi.`);
     await load();
   } catch (error) {
     const message = getHttpErrorMessage(error);
@@ -3539,6 +3542,7 @@ watch(selectedPlatformId, async () => {
           <QueueProgressPanel
             :items="queueItems"
             :progress-percent="queueProgressPercent"
+            :review-mode="isQueueReviewMode"
             :stats="queueStats"
           />
 
